@@ -136,6 +136,23 @@ python3 radar_display.py --no-basemap
 
 缩放范围 `3`~`12`，转动后立即重绘。需要 `python3-evdev`，且运行用户要能读取 `/dev/input/event*`。用 `--no-knob` 可禁用。
 
+## 经纬度设置（旋钮长按）
+
+**长按旋钮**（按下静音键 ≥ `long_press_ms`）进入**全局经纬度设置界面**：
+
+- 屏幕显示以设定坐标为中心的**高德地图**（未压暗），叠加一条**贯穿全屏的十字线**，十字中心即设定坐标；调整数值时地图随之平移，使十字中心始终对准设定的经纬度。
+- **旋转旋钮**：调整当前字段数值。
+- **短按旋钮**：循环切换调整字段，共 6 个：经-度 → 经-分 → 经-秒 → 纬-度 → 纬-分 → 纬-秒。东/西、南/北半球**随坐标正负自动显示**，跨过 0 时自动切换，无需手动选择。
+- **再次长按旋钮**：确认并退出。设定坐标会**全局覆盖**所有图层的中心位置，并**写回 `config.json`**（`manual_lat`/`manual_lon`/`manual_location`），重启后仍保留。
+
+数值范围：经度 ±180°、纬度 ±90°；度/分/秒调整时**连续进位/借位**（秒满 60 进分、分满 60 进度），经度到 ±180° 环绕，纬度到 ±90° 限幅。设置界面缩放级别与进入前当前图层一致。
+
+> 手动指定 `--lat/--lon` 时，命令行坐标优先，`manual_location` 不生效。要恢复 IP 自动定位，把 `config.json` 的 `manual_location` 改回 `false` 即可。
+
+> **FY-4B 独立中心**：`风云4B`（`satellite_fy4b`）与 `风云4B盘`（`satellite_fy4b_disk`）各自拥有**独立中心坐标**，在该图层下长按旋钮进入设置界面，**只调整当前图层的中心**（分别写入 `fy4b_cn_lat`/`fy4b_cn_lon` 与 `fy4b_disk_lat`/`fy4b_disk_lon`），不受全局经纬度设置影响，也不会影响其它图层。其它图层下长按则调整全局中心。
+
+> 注意：设置界面用的是高德矢量底图（国内有数据），把中心移到境外或大洋会因无瓦片而显示空白，属正常现象。
+
 > **短临（nowcast）图层例外**：该图层为全国文本天气，不支持缩放，旋钮改为**预报时间步进**（见下）。
 
 > **飞机雷达通道例外**：旋钮改为调节雷达**量程**（20/50/100/150/200/300 km），见下方「飞机雷达通道」。
@@ -270,6 +287,13 @@ IP 定位失败时使用 `config.json`：
   "default_lat": 39.9042,
   "default_lon": 116.4074,
   "default_city": "Beijing",
+  "manual_location": false,
+  "manual_lat": 39.9042,
+  "manual_lon": 116.4074,
+  "fy4b_disk_lat": 39.9042,
+  "fy4b_disk_lon": 116.4074,
+  "fy4b_cn_lat": 39.9042,
+  "fy4b_cn_lon": 116.4074,
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
   "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
   "channel_keys": {
@@ -287,6 +311,10 @@ IP 定位失败时使用 `config.json`：
 }
 ```
 
+- `manual_location`：为 `true` 时使用下方 `manual_lat`/`manual_lon` 作为全局中心坐标（覆盖 IP 定位）；旋钮长按设置界面确认后会自动写入这三项
+- `manual_lat` / `manual_lon`：旋钮长按设置界面保存的全局经纬度
+- `fy4b_disk_lat` / `fy4b_disk_lon`：FY-4B 圆盘图的独立中心坐标（在该图层下长按旋钮设置，不受全局坐标影响）
+- `fy4b_cn_lat` / `fy4b_cn_lon`：FY-4B 中国区图的独立中心坐标（在该图层下长按旋钮设置，不受全局坐标影响）
 - `layers`：天气通道图层及顺序
 - `aircraft_layers`：飞机雷达通道图层及顺序
 - `channel_keys`：宏键盘通道切换键（`KEY_*` 名称，空则未绑定）

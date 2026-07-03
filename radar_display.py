@@ -49,6 +49,10 @@ FY4B_DISK_XML_URL = (
 NSMC_REFERER = "http://www.nsmc.org.cn/"
 # FY-4B 中国区缩略图近似经纬度范围（等经纬度裁切）
 FY4B_CHINA_BOUNDS = (70.0, 4.0, 140.0, 54.0)  # west, south, east, north
+# FY-4B 中国区数字缩放：以 240px 裁切窗口为基准 zoom，每级按 factor 缩放窗口
+FY4B_CN_BASE_ZOOM = 7
+FY4B_CN_ZOOM_FACTOR = 1.5
+FY4B_CN_MIN_WIN = 96  # 最小裁切窗口（放大上限，越小越糊）
 # FY-4B 全圆盘 GEOS 地球静止投影参数（星下点经度 105E）
 FY4B_SUB_LON = 105.0
 FY4B_DISK_KEEP_RAW = 30  # 保留的原始圆盘 JPEG 帧数（约 6h 动画，每帧约 16MB）
@@ -101,6 +105,19 @@ CHANNEL_ORDER = ["weather", "aircraft"]
 LOCATION_CACHE_SEC = 120
 ADSB_RADAR_MARGIN = 18
 ADSB_MAX_LABELS = 6
+
+FY4B_DISK_LAYER_ID = "satellite_fy4b_disk"
+FY4B_CN_LAYER_ID = "satellite_fy4b"
+# layer_id -> (config_lat_key, config_lon_key, lcd_enter_hint, lcd_saved_hint)
+INDEPENDENT_CENTERS: dict[str, tuple[str, str, str, str]] = {
+    FY4B_DISK_LAYER_ID: ("fy4b_disk_lat", "fy4b_disk_lon", "Set FY4B Ctr", "FY4B Saved"),
+    FY4B_CN_LAYER_ID: ("fy4b_cn_lat", "fy4b_cn_lon", "Set FY4B-CN", "FY4B-CN Saved"),
+}
+SETTINGS_FIELD_COUNT = 6
+SETTINGS_FIELD_LCD = [
+    "Lon deg", "Lon min", "Lon sec",
+    "Lat deg", "Lat min", "Lat sec",
+]
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -165,6 +182,13 @@ def load_config() -> dict:
         "default_lat": 39.9042,
         "default_lon": 116.4074,
         "default_city": "Beijing",
+        "manual_location": False,
+        "manual_lat": 39.9042,
+        "manual_lon": 116.4074,
+        "fy4b_disk_lat": 39.9042,
+        "fy4b_disk_lon": 116.4074,
+        "fy4b_cn_lat": 39.9042,
+        "fy4b_cn_lon": 116.4074,
         "layers": DEFAULT_LAYERS,
         "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
         "channel_keys": {"weather": "", "aircraft": ""},
@@ -180,6 +204,66 @@ def load_config() -> dict:
             cfg = json.load(f)
         defaults.update(cfg)
     return defaults
+
+
+def save_config_updates(updates: dict) -> None:
+    cfg = load_config()
+    cfg.update(updates)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    tmp.replace(CONFIG_PATH)
+
+
+def save_manual_location(lat: float, lon: float) -> None:
+    save_config_updates({
+        "manual_lat": round(lat, 6),
+        "manual_lon": round(lon, 6),
+        "manual_location": True,
+    })
+
+
+def save_layer_center(layer_id: str, lat: float, lon: float) -> None:
+    spec = INDEPENDENT_CENTERS.get(layer_id)
+    if spec is None:
+        raise ValueError(f"图层 {layer_id} 不支持独立中心")
+    lat_key, lon_key, _, _ = spec
+    save_config_updates({
+        lat_key: round(lat, 6),
+        lon_key: round(lon, 6),
+    })
+
+
+def save_fy4b_disk_location(lat: float, lon: float) -> None:
+    save_layer_center(FY4B_DISK_LAYER_ID, lat, lon)
+
+
+LON_ARCSEC_MAX = 180 * 3600
+LAT_ARCSEC_MAX = 90 * 3600
+# 每个字段对应的调整步长（弧秒）：度/分/秒
+SETTINGS_FIELD_STEP = [3600, 60, 1, 3600, 60, 1]
+
+
+def arcsec_to_dms(value: int, is_lat: bool) -> list[int]:
+    """整数弧秒 -> [半球位(0=E/N, 1=W/S), 度, 分, 秒]。"""
+    hemi = 0 if value >= 0 else 1
+    a = abs(int(value))
+    deg = a // 3600
+    minutes = (a % 3600) // 60
+    seconds = a % 60
+    return [hemi, deg, minutes, seconds]
+
+
+def wrap_lon_arcsec(value: int) -> int:
+    """经度弧秒环绕到 [-180°, 180°)，跨过 0 自动切换 E/W。"""
+    span = 2 * LON_ARCSEC_MAX
+    return ((int(value) + LON_ARCSEC_MAX) % span) - LON_ARCSEC_MAX
+
+
+def clamp_lat_arcsec(value: int) -> int:
+    """纬度弧秒限幅到 [-90°, 90°]。"""
+    return max(-LAT_ARCSEC_MAX, min(LAT_ARCSEC_MAX, int(value)))
 
 
 def frame_token_slug(token: str) -> str:
@@ -433,8 +517,10 @@ def amap_tile_url(zoom: int, tx: int, ty: int) -> str:
     return AMAP_TILE.format(sub=sub, x=tx, y=ty, z=zoom)
 
 
-def prepare_basemap_tile(tile: Image.Image) -> Image.Image:
+def prepare_basemap_tile(tile: Image.Image, bright: bool = False) -> Image.Image:
     tile = tile.convert("RGBA")
+    if bright:
+        return tile
     backdrop = Image.new("RGBA", tile.size, (15, 20, 30, 255))
     return Image.blend(backdrop, tile, BASEMAP_BLEND)
 
@@ -609,6 +695,7 @@ def build_composite_tiles(
     use_basemap: bool,
     overlay_fn: OverlayFn,
     overlay_zoom: int | None = None,
+    basemap_bright: bool = False,
 ) -> Image.Image:
     tile_zoom = overlay_zoom if overlay_zoom is not None else zoom
     center_tx, center_ty = lat_lon_to_tile(lat, lon, zoom)
@@ -645,7 +732,7 @@ def build_composite_tiles(
             if not tile:
                 continue
             if kind == "base":
-                tile = prepare_basemap_tile(tile)
+                tile = prepare_basemap_tile(tile, bright=basemap_bright)
                 composite.paste(tile, (px, py), tile)
             else:
                 composite.alpha_composite(tile, (px, py))
@@ -701,6 +788,77 @@ def draw_overlay(
     draw.rectangle([(0, HEIGHT - bar_h), (WIDTH, HEIGHT)], fill=(0, 0, 0))
     draw.text(((WIDTH - tw) // 2, HEIGHT - bar_h + 3), label, fill=(200, 200, 200), font=font)
     return img
+
+
+def _dms_line_parts(dms: dict[str, list[int]], axis: str) -> list[tuple[str, int]]:
+    """返回 (文本片段, 对应字段索引) 列表，用于高亮当前编辑字段。
+
+    字段布局（6 项）：经-度/分/秒 = 0/1/2，纬-度/分/秒 = 3/4/5。
+    半球（E/W、N/S）随经纬度正负自动显示，字段索引为 -1（不参与高亮）。
+    """
+    base = 0 if axis == "lon" else 3
+    parts = dms[axis]
+    hemi = "E" if parts[0] == 0 else "W"
+    if axis == "lat":
+        hemi = "N" if parts[0] == 0 else "S"
+    return [
+        (hemi, -1),
+        (f" {parts[1]}", base + 0),
+        ("\xb0", base + 0),
+        (f"{parts[2]:02d}", base + 1),
+        ("'", base + 1),
+        (f"{parts[3]:02d}", base + 2),
+        ('"', base + 2),
+    ]
+
+
+def _draw_dms_line(
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    parts: list[tuple[str, int]],
+    active_field: int,
+    font,
+    font_active,
+) -> None:
+    x = 8
+    for text, field_idx in parts:
+        use_font = font_active if field_idx == active_field else font
+        fill = (255, 220, 60) if field_idx == active_field else (220, 220, 220)
+        draw.text((x, y), text, fill=fill, font=use_font)
+        bbox = draw.textbbox((x, y), text, font=use_font)
+        x = bbox[2]
+
+
+def render_coord_setting(
+    lat: float,
+    lon: float,
+    zoom: int,
+    dms: dict[str, list[int]],
+    active_field: int,
+) -> Image.Image:
+    def noop_overlay(z: int, tx: int, ty: int) -> tuple[str, str] | None:
+        return None
+
+    composite = build_composite_tiles(
+        lat, lon, zoom, True, noop_overlay, basemap_bright=True,
+    )
+    cropped = crop_centered(composite, lat, lon, zoom)
+    draw = ImageDraw.Draw(cropped)
+    cx, cy = HALF, HALF
+    cross_color = (255, 255, 80)
+    draw.line([(0, cy), (WIDTH, cy)], fill=cross_color, width=1)
+    draw.line([(cx, 0), (cx, HEIGHT)], fill=cross_color, width=1)
+    draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], outline=(255, 60, 60), width=2)
+
+    bar_h = 40
+    draw.rectangle([(0, HEIGHT - bar_h), (WIDTH, HEIGHT)], fill=(0, 0, 0))
+    font = get_font(11)
+    font_active = get_font(11, bold=True)
+    lon_parts = _dms_line_parts(dms, "lon")
+    lat_parts = _dms_line_parts(dms, "lat")
+    _draw_dms_line(draw, HEIGHT - bar_h + 4, lon_parts, active_field, font, font_active)
+    _draw_dms_line(draw, HEIGHT - bar_h + 22, lat_parts, active_field, font, font_active)
+    return apply_circle_mask(cropped)
 
 
 def make_error_image(message: str) -> Image.Image:
@@ -864,7 +1022,7 @@ class FY4BLayer(LayerProvider):
     display_name = "风云4B"
 
     def supports_zoom(self) -> bool:
-        return False
+        return True
 
     def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
         return fetch_fy4b_frames(window_hours)
@@ -894,22 +1052,30 @@ class FY4BLayer(LayerProvider):
         w, h = src.size
         cx = (lon - west) / (east - west) * w
         cy = (north - lat) / (north - south) * h
-        half_w = WIDTH / 2
-        half_h = HEIGHT / 2
-        left = max(0, int(cx - half_w))
-        top = max(0, int(cy - half_h))
-        right = min(w, left + WIDTH)
-        bottom = min(h, top + HEIGHT)
-        if right - left < WIDTH:
-            left = max(0, right - WIDTH)
-        if bottom - top < HEIGHT:
-            top = max(0, bottom - HEIGHT)
-        cropped = src.crop((left, top, left + WIDTH, top + HEIGHT))
+
+        # 数字缩放：zoom 越大裁切窗口越小（放大），resize 回 240
+        win = WIDTH * (FY4B_CN_ZOOM_FACTOR ** (FY4B_CN_BASE_ZOOM - zoom))
+        win = int(round(max(FY4B_CN_MIN_WIN, min(min(w, h), win))))
+        left = int(round(cx - win / 2))
+        top = int(round(cy - win / 2))
+        left = max(0, min(w - win, left))
+        top = max(0, min(h - win, top))
+
+        # 计算裁切窗口对应的实际经纬度范围，供轮廓线对齐
+        lon_left = west + left / w * (east - west)
+        lon_right = west + (left + win) / w * (east - west)
+        lat_top = north - top / h * (north - south)
+        lat_bottom = north - (top + win) / h * (north - south)
+
+        cropped = src.crop((left, top, left + win, top + win))
         if cropped.size != (WIDTH, HEIGHT):
             cropped = cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
         if outline_geometries:
-            draw_outline_equirect(cropped, outline_geometries, FY4B_CHINA_BOUNDS)
-        cropped = draw_overlay(cropped, city, frame.timestamp, None, self.display_name)
+            draw_outline_equirect(
+                cropped, outline_geometries,
+                (lon_left, lat_bottom, lon_right, lat_top),
+            )
+        cropped = draw_overlay(cropped, city, frame.timestamp, zoom, self.display_name)
         return apply_circle_mask(cropped)
 
 
@@ -1652,6 +1818,14 @@ class FrameCache:
         with self._lock:
             self._mem.clear()
 
+    def invalidate_layer(self, layer_id: str) -> None:
+        """清空某图层的全部内存与磁盘成品缓存（中心坐标改变时用）。"""
+        with self._lock:
+            self._mem = {k: v for k, v in self._mem.items() if k[0] != layer_id}
+        layer_dir = FRAMES_DIR / layer_id
+        if layer_dir.exists():
+            shutil.rmtree(layer_dir, ignore_errors=True)
+
     def invalidate_old(self, layer_id: str, keep_token: str) -> None:
         layer_dir = FRAMES_DIR / layer_id
         if not layer_dir.exists():
@@ -1755,6 +1929,9 @@ class AppState:
         start_layer: str | None = None,
         long_press_ms: int = DEFAULT_LONG_PRESS_MS,
         default_range_km: int = ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX],
+        manual_lat: float | None = None,
+        manual_lon: float | None = None,
+        layer_centers: dict[str, tuple[float, float] | None] | None = None,
     ) -> None:
         self.layers = layers
         self.zoom = self._clamp(zoom)
@@ -1772,6 +1949,19 @@ class AppState:
         self.layer_index = idx
         self.notifier: LcdNotifier | None = None
         self._forecast_step_index = FORECAST_ZERO_INDEX
+
+        self.settings_mode = False
+        self.settings_field = 0
+        self._settings_target = "global"
+        self._set_lat_arcsec = 0
+        self._set_lon_arcsec = 0
+        self.override_lat = manual_lat
+        self.override_lon = manual_lon
+        self._layer_centers: dict[str, tuple[float, float] | None] = dict(
+            layer_centers or {},
+        )
+        self._current_lat = manual_lat or 0.0
+        self._current_lon = manual_lon or 0.0
 
         self._channel_indices: dict[str, list[int]] = {}
         for i, layer in enumerate(layers):
@@ -1950,6 +2140,132 @@ class AppState:
         self._lcd_notify("Animation", "Stopped")
         self.wake.set()
 
+    def update_current_location(self, lat: float, lon: float) -> None:
+        with self._lock:
+            self._current_lat = lat
+            self._current_lon = lon
+
+    def get_location_override(self) -> tuple[float, float] | None:
+        with self._lock:
+            if self.override_lat is not None and self.override_lon is not None:
+                return self.override_lat, self.override_lon
+            return None
+
+    def is_settings_mode(self) -> bool:
+        with self._lock:
+            return self.settings_mode
+
+    def get_settings_dms(self) -> tuple[dict[str, list[int]], int]:
+        with self._lock:
+            dms = {
+                "lat": arcsec_to_dms(self._set_lat_arcsec, True),
+                "lon": arcsec_to_dms(self._set_lon_arcsec, False),
+            }
+            return dms, self.settings_field
+
+    def get_setting_center(self) -> tuple[float, float]:
+        with self._lock:
+            return self._set_lat_arcsec / 3600.0, self._set_lon_arcsec / 3600.0
+
+    def _lcd_settings_field(self, field: int) -> None:
+        label = SETTINGS_FIELD_LCD[field]
+        lat = self._set_lat_arcsec / 3600.0
+        lon = self._set_lon_arcsec / 3600.0
+        self._lcd_notify("Set Coord", f"{label} {lat:.4f},{lon:.4f}")
+
+    def get_render_center(
+        self, layer_id: str, global_lat: float, global_lon: float,
+    ) -> tuple[float, float]:
+        """独立中心图层使用各自坐标，其余图层用全局坐标。"""
+        with self._lock:
+            center = self._layer_centers.get(layer_id)
+            if center is not None:
+                return center
+        return global_lat, global_lon
+
+    def enter_settings(self) -> None:
+        with self._lock:
+            layer_id = self.layers[self.layer_index].layer_id
+            if layer_id in INDEPENDENT_CENTERS:
+                self._settings_target = layer_id
+                center = self._layer_centers.get(layer_id)
+                if center is not None:
+                    lat, lon = center
+                else:
+                    lat = self._current_lat
+                    lon = self._current_lon
+                head = INDEPENDENT_CENTERS[layer_id][2]
+            else:
+                self._settings_target = "global"
+                lat = self._current_lat
+                lon = self._current_lon
+                head = "Set Coord"
+            self.anim_active = False
+            self.settings_mode = True
+            self.settings_field = 0
+            self._set_lat_arcsec = clamp_lat_arcsec(round(lat * 3600))
+            self._set_lon_arcsec = wrap_lon_arcsec(round(lon * 3600))
+            target = self._settings_target
+        print(f"进入坐标设置[{target}]: ({lat:.6f}, {lon:.6f})")
+        self._lcd_notify(head, "Long press save")
+        self.wake.set()
+
+    def settings_next_field(self) -> None:
+        with self._lock:
+            if not self.settings_mode:
+                return
+            self.settings_field = (self.settings_field + 1) % SETTINGS_FIELD_COUNT
+            field = self.settings_field
+        print(f"坐标设置: 切换字段 -> {SETTINGS_FIELD_LCD[field]}")
+        self._lcd_settings_field(field)
+        self.wake.set()
+
+    def settings_adjust(self, direction: int) -> None:
+        with self._lock:
+            if not self.settings_mode:
+                return
+            f = self.settings_field
+            delta = SETTINGS_FIELD_STEP[f] * direction
+            if f < 3:
+                self._set_lon_arcsec = wrap_lon_arcsec(self._set_lon_arcsec + delta)
+            else:
+                self._set_lat_arcsec = clamp_lat_arcsec(self._set_lat_arcsec + delta)
+            field = self.settings_field
+            lat = self._set_lat_arcsec / 3600.0
+            lon = self._set_lon_arcsec / 3600.0
+        print(
+            f"坐标设置: {SETTINGS_FIELD_LCD[field]} -> "
+            f"({lat:.6f}, {lon:.6f})"
+        )
+        self._lcd_settings_field(field)
+        self.wake.set()
+
+    def confirm_settings(self) -> None:
+        with self._lock:
+            if not self.settings_mode:
+                return
+            lat = self._set_lat_arcsec / 3600.0
+            lon = self._set_lon_arcsec / 3600.0
+            target = self._settings_target
+            self.settings_mode = False
+            if target in INDEPENDENT_CENTERS:
+                self._layer_centers[target] = (lat, lon)
+            else:
+                self.override_lat = lat
+                self.override_lon = lon
+                self._current_lat = lat
+                self._current_lon = lon
+        if target in INDEPENDENT_CENTERS:
+            save_layer_center(target, lat, lon)
+            _, _, _, saved_lcd = INDEPENDENT_CENTERS[target]
+            print(f"{target} 独立中心已保存: ({lat:.6f}, {lon:.6f})")
+            self._lcd_notify(saved_lcd, f"{lat:.4f},{lon:.4f}")
+        else:
+            save_manual_location(lat, lon)
+            print(f"坐标已保存: ({lat:.6f}, {lon:.6f})")
+            self._lcd_notify("Coord Saved", f"{lat:.4f},{lon:.4f}")
+        self.wake.set()
+
 
 def find_knob_device():
     try:
@@ -2093,6 +2409,44 @@ class KnobController(threading.Thread):
     def __init__(self, state: AppState) -> None:
         super().__init__(daemon=True)
         self.state = state
+        self._press_t: float | None = None
+        self._long_triggered = False
+        self._held = False
+        self._timer: threading.Timer | None = None
+
+    def _on_long_press(self) -> None:
+        if self._held and not self._long_triggered:
+            self._long_triggered = True
+            if self.state.is_settings_mode():
+                self.state.confirm_settings()
+            else:
+                self.state.enter_settings()
+
+    def _cancel_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _on_rotate(self, direction: int) -> None:
+        if self.state.is_settings_mode():
+            self.state.settings_adjust(direction)
+            return
+        if self.state.is_aircraft_channel():
+            self.state.step_range(direction)
+        elif self.state.is_nowcast_layer():
+            self.state.step_forecast(direction)
+        else:
+            self.state.bump_zoom(direction)
+
+    def _on_short_press(self) -> None:
+        if self.state.is_settings_mode():
+            self.state.settings_next_field()
+        elif self.state.is_aircraft_channel():
+            self.state.reset_range()
+        elif self.state.is_nowcast_layer():
+            self.state.reset_nowcast()
+        else:
+            self.state.reset_zoom()
 
     def run(self) -> None:
         try:
@@ -2107,35 +2461,43 @@ class KnobController(threading.Thread):
                 time.sleep(5)
                 continue
             print(f"旋钮已连接: {dev.name}")
+            self._press_t = None
+            self._long_triggered = False
+            self._held = False
+            self._cancel_timer()
             try:
                 for ev in dev.read_loop():
-                    if ev.type != ecodes.EV_KEY or ev.value != 1:
+                    if ev.type != ecodes.EV_KEY:
                         continue
-                    nowcast = self.state.is_nowcast_layer()
-                    aircraft = self.state.is_aircraft_channel()
-                    if ev.code == ecodes.KEY_VOLUMEUP:
-                        if aircraft:
-                            self.state.step_range(+1)
-                        elif nowcast:
-                            self.state.step_forecast(+1)
-                        else:
-                            self.state.bump_zoom(+1)
-                    elif ev.code == ecodes.KEY_VOLUMEDOWN:
-                        if aircraft:
-                            self.state.step_range(-1)
-                        elif nowcast:
-                            self.state.step_forecast(-1)
-                        else:
-                            self.state.bump_zoom(-1)
+                    if ev.code in (ecodes.KEY_VOLUMEUP, ecodes.KEY_VOLUMEDOWN):
+                        if ev.value != 1:
+                            continue
+                        self._on_rotate(
+                            +1 if ev.code == ecodes.KEY_VOLUMEUP else -1
+                        )
                     elif ev.code == ecodes.KEY_MUTE:
-                        if aircraft:
-                            self.state.reset_range()
-                        elif nowcast:
-                            self.state.reset_nowcast()
-                        else:
-                            self.state.reset_zoom()
+                        if ev.value == 1:
+                            self._press_t = time.time()
+                            self._long_triggered = False
+                            self._held = True
+                            self._cancel_timer()
+                            self._timer = threading.Timer(
+                                self.state.long_press_ms / 1000.0,
+                                self._on_long_press,
+                            )
+                            self._timer.daemon = True
+                            self._timer.start()
+                        elif ev.value == 0 and self._press_t is not None:
+                            self._held = False
+                            self._cancel_timer()
+                            held_ms = (time.time() - self._press_t) * 1000
+                            if held_ms < self.state.long_press_ms and not self._long_triggered:
+                                self._on_short_press()
+                            self._press_t = None
+                            self._long_triggered = False
             except OSError as exc:
                 print(f"旋钮读取中断: {exc}")
+                self._cancel_timer()
                 time.sleep(2)
 
 
@@ -2358,6 +2720,23 @@ def main() -> None:
     layer_names = ", ".join(l.display_name for l in layers)
     print(f"图层: {layer_names}")
 
+    manual_lat: float | None = None
+    manual_lon: float | None = None
+    if args.lat is None and args.lon is None and cfg.get("manual_location"):
+        try:
+            manual_lat = float(cfg["manual_lat"])
+            manual_lon = float(cfg["manual_lon"])
+            print(f"使用持久化坐标: ({manual_lat:.6f}, {manual_lon:.6f})")
+        except (KeyError, TypeError, ValueError):
+            manual_lat = manual_lon = None
+
+    layer_centers: dict[str, tuple[float, float] | None] = {}
+    for layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
+        try:
+            layer_centers[layer_id] = (float(cfg[lat_key]), float(cfg[lon_key]))
+        except (KeyError, TypeError, ValueError):
+            layer_centers[layer_id] = None
+
     state = AppState(
         layers=layers,
         zoom=args.zoom,
@@ -2365,6 +2744,9 @@ def main() -> None:
         start_layer=args.layer,
         long_press_ms=long_press_ms,
         default_range_km=default_range_km,
+        manual_lat=manual_lat,
+        manual_lon=manual_lon,
+        layer_centers=layer_centers,
     )
     for layer in layers:
         if isinstance(layer, (NmcNowcastLayer, AdsbRadarLayer)):
@@ -2402,6 +2784,7 @@ def main() -> None:
     last_lat: float | None = None
     last_lon: float | None = None
     last_tokens: dict[str, str] = {}
+    last_render_centers: dict[str, tuple[float, float]] = {}
 
     try:
         while True:
@@ -2410,7 +2793,15 @@ def main() -> None:
             forecast_offset = state.get_forecast_offset() if state.is_nowcast_layer() else 0
             adsb_range = state.get_adsb_range_km() if state.is_aircraft_channel() else 0
             try:
-                lat, lon, city = fetch_location_cached(args.lat, args.lon)
+                override = state.get_location_override()
+                if args.lat is not None and args.lon is not None:
+                    lat, lon, city = fetch_location_cached(args.lat, args.lon)
+                elif override is not None:
+                    lat, lon = override
+                    city = cfg.get("default_city", "Custom")
+                else:
+                    lat, lon, city = fetch_location_cached(args.lat, args.lon)
+                state.update_current_location(lat, lon)
                 if last_lat is not None and (
                     abs(lat - last_lat) > LOCATION_THRESHOLD
                     or abs(lon - last_lon) > LOCATION_THRESHOLD
@@ -2419,10 +2810,31 @@ def main() -> None:
                     frame_cache.clear_memory()
                 last_lat, last_lon = lat, lon
 
+                if state.is_settings_mode():
+                    dms, active_field = state.get_settings_dms()
+                    set_lat, set_lon = state.get_setting_center()
+                    img = render_coord_setting(
+                        set_lat, set_lon, zoom, dms, active_field,
+                    )
+                    show(img)
+                    state.wake.wait(timeout=60)
+                    state.wake.clear()
+                    continue
+
+                r_lat, r_lon = state.get_render_center(layer.layer_id, lat, lon)
+                prev_center = last_render_centers.get(layer.layer_id)
+                if prev_center is not None and (
+                    abs(r_lat - prev_center[0]) > LOCATION_THRESHOLD
+                    or abs(r_lon - prev_center[1]) > LOCATION_THRESHOLD
+                ):
+                    print(f"{layer.display_name} 中心变化，清空该图层缓存")
+                    frame_cache.invalidate_layer(layer.layer_id)
+                last_render_centers[layer.layer_id] = (r_lat, r_lon)
+
                 if state.is_anim_active():
                     anim_frames = layer.frames(anim_hours)
                     play_animation(
-                        layer, anim_frames, lat, lon, city, zoom,
+                        layer, anim_frames, r_lat, r_lon, city, zoom,
                         use_basemap, outline_geometries, frame_cache,
                         state, show, anim_fps,
                     )
@@ -2450,7 +2862,7 @@ def main() -> None:
 
                 if not quiet:
                     print(
-                        f"位置: {city} ({lat:.4f}, {lon:.4f}), "
+                        f"位置: {city} ({r_lat:.4f}, {r_lon:.4f}), "
                         f"图层={layer.display_name}, zoom={zoom}"
                     )
                     if state.is_nowcast_layer():
@@ -2462,7 +2874,7 @@ def main() -> None:
 
                 t0 = time.time()
                 img, from_cache = render_layer_frame(
-                    layer, frame, lat, lon, city, zoom,
+                    layer, frame, r_lat, r_lon, city, zoom,
                     use_basemap, outline_geometries, frame_cache,
                 )
                 if state.wake.is_set() and (
@@ -2489,7 +2901,7 @@ def main() -> None:
                         print(f"已更新 ({elapsed_ms:.0f}ms)")
 
                 if prefetch is not None and layer.supports_zoom():
-                    prefetch.schedule(layer, frame, lat, lon, city, state.get_zoom())
+                    prefetch.schedule(layer, frame, r_lat, r_lon, city, state.get_zoom())
             except Exception as exc:
                 print(f"刷新失败: {exc}")
                 show(make_error_image("离线\n重试中..."))
