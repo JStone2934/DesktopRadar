@@ -5,7 +5,7 @@
 数据源：[RainViewer](https://www.rainviewer.com/)（全球免费、无需 API key）  
 定位：公网 IP 自动定位（[ip-api.com](http://ip-api.com)），失败时回退到 `config.json` 默认坐标。
 
-> 注：CartoDB 暗色底图在国内网络可能无法访问，程序会自动跳过底图、仅显示雷达层。可用 `--no-basemap` 显式关闭底图以加快首次加载。
+> 底图使用高德矢量瓦片（国内可达，含路网/地名，最高约 z18），叠加时会压暗以突出雷达回波。不可用 `--no-basemap` 关闭。
 
 ## 接线（BCM 编号）
 
@@ -42,7 +42,7 @@ ls /dev/spidev*
 cd /home/js/Project/gc9a01-display
 pip3 install -r requirements.txt
 # 系统包（如未安装）：
-sudo apt install python3-lgpio fonts-dejavu-core
+sudo apt install python3-lgpio fonts-dejavu-core python3-evdev
 ```
 
 ## 屏幕测试
@@ -70,6 +70,27 @@ python3 radar_display.py --zoom 8 --interval 180
 python3 radar_display.py --no-basemap
 ```
 
+## 旋钮缩放（可选）
+
+若连接了带旋钮的小键盘（旋钮通过 USB 发送音量键），程序会自动识别并支持旋钮缩放：
+
+- 向上转（音量+）：放大（zoom +1）
+- 向下转（音量-）：缩小（zoom -1）
+- 按下旋钮（静音键）：重置为默认缩放
+
+缩放范围 `3`~`12`，转动后立即重绘。需要 `python3-evdev`，且运行用户要能读取 `/dev/input/event*`（服务单元已通过 `SupplementaryGroups=input` 授权；交互运行可执行 `sudo usermod -aG input $USER` 后重新登录）。用 `--no-knob` 可禁用。
+
+## 预渲染磁盘缓存
+
+为加快旋钮缩放响应，程序会在后台把每个雷达帧、每个 zoom 级别（z3~z12）预渲染为 240×240 成品图，落盘到 `cache/frames/{雷达帧ID}/zNN.png`：
+
+- **旋钮切换**：优先读内存热缓存或磁盘成品图，目标 **<50ms** 显示
+- **后台预取**：首帧显示后按「当前 zoom → 相邻 zoom」优先级预渲染其余级别
+- **自动清理**：只保留最近 2 个雷达帧目录；新雷达帧到达时删除更旧的
+- **重启复用**：同一雷达帧内重启进程仍可从磁盘秒开
+
+瓦片下载使用 LRU 内存缓存（上限 2000）；底图可达性探测结果写入 `cache/basemap_ok`，重启跳过 3 秒超时。
+
 ## 命令行参数
 
 | 参数 | 默认值 | 说明 |
@@ -79,7 +100,9 @@ python3 radar_display.py --no-basemap
 | `--zoom` | 7 | 地图缩放级别（越大越近） |
 | `--interval` | 300 | 刷新间隔（秒） |
 | `--once` | - | 只刷新一次后退出 |
-| `--no-basemap` | - | 不加载 CartoDB 暗色底图 |
+| `--no-basemap` | - | 不加载高德矢量底图 |
+| `--no-outline` | - | 不绘制海岸线/国界轮廓 |
+| `--no-knob` | - | 禁用旋钮缩放控制 |
 | `--no-display` | - | 仅下载渲染，不刷屏幕（调试） |
 
 ## 默认坐标配置
@@ -119,4 +142,5 @@ journalctl -u radar.service -f
 | `radar_display.py` | 气象雷达主程序 |
 | `test_display.py` | 屏幕色彩测试 |
 | `config.json` | 默认经纬度 |
+| `cache/frames/` | 预渲染成品图（自动生成，勿提交） |
 | `radar.service` | systemd 服务单元 |

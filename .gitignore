@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .lgd-nfy0
 cache/
+# cache/frames/ 由 cache/ 覆盖
