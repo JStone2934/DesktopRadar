@@ -34,6 +34,11 @@ class Aircraft:
     lon: float
     dist_km: float
     bearing_deg: float
+    sample_ts: float = 0.0
+
+    @property
+    def ident(self) -> str:
+        return (self.flight or self.hex[:6] or "?").strip()
 
 
 def km_to_nm(km: float) -> int:
@@ -83,7 +88,46 @@ def _parse_float(raw) -> float | None:
         return None
 
 
-def _parse_aircraft(item: dict, ref_lat: float, ref_lon: float, range_km: float) -> Aircraft | None:
+def extrapolate_position(ac: Aircraft, now: float) -> tuple[float, float]:
+    """按航向/地速把飞机位置外推到当前时刻（球面前推），用于插值平滑。"""
+    if ac.gs_kt is None or ac.track_deg is None or ac.sample_ts <= 0:
+        return ac.lat, ac.lon
+    dt = now - ac.sample_ts
+    if dt <= 0:
+        return ac.lat, ac.lon
+    dist_km = ac.gs_kt * KM_PER_NM * (dt / 3600.0)
+    if dist_km <= 0:
+        return ac.lat, ac.lon
+    r = 6371.0
+    ang = dist_km / r
+    brng = math.radians(ac.track_deg)
+    lat1 = math.radians(ac.lat)
+    lon1 = math.radians(ac.lon)
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(ang)
+        + math.cos(lat1) * math.sin(ang) * math.cos(brng)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(brng) * math.sin(ang) * math.cos(lat1),
+        math.cos(ang) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+def extrapolated_polar(
+    ac: Aircraft, ref_lat: float, ref_lon: float, now: float,
+) -> tuple[float, float]:
+    """返回外推后相对参考点的 (dist_km, bearing_deg)。"""
+    lat, lon = extrapolate_position(ac, now)
+    return (
+        haversine_km(ref_lat, ref_lon, lat, lon),
+        bearing_deg(ref_lat, ref_lon, lat, lon),
+    )
+
+
+def _parse_aircraft(
+    item: dict, ref_lat: float, ref_lon: float, range_km: float, now: float = 0.0,
+) -> Aircraft | None:
     lat = item.get("lat")
     lon = item.get("lon")
     if lat is None or lon is None:
@@ -108,6 +152,7 @@ def _parse_aircraft(item: dict, ref_lat: float, ref_lon: float, range_km: float)
         lon=lon_f,
         dist_km=dist,
         bearing_deg=bearing_deg(ref_lat, ref_lon, lat_f, lon_f),
+        sample_ts=now,
     )
 
 
@@ -158,7 +203,7 @@ class AdsbClient:
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            ac = _parse_aircraft(item, lat, lon, range_km)
+            ac = _parse_aircraft(item, lat, lon, range_km, now)
             if ac is not None:
                 aircraft.append(ac)
         aircraft.sort(key=lambda a: a.dist_km)

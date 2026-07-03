@@ -3,7 +3,7 @@
   "default_lon": 116.4074,
   "default_city": "Beijing",
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
-  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
+  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
   "channel_keys": {
     "weather": "ctrl+c",
     "aircraft": "ctrl+v"

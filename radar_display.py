@@ -30,7 +30,7 @@ Image.MAX_IMAGE_PIXELS = None
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
 from lcd_notifier import LcdNotifier
-from adsb_client import AdsbClient, AdsbError, Aircraft
+from adsb_client import AdsbClient, AdsbError, Aircraft, extrapolated_polar
 from nmc_client import NmcClient, NmcError, NmcReport
 
 TILE_SIZE = 256
@@ -1206,6 +1206,11 @@ def _draw_aircraft_blip(
     return x, y
 
 
+SWEEP_TRAIL_DEG = 150.0   # 拖影跨度
+SWEEP_TRAIL_STEP = 5.0    # 拖影分段角度
+SWEEP_MAX_ALPHA = 150     # 拖影根部最大不透明度
+
+
 def _draw_sweep(
     img: Image.Image,
     cx: int,
@@ -1213,21 +1218,93 @@ def _draw_sweep(
     max_r: float,
     angle_deg: float,
 ) -> Image.Image:
+    """老式 PPI 雷达扫描：亮绿扫描线 + 后方绿色渐变余晖拖影。"""
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    span = 35
-    pil_center = 90 - angle_deg
-    draw.pieslice(
-        [cx - max_r, cy - max_r, cx + max_r, cy + max_r],
-        start=pil_center - span / 2,
-        end=pil_center + span / 2,
-        fill=(0, 255, 120, 35),
-    )
+    box = [cx - max_r, cy - max_r, cx + max_r, cy + max_r]
+    # 拖影：从扫描线往"后方"（角度递减方向）逐段渐暗
+    k = 0.0
+    while k < SWEEP_TRAIL_DEG:
+        frac = 1.0 - (k / SWEEP_TRAIL_DEG)
+        alpha = int(SWEEP_MAX_ALPHA * frac * frac)
+        if alpha > 0:
+            a0 = angle_deg - k - SWEEP_TRAIL_STEP
+            a1 = angle_deg - k
+            # 屏幕角度(正北0,顺时针) -> PIL 角度(正东0,顺时针)
+            draw.pieslice(
+                box,
+                start=90 - a1,
+                end=90 - a0,
+                fill=(0, 230, 90, alpha),
+            )
+        k += SWEEP_TRAIL_STEP
+    # 亮扫描线 + 前端光点
     rad = math.radians(angle_deg)
     ex = cx + max_r * math.sin(rad)
     ey = cy - max_r * math.cos(rad)
-    draw.line([(cx, cy), (ex, ey)], fill=(0, 255, 140, 200), width=2)
+    draw.line([(cx, cy), (ex, ey)], fill=(150, 255, 170, 230), width=2)
+    draw.ellipse([ex - 3, ey - 3, ex + 3, ey + 3], fill=(200, 255, 210, 230))
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def draw_outline_centered(
+    draw: ImageDraw.ImageDraw,
+    lat: float,
+    lon: float,
+    zoom: int,
+    geometries: list,
+    color: tuple[int, int, int],
+) -> None:
+    """以 (lat,lon) 为屏幕中心，按 mercator 投影绘制经纬度线段轮廓。"""
+    if not geometries:
+        return
+    cgx, cgy = lat_lon_to_global_pixel(lat, lon, zoom)
+    half_deg = 360.0 * (HALF + 4) / (TILE_SIZE * (2 ** zoom))
+    lon_min, lon_max = lon - half_deg, lon + half_deg
+    for line in geometries:
+        lons = [pt[0] for pt in line]
+        if max(lons) < lon_min or min(lons) > lon_max:
+            continue
+        pts = []
+        for lon_pt, lat_pt in line:
+            gx, gy = lat_lon_to_global_pixel(lat_pt, lon_pt, zoom)
+            pts.append((gx - cgx + HALF, gy - cgy + HALF))
+        if len(pts) >= 2:
+            draw.line(pts, fill=color, width=1, joint="curve")
+
+
+SWEEP_DEG_PER_SEC = 45.0  # 老式雷达转速（度/秒），约 8 秒一圈
+
+
+def render_adsb_background(
+    style: str,
+    lat: float,
+    lon: float,
+    range_km: float,
+    outline_geometries: list | None,
+) -> Image.Image:
+    """渲染量程内不变的静态背景（底图/轮廓 + 距离环 + 方位刻度）。"""
+    cx, cy = HALF, HALF
+    max_r = HALF - ADSB_RADAR_MARGIN
+    if style == "map":
+        zoom = range_km_to_zoom(lat, range_km)
+        img = render_basemap_dark(lat, lon, zoom)
+        ring_color, label_color = (60, 90, 75), (120, 160, 130)
+    elif style == "outline":
+        img = Image.new("RGB", (WIDTH, HEIGHT), (4, 10, 6))
+        zoom = range_km_to_zoom(lat, range_km)
+        draw_outline_centered(
+            ImageDraw.Draw(img), lat, lon, zoom,
+            outline_geometries or [], (40, 160, 80),
+        )
+        ring_color, label_color = (45, 115, 65), (90, 175, 115)
+    else:  # plain / sweep
+        img = Image.new("RGB", (WIDTH, HEIGHT), (8, 14, 12))
+        ring_color, label_color = (50, 90, 70), (90, 130, 100)
+    draw = ImageDraw.Draw(img)
+    _draw_radar_rings(draw, cx, cy, max_r, range_km, ring_color, label_color)
+    _draw_compass_marks(draw, cx, cy, max_r)
+    return img
 
 
 def render_adsb(
@@ -1237,38 +1314,51 @@ def render_adsb(
     lon: float,
     city: str,
     range_km: float,
-    sweep_angle: float | None = None,
-) -> Image.Image:
+    background: Image.Image,
+    now: float | None = None,
+) -> tuple[Image.Image, tuple[str, float] | None]:
+    """在背景上叠加插值后的飞机点、标签与扫描线。
+
+    返回 (成品图, 最近飞机(ident, dist_km) 或 None)。
+    """
+    if now is None:
+        now = time.time()
     try:
         aircraft = client.fetch(lat, lon, range_km)
     except AdsbError as exc:
-        return make_error_image(f"ADSB\n{exc}")
+        return make_error_image(f"ADSB\n{exc}"), None
     except Exception as exc:
-        return make_error_image(f"ADSB\n{exc}")
+        return make_error_image(f"ADSB\n{exc}"), None
 
     cx, cy = HALF, HALF
     max_r = HALF - ADSB_RADAR_MARGIN
-
-    if style == "map":
-        zoom = range_km_to_zoom(lat, range_km)
-        img = render_basemap_dark(lat, lon, zoom)
-    else:
-        img = Image.new("RGB", (WIDTH, HEIGHT), (8, 14, 12))
-
+    img = background.copy()
     draw = ImageDraw.Draw(img)
-    ring_color = (60, 90, 75) if style == "map" else (50, 90, 70)
-    label_color = (120, 160, 130) if style == "map" else (90, 130, 100)
-    _draw_radar_rings(draw, cx, cy, max_r, range_km, ring_color, label_color)
-    _draw_compass_marks(draw, cx, cy, max_r)
 
+    # 按航向/地速外推到当前时刻做位置插值
+    view: list[tuple[float, float, Aircraft]] = []
     for ac in aircraft:
-        _draw_aircraft_blip(draw, ac, cx, cy, max_r, range_km)
+        dist, brng = extrapolated_polar(ac, lat, lon, now)
+        if dist > range_km:
+            continue
+        view.append((dist, brng, ac))
+    view.sort(key=lambda t: t[0])
+
+    for dist, brng, ac in view:
+        x, y = _aircraft_polar_xy(cx, cy, max_r, brng, dist, range_km)
+        color = _altitude_color(ac.alt_ft)
+        draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
+        if ac.track_deg is not None:
+            tr = math.radians(ac.track_deg)
+            draw.line(
+                [(x, y), (x + 10 * math.sin(tr), y - 10 * math.cos(tr))],
+                fill=color, width=2,
+            )
 
     label_font = get_font(10)
-    for i, ac in enumerate(aircraft[:ADSB_MAX_LABELS]):
-        x, y = _aircraft_polar_xy(cx, cy, max_r, ac.bearing_deg, ac.dist_km, range_km)
-        ident = (ac.flight or ac.hex[:6] or "?").strip()
-        tag = f"{ident} {_format_alt(ac.alt_ft)}"
+    for dist, brng, ac in view[:ADSB_MAX_LABELS]:
+        x, y = _aircraft_polar_xy(cx, cy, max_r, brng, dist, range_km)
+        tag = f"{ac.ident} {_format_alt(ac.alt_ft)}"
         ox = 6 if x >= cx else -6
         oy = -14 if y >= cy else 2
         draw.text((x + ox, y + oy), tag, fill=(220, 230, 220), font=label_font)
@@ -1277,20 +1367,24 @@ def render_adsb(
     draw.line([(cx - 6, cy), (cx + 6, cy)], fill=(255, 255, 255), width=1)
     draw.line([(cx, cy - 6), (cx, cy + 6)], fill=(255, 255, 255), width=1)
 
-    header = f"R {int(range_km)}km  {len(aircraft)} ac"
+    header = f"R {int(range_km)}km  {len(view)} ac"
     _draw_centered(draw, 14, header, get_font(12, bold=True), (180, 220, 180))
-    if not aircraft:
+    if not view:
         _draw_centered(draw, cy + 20, "No aircraft", get_font(14), (120, 150, 130))
 
     if style == "sweep":
-        angle = sweep_angle if sweep_angle is not None else (time.time() * 90) % 360
+        angle = (now * SWEEP_DEG_PER_SEC) % 360
         img = _draw_sweep(img, cx, cy, max_r, angle)
 
-    return apply_circle_mask(img)
+    nearest = None
+    if view:
+        d0, _, a0 = view[0]
+        nearest = (a0.ident, d0)
+    return apply_circle_mask(img), nearest
 
 
 class AdsbRadarLayer(LayerProvider):
-    """附近 ADSB 飞机雷达显示（纯雷达 / 叠地图 / 扫描线）。"""
+    """附近 ADSB 飞机雷达显示（纯雷达 / 叠地图 / 绿色轮廓 / 扫描线）。"""
 
     channel = "aircraft"
 
@@ -1306,6 +1400,9 @@ class AdsbRadarLayer(LayerProvider):
         self.display_name = display_name
         self.style = style
         self.state: "AppState | None" = None
+        self._bg: Image.Image | None = None
+        self._bg_key: tuple | None = None
+        self._last_lcd: tuple[str | None, float] | None = None
 
     def supports_zoom(self) -> bool:
         return False
@@ -1314,18 +1411,44 @@ class AdsbRadarLayer(LayerProvider):
         return False
 
     def live_refresh_sec(self) -> float | None:
-        return 0.1 if self.style == "sweep" else 8.0
+        return 0.05 if self.style == "sweep" else 0.12
+
+    def _range_km(self) -> int:
+        if self.state:
+            return self.state.get_adsb_range_km()
+        return ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
 
     def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
-        range_km = self.state.get_adsb_range_km() if self.state else ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
-        if self.style == "sweep":
-            bucket = int(time.time() * 10)
-        else:
-            bucket = int(time.time() // 8)
+        bucket = int(time.time() * 20)
         return [WeatherFrame(
-            token=f"adsb_{self.style}_{range_km}_{bucket}",
+            token=f"adsb_{self.style}_{self._range_km()}_{bucket}",
             timestamp=int(time.time()),
         )]
+
+    def _background(
+        self, lat: float, lon: float, range_km: int, outline_geometries: list | None,
+    ) -> Image.Image:
+        key = (self.style, range_km, round(lat, 3), round(lon, 3))
+        if self._bg is None or self._bg_key != key:
+            self._bg = render_adsb_background(
+                self.style, lat, lon, range_km, outline_geometries,
+            )
+            self._bg_key = key
+        return self._bg
+
+    def _update_lcd(self, nearest: tuple[str, float] | None, now: float) -> None:
+        if self.state is None:
+            return
+        ident = nearest[0] if nearest else None
+        last = self._last_lcd
+        changed = last is None or last[0] != ident
+        if not changed and now - last[1] < 3.0:
+            return
+        if nearest is not None:
+            self.state.notify_lcd("Nearest", f"{nearest[0]} {int(nearest[1])}km")
+        else:
+            self.state.notify_lcd("Aircraft", "No traffic")
+        self._last_lcd = (ident, now)
 
     def render(
         self,
@@ -1337,11 +1460,14 @@ class AdsbRadarLayer(LayerProvider):
         use_basemap: bool,
         outline_geometries: list | None,
     ) -> Image.Image:
-        range_km = self.state.get_adsb_range_km() if self.state else ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
-        sweep_angle = (time.time() * 90) % 360 if self.style == "sweep" else None
-        return render_adsb(
-            self.client, self.style, lat, lon, city, range_km, sweep_angle,
+        range_km = self._range_km()
+        now = time.time()
+        background = self._background(lat, lon, range_km, outline_geometries)
+        img, nearest = render_adsb(
+            self.client, self.style, lat, lon, city, range_km, background, now,
         )
+        self._update_lcd(nearest, now)
+        return img
 
 
 class NmcNowcastLayer(LayerProvider):
@@ -1390,6 +1516,7 @@ LAYER_LCD_LABELS = {
     "radar_caiyun": "Caiyun Radar",
     "adsb_radar": "ADSB",
     "adsb_map": "ADSB Map",
+    "adsb_outline": "ADSB Outline",
     "adsb_sweep": "ADSB Sweep",
 }
 
@@ -1423,6 +1550,7 @@ def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
         "satellite_fy4b_disk": FY4BDiskLayer(),
         "adsb_radar": AdsbRadarLayer(adsb_client, "adsb_radar", "飞机雷达", "plain"),
         "adsb_map": AdsbRadarLayer(adsb_client, "adsb_map", "飞机+地图", "map"),
+        "adsb_outline": AdsbRadarLayer(adsb_client, "adsb_outline", "飞机+轮廓", "outline"),
         "adsb_sweep": AdsbRadarLayer(adsb_client, "adsb_sweep", "飞机扫描", "sweep"),
     }
     token = (cfg.get("caiyun_token") or "").strip()
@@ -1434,7 +1562,10 @@ def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
 def resolve_layers(cfg: dict) -> list[LayerProvider]:
     registry = build_layer_registry(cfg)
     weather_ids = cfg.get("layers", DEFAULT_LAYERS)
-    aircraft_ids = cfg.get("aircraft_layers", ["adsb_radar", "adsb_map", "adsb_sweep"])
+    aircraft_ids = cfg.get(
+        "aircraft_layers",
+        ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
+    )
     layers: list[LayerProvider] = []
     seen: set[str] = set()
     for lid in list(weather_ids) + list(aircraft_ids):
@@ -2314,16 +2445,20 @@ def main() -> None:
                     frame_cache.invalidate_old(layer.layer_id, frame.token)
                     last_tokens[layer.layer_id] = frame.token
 
-                print(
-                    f"位置: {city} ({lat:.4f}, {lon:.4f}), "
-                    f"图层={layer.display_name}, zoom={zoom}"
-                )
-                if state.is_nowcast_layer():
-                    print(f"  预报偏移: {format_offset_label(forecast_offset)}")
-                elif state.is_aircraft_channel():
-                    print(f"  ADSB 量程: {adsb_range} km")
-                else:
-                    print(f"  帧: {frame.token} ({frame.timestamp})")
+                refresh_sec = layer.live_refresh_sec()
+                quiet = refresh_sec is not None and refresh_sec < 1.0
+
+                if not quiet:
+                    print(
+                        f"位置: {city} ({lat:.4f}, {lon:.4f}), "
+                        f"图层={layer.display_name}, zoom={zoom}"
+                    )
+                    if state.is_nowcast_layer():
+                        print(f"  预报偏移: {format_offset_label(forecast_offset)}")
+                    elif state.is_aircraft_channel():
+                        print(f"  ADSB 量程: {adsb_range} km")
+                    else:
+                        print(f"  帧: {frame.token} ({frame.timestamp})")
 
                 t0 = time.time()
                 img, from_cache = render_layer_frame(
@@ -2347,10 +2482,11 @@ def main() -> None:
 
                 show(img)
                 elapsed_ms = (time.time() - t0) * 1000
-                if from_cache:
-                    print(f"缓存命中 ({elapsed_ms:.0f}ms)")
-                else:
-                    print(f"已更新 ({elapsed_ms:.0f}ms)")
+                if not quiet:
+                    if from_cache:
+                        print(f"缓存命中 ({elapsed_ms:.0f}ms)")
+                    else:
+                        print(f"已更新 ({elapsed_ms:.0f}ms)")
 
                 if prefetch is not None and layer.supports_zoom():
                     prefetch.schedule(layer, frame, lat, lon, city, state.get_zoom())
@@ -2363,7 +2499,8 @@ def main() -> None:
 
             refresh_sec = layer.live_refresh_sec()
             wait_timeout = refresh_sec if refresh_sec is not None else args.interval
-            print(f"等待 {wait_timeout:.1f} 秒（旋钮/空格可打断）...")
+            if not (refresh_sec is not None and refresh_sec < 1.0):
+                print(f"等待 {wait_timeout:.1f} 秒（旋钮/空格可打断）...")
             if state.wake.wait(timeout=wait_timeout):
                 time.sleep(KNOB_DEBOUNCE)
                 state.wake.clear()

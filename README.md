@@ -13,7 +13,8 @@
 | `radar_caiyun` | 彩云雷达拼图（需在 config 填写 `caiyun_token`） | ~2 小时 |
 | `adsb_radar` | 附近 ADSB 飞机雷达（纯雷达环，正北朝上） | 实时 |
 | `adsb_map` | ADSB 飞机雷达叠压暗地图底图 | 实时 |
-| `adsb_sweep` | ADSB 飞机雷达 + 旋转扫描线动画 | 实时 |
+| `adsb_outline` | ADSB 飞机雷达叠绿色海岸线/国界轮廓 | 实时 |
+| `adsb_sweep` | ADSB 飞机雷达 + 老式扫描线余晖 | 实时 |
 
 > `satellite_fy4b_disk` 使用 FY-4B 全圆盘原始大图（每帧约 16MB），首次拉取较慢（约 10 秒），
 > 原始图缓存在 `cache/disk_raw/`，渲染后的成品图缓存在 `cache/frames/`。圆盘图动画首轮会逐帧下载，之后从缓存秒播。
@@ -149,22 +150,27 @@ python3 radar_display.py --no-basemap
 
 | 通道 | 包含图层 | 切换方式 |
 |------|----------|----------|
-| **天气** | `radar`、`satellite_fy4b`、`satellite_fy4b_disk`、`nowcast` 等 | 宏键盘**第 1 键**（需在 config 配置） |
-| **飞机** | `adsb_radar`、`adsb_map`、`adsb_sweep` | 宏键盘**第 2 键** |
+| **天气** | `radar`、`satellite_fy4b`、`satellite_fy4b_disk`、`nowcast` 等 | 宏键盘键（默认 `ctrl+c`，可在 config 配置） |
+| **飞机** | `adsb_radar`、`adsb_map`、`adsb_outline`、`adsb_sweep` | 宏键盘键（默认 `ctrl+v`） |
 
-- **空格短按**：仅在**当前通道内**循环切换图层（天气通道内切雷达/风云/短临；飞机通道内切三种雷达风格）。
+- **空格短按**：仅在**当前通道内**循环切换图层（天气通道内切雷达/风云/短临；飞机通道内切四种雷达风格）。
 - **空格长按**：播放当前图层历史动画（飞机通道图层无历史帧，动画自然无效）。
-- **宏键盘第 3、4 键**：预留，暂未绑定。
+- **宏键盘其余键**：预留，暂未绑定。
 
-### 飞机通道内三种风格
+### 飞机通道内四种风格
 
 | 图层 ID | 说明 |
 |---------|------|
 | `adsb_radar` | 纯雷达：同心距离环 + 方位刻度，飞机为亮点 + 航向箭头 |
 | `adsb_map` | 雷达环叠加压暗的高德地图底图 |
-| `adsb_sweep` | 纯雷达 + 旋转扫描线动画（约 10fps） |
+| `adsb_outline` | 雷达环叠加**绿色海岸线/国界矢量轮廓**底图 |
+| `adsb_sweep` | 老式 PPI 雷达：慢速亮绿扫描线 + 后方绿色渐变余晖拖影 |
 
 圆屏顶部显示量程与飞机数量；最近若干架标注呼号与高度（FL）。飞机按高度分色（地面/低空/中空/高空）。
+
+**平滑移动（插值）**：ADSB 数据约每 8 秒更新一次，但圆屏以高帧率（扫描线约 20fps、其余约 8fps）重绘，并按飞机的航向（`track`）与地速（`gs`）把位置外推到当前时刻，实现丝滑的连续移动，而非每 8 秒跳一次。
+
+**1602 LCD**：在飞机通道，LCD 常显示**最靠近本机的航班**代码与距离（如 `Nearest` / `CCA742 12km`）。
 
 ### 旋钮（飞机通道）
 
@@ -265,7 +271,7 @@ IP 定位失败时使用 `config.json`：
   "default_lon": 116.4074,
   "default_city": "Beijing",
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
-  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
+  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
   "channel_keys": {
     "weather": "KEY_1",
     "aircraft": "KEY_2"
