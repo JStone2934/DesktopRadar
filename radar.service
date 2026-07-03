@@ -1,0 +1,16 @@
+[Unit]
+Description=GC9A01 weather radar display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=js
+WorkingDirectory=/home/js/Project/gc9a01-display
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/js/Project/gc9a01-display/radar_display.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
