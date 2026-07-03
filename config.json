@@ -3,10 +3,17 @@
   "default_lon": 116.4074,
   "default_city": "Beijing",
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
+  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
+  "channel_keys": {
+    "weather": "ctrl+c",
+    "aircraft": "ctrl+v"
+  },
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,
   "anim_window_hours": 6,
   "lcd_backlight_seconds": 5,
-  "nmc_cache_ttl_sec": 300
+  "nmc_cache_ttl_sec": 300,
+  "adsb_ttl_sec": 8,
+  "adsb_default_range_km": 100
 }

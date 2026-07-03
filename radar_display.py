@@ -30,6 +30,7 @@ Image.MAX_IMAGE_PIXELS = None
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
 from lcd_notifier import LcdNotifier
+from adsb_client import AdsbClient, AdsbError, Aircraft
 from nmc_client import NmcClient, NmcError, NmcReport
 
 TILE_SIZE = 256
@@ -94,6 +95,13 @@ DEFAULT_ANIM_WINDOW_HOURS = 6
 FORECAST_OFFSETS_MIN = list(range(-60, 481, 30))
 FORECAST_ZERO_INDEX = FORECAST_OFFSETS_MIN.index(0)
 
+ADSB_RANGES_KM = [20, 50, 100, 150, 200, 300]
+ADSB_DEFAULT_RANGE_INDEX = ADSB_RANGES_KM.index(100)
+CHANNEL_ORDER = ["weather", "aircraft"]
+LOCATION_CACHE_SEC = 120
+ADSB_RADAR_MARGIN = 18
+ADSB_MAX_LABELS = 6
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 _adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
@@ -122,10 +130,17 @@ class WeatherFrame:
 class LayerProvider(ABC):
     layer_id: str
     display_name: str
+    channel: str = "weather"
 
     @abstractmethod
     def supports_zoom(self) -> bool:
         ...
+
+    def cacheable(self) -> bool:
+        return True
+
+    def live_refresh_sec(self) -> float | None:
+        return None
 
     @abstractmethod
     def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
@@ -151,10 +166,14 @@ def load_config() -> dict:
         "default_lon": 116.4074,
         "default_city": "Beijing",
         "layers": DEFAULT_LAYERS,
+        "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
+        "channel_keys": {"weather": "", "aircraft": ""},
         "caiyun_token": "",
         "long_press_ms": DEFAULT_LONG_PRESS_MS,
         "anim_fps": DEFAULT_ANIM_FPS,
         "anim_window_hours": DEFAULT_ANIM_WINDOW_HOURS,
+        "adsb_ttl_sec": 8,
+        "adsb_default_range_km": 100,
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -234,6 +253,27 @@ def fetch_location(lat: float | None, lon: float | None) -> tuple[float, float, 
         float(cfg.get("default_lon", 116.4074)),
         cfg.get("default_city", "Beijing"),
     )
+
+
+_location_cache: tuple[float, float, str, float] | None = None
+
+
+def fetch_location_cached(
+    lat: float | None,
+    lon: float | None,
+    cache_sec: float = LOCATION_CACHE_SEC,
+) -> tuple[float, float, str]:
+    global _location_cache
+    if lat is not None and lon is not None:
+        return fetch_location(lat, lon)
+    now = time.time()
+    if _location_cache is not None:
+        clat, clon, ccity, ts = _location_cache
+        if now - ts < cache_sec:
+            return clat, clon, ccity
+    clat, clon, ccity = fetch_location(lat, lon)
+    _location_cache = (clat, clon, ccity, now)
+    return clat, clon, ccity
 
 
 def fetch_rainviewer_data() -> dict:
@@ -1060,6 +1100,250 @@ def render_nmc_report(report: NmcReport, city: str) -> Image.Image:
     return apply_circle_mask(img)
 
 
+def range_km_to_zoom(lat: float, range_km: float) -> int:
+    """按雷达量程估算 web-mercator zoom（圆屏直径约覆盖 2×量程）。"""
+    mpp_needed = (range_km * 2000.0) / WIDTH
+    lat_rad = math.radians(lat)
+    mpp_at_z0 = 156543.03 * math.cos(lat_rad)
+    if mpp_needed <= 0:
+        return ZOOM_MAX
+    z = math.log2(mpp_at_z0 / mpp_needed)
+    return max(ZOOM_MIN, min(ZOOM_MAX, int(round(z))))
+
+
+def render_basemap_dark(lat: float, lon: float, zoom: int) -> Image.Image:
+    composite = build_composite_tiles(lat, lon, zoom, True, lambda _z, _x, _y: None)
+    cropped = crop_centered(composite, lat, lon, zoom).convert("RGB")
+    return Image.blend(cropped, Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0)), 0.55)
+
+
+def _altitude_color(alt_ft: int | None) -> tuple[int, int, int]:
+    if alt_ft is None:
+        return (180, 180, 180)
+    if alt_ft <= 0:
+        return (140, 200, 140)
+    if alt_ft < 10000:
+        return (80, 220, 120)
+    if alt_ft < 25000:
+        return (255, 210, 80)
+    return (80, 200, 255)
+
+
+def _format_alt(alt_ft: int | None) -> str:
+    if alt_ft is None:
+        return "?"
+    if alt_ft <= 0:
+        return "GND"
+    return f"FL{alt_ft // 100:02d}"
+
+
+def _aircraft_polar_xy(
+    cx: int, cy: int, max_r: float, bearing: float, dist_km: float, range_km: float,
+) -> tuple[int, int]:
+    r = (dist_km / range_km) * max_r if range_km > 0 else 0
+    rad = math.radians(bearing)
+    x = cx + r * math.sin(rad)
+    y = cy - r * math.cos(rad)
+    return int(round(x)), int(round(y))
+
+
+def _draw_radar_rings(
+    draw: ImageDraw.ImageDraw,
+    cx: int,
+    cy: int,
+    max_r: float,
+    range_km: float,
+    ring_color: tuple[int, int, int] = (50, 90, 70),
+    label_color: tuple[int, int, int] = (90, 130, 100),
+) -> None:
+    font = get_font(10)
+    for i in range(1, 5):
+        frac = i / 4.0
+        r = max_r * frac
+        draw.ellipse(
+            [cx - r, cy - r, cx + r, cy + r],
+            outline=ring_color,
+            width=1,
+        )
+        label = f"{int(range_km * frac)}"
+        draw.text((cx + 4, cy - r - 10), label, fill=label_color, font=font)
+
+
+def _draw_compass_marks(
+    draw: ImageDraw.ImageDraw,
+    cx: int,
+    cy: int,
+    max_r: float,
+    color: tuple[int, int, int] = (100, 140, 110),
+) -> None:
+    font = get_font(11, bold=True)
+    for label, bearing in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+        rad = math.radians(bearing)
+        x = cx + (max_r + 10) * math.sin(rad)
+        y = cy - (max_r + 10) * math.cos(rad)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text((x - tw / 2, y - th / 2), label, fill=color, font=font)
+
+
+def _draw_aircraft_blip(
+    draw: ImageDraw.ImageDraw,
+    ac: Aircraft,
+    cx: int,
+    cy: int,
+    max_r: float,
+    range_km: float,
+) -> tuple[int, int]:
+    x, y = _aircraft_polar_xy(cx, cy, max_r, ac.bearing_deg, ac.dist_km, range_km)
+    color = _altitude_color(ac.alt_ft)
+    draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
+    if ac.track_deg is not None:
+        tr = math.radians(ac.track_deg)
+        ax = x + 10 * math.sin(tr)
+        ay = y - 10 * math.cos(tr)
+        draw.line([(x, y), (ax, ay)], fill=color, width=2)
+    return x, y
+
+
+def _draw_sweep(
+    img: Image.Image,
+    cx: int,
+    cy: int,
+    max_r: float,
+    angle_deg: float,
+) -> Image.Image:
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    span = 35
+    pil_center = 90 - angle_deg
+    draw.pieslice(
+        [cx - max_r, cy - max_r, cx + max_r, cy + max_r],
+        start=pil_center - span / 2,
+        end=pil_center + span / 2,
+        fill=(0, 255, 120, 35),
+    )
+    rad = math.radians(angle_deg)
+    ex = cx + max_r * math.sin(rad)
+    ey = cy - max_r * math.cos(rad)
+    draw.line([(cx, cy), (ex, ey)], fill=(0, 255, 140, 200), width=2)
+    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def render_adsb(
+    client: AdsbClient,
+    style: str,
+    lat: float,
+    lon: float,
+    city: str,
+    range_km: float,
+    sweep_angle: float | None = None,
+) -> Image.Image:
+    try:
+        aircraft = client.fetch(lat, lon, range_km)
+    except AdsbError as exc:
+        return make_error_image(f"ADSB\n{exc}")
+    except Exception as exc:
+        return make_error_image(f"ADSB\n{exc}")
+
+    cx, cy = HALF, HALF
+    max_r = HALF - ADSB_RADAR_MARGIN
+
+    if style == "map":
+        zoom = range_km_to_zoom(lat, range_km)
+        img = render_basemap_dark(lat, lon, zoom)
+    else:
+        img = Image.new("RGB", (WIDTH, HEIGHT), (8, 14, 12))
+
+    draw = ImageDraw.Draw(img)
+    ring_color = (60, 90, 75) if style == "map" else (50, 90, 70)
+    label_color = (120, 160, 130) if style == "map" else (90, 130, 100)
+    _draw_radar_rings(draw, cx, cy, max_r, range_km, ring_color, label_color)
+    _draw_compass_marks(draw, cx, cy, max_r)
+
+    for ac in aircraft:
+        _draw_aircraft_blip(draw, ac, cx, cy, max_r, range_km)
+
+    label_font = get_font(10)
+    for i, ac in enumerate(aircraft[:ADSB_MAX_LABELS]):
+        x, y = _aircraft_polar_xy(cx, cy, max_r, ac.bearing_deg, ac.dist_km, range_km)
+        ident = (ac.flight or ac.hex[:6] or "?").strip()
+        tag = f"{ident} {_format_alt(ac.alt_ft)}"
+        ox = 6 if x >= cx else -6
+        oy = -14 if y >= cy else 2
+        draw.text((x + ox, y + oy), tag, fill=(220, 230, 220), font=label_font)
+
+    draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 60, 60))
+    draw.line([(cx - 6, cy), (cx + 6, cy)], fill=(255, 255, 255), width=1)
+    draw.line([(cx, cy - 6), (cx, cy + 6)], fill=(255, 255, 255), width=1)
+
+    header = f"R {int(range_km)}km  {len(aircraft)} ac"
+    _draw_centered(draw, 14, header, get_font(12, bold=True), (180, 220, 180))
+    if not aircraft:
+        _draw_centered(draw, cy + 20, "No aircraft", get_font(14), (120, 150, 130))
+
+    if style == "sweep":
+        angle = sweep_angle if sweep_angle is not None else (time.time() * 90) % 360
+        img = _draw_sweep(img, cx, cy, max_r, angle)
+
+    return apply_circle_mask(img)
+
+
+class AdsbRadarLayer(LayerProvider):
+    """附近 ADSB 飞机雷达显示（纯雷达 / 叠地图 / 扫描线）。"""
+
+    channel = "aircraft"
+
+    def __init__(
+        self,
+        client: AdsbClient,
+        layer_id: str,
+        display_name: str,
+        style: str,
+    ) -> None:
+        self.client = client
+        self.layer_id = layer_id
+        self.display_name = display_name
+        self.style = style
+        self.state: "AppState | None" = None
+
+    def supports_zoom(self) -> bool:
+        return False
+
+    def cacheable(self) -> bool:
+        return False
+
+    def live_refresh_sec(self) -> float | None:
+        return 0.1 if self.style == "sweep" else 8.0
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        range_km = self.state.get_adsb_range_km() if self.state else ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
+        if self.style == "sweep":
+            bucket = int(time.time() * 10)
+        else:
+            bucket = int(time.time() // 8)
+        return [WeatherFrame(
+            token=f"adsb_{self.style}_{range_km}_{bucket}",
+            timestamp=int(time.time()),
+        )]
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        range_km = self.state.get_adsb_range_km() if self.state else ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
+        sweep_angle = (time.time() * 90) % 360 if self.style == "sweep" else None
+        return render_adsb(
+            self.client, self.style, lat, lon, city, range_km, sweep_angle,
+        )
+
+
 class NmcNowcastLayer(LayerProvider):
     """中央气象台文本天气（Nowcast），旋钮做时间步进。"""
 
@@ -1104,6 +1388,14 @@ LAYER_LCD_LABELS = {
     "satellite_fy4b": "FY-4B CN",
     "satellite_fy4b_disk": "FY-4B Disk",
     "radar_caiyun": "Caiyun Radar",
+    "adsb_radar": "ADSB",
+    "adsb_map": "ADSB Map",
+    "adsb_sweep": "ADSB Sweep",
+}
+
+CHANNEL_LCD_LABELS = {
+    "weather": "Weather",
+    "aircraft": "Aircraft",
 }
 
 
@@ -1122,11 +1414,16 @@ def frame_lcd_time(frame: WeatherFrame) -> str | None:
 def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
     nmc_ttl = float(cfg.get("nmc_cache_ttl_sec", 300))
     nmc_client = NmcClient(session=SESSION, weather_ttl_sec=nmc_ttl)
+    adsb_ttl = float(cfg.get("adsb_ttl_sec", 8))
+    adsb_client = AdsbClient(session=SESSION, ttl_sec=adsb_ttl)
     registry: dict[str, LayerProvider] = {
         "radar": RainViewerLayer("radar", "雷达", "past"),
         "nowcast": NmcNowcastLayer(nmc_client),
         "satellite_fy4b": FY4BLayer(),
         "satellite_fy4b_disk": FY4BDiskLayer(),
+        "adsb_radar": AdsbRadarLayer(adsb_client, "adsb_radar", "飞机雷达", "plain"),
+        "adsb_map": AdsbRadarLayer(adsb_client, "adsb_map", "飞机+地图", "map"),
+        "adsb_sweep": AdsbRadarLayer(adsb_client, "adsb_sweep", "飞机扫描", "sweep"),
     }
     token = (cfg.get("caiyun_token") or "").strip()
     if token:
@@ -1136,11 +1433,16 @@ def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
 
 def resolve_layers(cfg: dict) -> list[LayerProvider]:
     registry = build_layer_registry(cfg)
-    ids = cfg.get("layers", DEFAULT_LAYERS)
+    weather_ids = cfg.get("layers", DEFAULT_LAYERS)
+    aircraft_ids = cfg.get("aircraft_layers", ["adsb_radar", "adsb_map", "adsb_sweep"])
     layers: list[LayerProvider] = []
-    for lid in ids:
+    seen: set[str] = set()
+    for lid in list(weather_ids) + list(aircraft_ids):
+        if lid in seen:
+            continue
         if lid in registry:
             layers.append(registry[lid])
+            seen.add(lid)
         else:
             print(f"未知图层 {lid}，已跳过")
     if not layers:
@@ -1321,6 +1623,7 @@ class AppState:
         default_zoom: int,
         start_layer: str | None = None,
         long_press_ms: int = DEFAULT_LONG_PRESS_MS,
+        default_range_km: int = ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX],
     ) -> None:
         self.layers = layers
         self.zoom = self._clamp(zoom)
@@ -1338,6 +1641,75 @@ class AppState:
         self.layer_index = idx
         self.notifier: LcdNotifier | None = None
         self._forecast_step_index = FORECAST_ZERO_INDEX
+
+        self._channel_indices: dict[str, list[int]] = {}
+        for i, layer in enumerate(layers):
+            ch = getattr(layer, "channel", "weather")
+            self._channel_indices.setdefault(ch, []).append(i)
+        self._channel_last: dict[str, int] = {}
+        for ch, indices in self._channel_indices.items():
+            self._channel_last[ch] = indices[0]
+
+        try:
+            range_idx = ADSB_RANGES_KM.index(default_range_km)
+        except ValueError:
+            range_idx = ADSB_DEFAULT_RANGE_INDEX
+        self._adsb_range_index = range_idx
+        self._adsb_default_range_index = range_idx
+
+    def _current_channel(self) -> str:
+        return getattr(self.layers[self.layer_index], "channel", "weather")
+
+    def is_aircraft_channel(self) -> bool:
+        with self._lock:
+            return self._current_channel() == "aircraft"
+
+    def get_adsb_range_km(self) -> int:
+        with self._lock:
+            return ADSB_RANGES_KM[self._adsb_range_index]
+
+    def step_range(self, direction: int) -> None:
+        """direction +1 = 缩小量程（放大）, -1 = 放大量程（缩小）。"""
+        with self._lock:
+            n = len(ADSB_RANGES_KM)
+            new_idx = self._adsb_range_index - direction
+            if new_idx < 0 or new_idx >= n:
+                return
+            self._adsb_range_index = new_idx
+            range_km = ADSB_RANGES_KM[new_idx]
+        print(f"飞机雷达: 量程 -> {range_km} km")
+        self._lcd_notify("ADSB Range", f"{range_km} km")
+        self.wake.set()
+
+    def reset_range(self) -> None:
+        with self._lock:
+            if self._adsb_range_index == self._adsb_default_range_index:
+                return
+            self._adsb_range_index = self._adsb_default_range_index
+            range_km = ADSB_RANGES_KM[self._adsb_range_index]
+        print(f"飞机雷达: 量程重置为 {range_km} km")
+        self._lcd_notify("Range Reset", f"{range_km} km")
+        self.wake.set()
+
+    def switch_channel(self, channel_id: str) -> None:
+        with self._lock:
+            indices = self._channel_indices.get(channel_id)
+            if not indices:
+                return
+            if self._current_channel() == channel_id:
+                return
+            target = self._channel_last.get(channel_id, indices[0])
+            if target not in indices:
+                target = indices[0]
+            self.layer_index = target
+            self._channel_last[channel_id] = target
+            self.anim_active = False
+            self._forecast_step_index = FORECAST_ZERO_INDEX
+            layer = self.layers[self.layer_index]
+            ch_label = CHANNEL_LCD_LABELS.get(channel_id, channel_id)
+        print(f"通道: -> {ch_label} ({layer.display_name})")
+        self._lcd_notify("Channel", f"{ch_label} {layer_lcd_label(layer)}")
+        self.wake.set()
 
     def _lcd_notify(self, line1: str, line2: str = "") -> None:
         if self.notifier is not None:
@@ -1415,7 +1787,11 @@ class AppState:
 
     def next_layer(self) -> None:
         with self._lock:
-            self.layer_index = (self.layer_index + 1) % len(self.layers)
+            ch = self._current_channel()
+            indices = self._channel_indices.get(ch, [self.layer_index])
+            pos = indices.index(self.layer_index)
+            self.layer_index = indices[(pos + 1) % len(indices)]
+            self._channel_last[ch] = self.layer_index
             self.anim_active = False
             self._forecast_step_index = FORECAST_ZERO_INDEX
             layer = self.layers[self.layer_index]
@@ -1461,7 +1837,70 @@ def find_knob_device():
     return None
 
 
-def find_keyboard_device():
+MODIFIER_ALIASES = {
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "shift": "shift",
+    "alt": "alt",
+}
+
+
+def modifier_code_map() -> dict[int, str]:
+    """evdev 修饰键码 -> 类别（ctrl/shift/alt）。"""
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return {}
+    return {
+        ecodes.KEY_LEFTCTRL: "ctrl",
+        ecodes.KEY_RIGHTCTRL: "ctrl",
+        ecodes.KEY_LEFTSHIFT: "shift",
+        ecodes.KEY_RIGHTSHIFT: "shift",
+        ecodes.KEY_LEFTALT: "alt",
+        ecodes.KEY_RIGHTALT: "alt",
+    }
+
+
+def parse_channel_keys(cfg: dict) -> list[tuple[str, frozenset[str], int]]:
+    """解析 config channel_keys，支持单键或组合键（如 'ctrl+c'）。
+
+    返回 (channel, required_modifiers, main_key_code) 列表。
+    """
+    raw = cfg.get("channel_keys") or {}
+    combos: list[tuple[str, frozenset[str], int]] = []
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return combos
+    for channel, spec in raw.items():
+        if not spec or not isinstance(spec, str):
+            continue
+        tokens = [t for t in spec.strip().lower().replace(" ", "").split("+") if t]
+        if not tokens:
+            continue
+        mods: set[str] = set()
+        main_code: int | None = None
+        valid = True
+        for tok in tokens:
+            if tok in MODIFIER_ALIASES:
+                mods.add(MODIFIER_ALIASES[tok])
+                continue
+            name = tok.upper()
+            if not name.startswith("KEY_"):
+                name = "KEY_" + name
+            code = ecodes.ecodes.get(name)
+            if code is None:
+                print(f"未知 channel_keys 按键名: {tok}")
+                valid = False
+                break
+            main_code = code
+        if not valid or main_code is None:
+            continue
+        combos.append((channel, frozenset(mods), main_code))
+    return combos
+
+
+def find_keyboard_device(extra_codes: list[int] | None = None):
     try:
         import evdev
         from evdev import ecodes
@@ -1475,7 +1914,48 @@ def find_keyboard_device():
         keys = dev.capabilities().get(ecodes.EV_KEY, [])
         if ecodes.KEY_SPACE in keys:
             return dev
+        if extra_codes and any(code in keys for code in extra_codes):
+            return dev
     return None
+
+
+def run_detect_keys() -> None:
+    """打印所有输入设备上按下的键名，用于配置 channel_keys。"""
+    try:
+        import selectors
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        print("未安装 python3-evdev")
+        return
+    devices: list = []
+    selector = selectors.DefaultSelector()
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            selector.register(dev, selectors.EVENT_READ)
+            devices.append(dev)
+            print(f"监听: {dev.name} ({path})")
+        except Exception as exc:
+            print(f"无法打开 {path}: {exc}")
+    if not devices:
+        print("未找到输入设备")
+        return
+    print("请按下宏键盘上的键，Ctrl+C 退出")
+    try:
+        while True:
+            for key, _ in selector.select():
+                dev = key.fileobj
+                for ev in dev.read():
+                    if ev.type != ecodes.EV_KEY or ev.value != 1:
+                        continue
+                    name = ecodes.keys.get(ev.code, f"CODE_{ev.code}")
+                    print(f"  [{dev.name}] {name}  (code={ev.code})")
+    except KeyboardInterrupt:
+        print("\n退出按键识别")
+    finally:
+        for dev in devices:
+            dev.close()
 
 
 class KnobController(threading.Thread):
@@ -1501,18 +1981,25 @@ class KnobController(threading.Thread):
                     if ev.type != ecodes.EV_KEY or ev.value != 1:
                         continue
                     nowcast = self.state.is_nowcast_layer()
+                    aircraft = self.state.is_aircraft_channel()
                     if ev.code == ecodes.KEY_VOLUMEUP:
-                        if nowcast:
+                        if aircraft:
+                            self.state.step_range(+1)
+                        elif nowcast:
                             self.state.step_forecast(+1)
                         else:
                             self.state.bump_zoom(+1)
                     elif ev.code == ecodes.KEY_VOLUMEDOWN:
-                        if nowcast:
+                        if aircraft:
+                            self.state.step_range(-1)
+                        elif nowcast:
                             self.state.step_forecast(-1)
                         else:
                             self.state.bump_zoom(-1)
                     elif ev.code == ecodes.KEY_MUTE:
-                        if nowcast:
+                        if aircraft:
+                            self.state.reset_range()
+                        elif nowcast:
                             self.state.reset_nowcast()
                         else:
                             self.state.reset_zoom()
@@ -1522,18 +2009,26 @@ class KnobController(threading.Thread):
 
 
 class LayerKeyController(threading.Thread):
-    """KEY_SPACE 短按切换图层，长按播放动画。"""
+    """KEY_SPACE 短按切换图层（通道内），长按播放动画；channel_keys 切换通道。"""
 
-    def __init__(self, state: AppState) -> None:
+    def __init__(
+        self,
+        state: AppState,
+        channel_combos: list[tuple[str, frozenset[str], int]] | None = None,
+        anim_enabled: bool = True,
+    ) -> None:
         super().__init__(daemon=True)
         self.state = state
+        self.channel_combos = channel_combos or []
+        self.anim_enabled = anim_enabled
         self._press_t: float | None = None
         self._long_triggered = False
         self._held = False
         self._timer: threading.Timer | None = None
+        self._pressed_mods: set[str] = set()
 
     def _on_long_press(self) -> None:
-        if self._held and not self._long_triggered:
+        if self._held and not self._long_triggered and self.anim_enabled:
             self._long_triggered = True
             self.state.start_anim()
 
@@ -1549,37 +2044,60 @@ class LayerKeyController(threading.Thread):
         except ImportError:
             print("未安装 python3-evdev，空格键图层切换禁用")
             return
+        mod_map = modifier_code_map()
+        main_codes = [code for _, _, code in self.channel_combos]
         while True:
-            dev = find_keyboard_device()
+            dev = find_keyboard_device(main_codes)
             if dev is None:
                 time.sleep(5)
                 continue
             print(f"键盘已连接: {dev.name}")
+            self._pressed_mods.clear()
             try:
                 for ev in dev.read_loop():
-                    if ev.type != ecodes.EV_KEY or ev.code != ecodes.KEY_SPACE:
+                    if ev.type != ecodes.EV_KEY:
+                        continue
+                    if ev.code in mod_map:
+                        kind = mod_map[ev.code]
+                        if ev.value == 1:
+                            self._pressed_mods.add(kind)
+                        elif ev.value == 0:
+                            self._pressed_mods.discard(kind)
+                        continue
+                    if ev.code == ecodes.KEY_SPACE:
+                        if ev.value == 1:
+                            self._press_t = time.time()
+                            self._long_triggered = False
+                            self._held = True
+                            self._cancel_timer()
+                            if self.anim_enabled:
+                                self._timer = threading.Timer(
+                                    self.state.long_press_ms / 1000.0,
+                                    self._on_long_press,
+                                )
+                                self._timer.daemon = True
+                                self._timer.start()
+                        elif ev.value == 0 and self._press_t is not None:
+                            self._held = False
+                            self._cancel_timer()
+                            held_ms = (time.time() - self._press_t) * 1000
+                            if held_ms < self.state.long_press_ms:
+                                self.state.next_layer()
+                            elif self._long_triggered:
+                                self.state.stop_anim()
+                            self._press_t = None
+                            self._long_triggered = False
                         continue
                     if ev.value == 1:
-                        self._press_t = time.time()
-                        self._long_triggered = False
-                        self._held = True
-                        self._cancel_timer()
-                        self._timer = threading.Timer(
-                            self.state.long_press_ms / 1000.0,
-                            self._on_long_press,
-                        )
-                        self._timer.daemon = True
-                        self._timer.start()
-                    elif ev.value == 0 and self._press_t is not None:
-                        self._held = False
-                        self._cancel_timer()
-                        held_ms = (time.time() - self._press_t) * 1000
-                        if held_ms < self.state.long_press_ms:
-                            self.state.next_layer()
-                        elif self._long_triggered:
-                            self.state.stop_anim()
-                        self._press_t = None
-                        self._long_triggered = False
+                        matched = False
+                        for channel, mods, code in self.channel_combos:
+                            if ev.code == code and mods == self._pressed_mods:
+                                self.state.switch_channel(channel)
+                                matched = True
+                                break
+                        if not matched and self.channel_combos and not self._pressed_mods:
+                            name = ecodes.keys.get(ev.code, f"CODE_{ev.code}")
+                            print(f"未映射按键: {name} (code={ev.code})")
             except OSError as exc:
                 print(f"键盘读取中断: {exc}")
                 time.sleep(2)
@@ -1600,6 +2118,11 @@ def render_layer_frame(
     outline_geometries: list | None,
     frame_cache: FrameCache,
 ) -> tuple[Image.Image, bool]:
+    if not layer.cacheable():
+        img = layer.render(
+            frame, lat, lon, city, zoom, use_basemap, outline_geometries,
+        )
+        return img, False
     cache_z = cache_zoom_for_layer(layer, zoom)
     cached = frame_cache.get(layer.layer_id, frame.token, cache_z)
     if cached is not None:
@@ -1673,16 +2196,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", default=None, help="起始图层 ID")
     parser.add_argument("--no-anim", action="store_true", help="禁用长按动画")
     parser.add_argument("--no-lcd", action="store_true", help="禁用 1602 LCD 操作提示")
+    parser.add_argument(
+        "--detect-keys",
+        action="store_true",
+        help="识别宏键盘按键码（用于配置 channel_keys）后退出",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.detect_keys:
+        run_detect_keys()
+        return
+
     cfg = load_config()
     use_basemap = not args.no_basemap
     anim_fps = int(cfg.get("anim_fps", DEFAULT_ANIM_FPS))
     anim_hours = float(cfg.get("anim_window_hours", DEFAULT_ANIM_WINDOW_HOURS))
     long_press_ms = int(cfg.get("long_press_ms", DEFAULT_LONG_PRESS_MS))
+    default_range_km = int(cfg.get("adsb_default_range_km", 100))
+    channel_combos = parse_channel_keys(cfg)
 
     outline_geometries: list = []
     if not args.no_outline:
@@ -1699,9 +2233,10 @@ def main() -> None:
         default_zoom=args.zoom,
         start_layer=args.layer,
         long_press_ms=long_press_ms,
+        default_range_km=default_range_km,
     )
     for layer in layers:
-        if isinstance(layer, NmcNowcastLayer):
+        if isinstance(layer, (NmcNowcastLayer, AdsbRadarLayer)):
             layer.state = state
     notifier: LcdNotifier | None = None
     if not args.no_lcd and not args.once:
@@ -1718,8 +2253,10 @@ def main() -> None:
 
     if not args.no_knob and not args.once:
         KnobController(state).start()
-    if not args.no_keys and not args.once and not args.no_anim:
-        LayerKeyController(state).start()
+    if not args.no_keys and not args.once:
+        LayerKeyController(
+            state, channel_combos, anim_enabled=not args.no_anim,
+        ).start()
 
     lcd = None
     if not args.no_display:
@@ -1740,8 +2277,9 @@ def main() -> None:
             zoom = state.get_zoom()
             layer = state.get_layer()
             forecast_offset = state.get_forecast_offset() if state.is_nowcast_layer() else 0
+            adsb_range = state.get_adsb_range_km() if state.is_aircraft_channel() else 0
             try:
-                lat, lon, city = fetch_location(args.lat, args.lon)
+                lat, lon, city = fetch_location_cached(args.lat, args.lon)
                 if last_lat is not None and (
                     abs(lat - last_lat) > LOCATION_THRESHOLD
                     or abs(lon - last_lon) > LOCATION_THRESHOLD
@@ -1782,6 +2320,8 @@ def main() -> None:
                 )
                 if state.is_nowcast_layer():
                     print(f"  预报偏移: {format_offset_label(forecast_offset)}")
+                elif state.is_aircraft_channel():
+                    print(f"  ADSB 量程: {adsb_range} km")
                 else:
                     print(f"  帧: {frame.token} ({frame.timestamp})")
 
@@ -1797,6 +2337,10 @@ def main() -> None:
                     or (
                         state.is_nowcast_layer()
                         and state.get_forecast_offset() != forecast_offset
+                    )
+                    or (
+                        state.is_aircraft_channel()
+                        and state.get_adsb_range_km() != adsb_range
                     )
                 ):
                     continue
@@ -1817,8 +2361,10 @@ def main() -> None:
             if args.once:
                 break
 
-            print(f"等待 {args.interval} 秒（旋钮/空格可打断）...")
-            if state.wake.wait(timeout=args.interval):
+            refresh_sec = layer.live_refresh_sec()
+            wait_timeout = refresh_sec if refresh_sec is not None else args.interval
+            print(f"等待 {wait_timeout:.1f} 秒（旋钮/空格可打断）...")
+            if state.wake.wait(timeout=wait_timeout):
                 time.sleep(KNOB_DEBOUNCE)
                 state.wake.clear()
     except KeyboardInterrupt:

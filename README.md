@@ -11,6 +11,9 @@
 | `satellite_fy4b_disk` | FY-4B 全圆盘真彩色（DISK GCLR，GEOS 投影，以当前位置为中心、可缩放） | ~72 小时 |
 | `nowcast` | 中央气象台（NMC）文本天气信息（文本+图标，旋钮做时间步进 -1h~+8h） | 见下方说明 |
 | `radar_caiyun` | 彩云雷达拼图（需在 config 填写 `caiyun_token`） | ~2 小时 |
+| `adsb_radar` | 附近 ADSB 飞机雷达（纯雷达环，正北朝上） | 实时 |
+| `adsb_map` | ADSB 飞机雷达叠压暗地图底图 | 实时 |
+| `adsb_sweep` | ADSB 飞机雷达 + 旋转扫描线动画 | 实时 |
 
 > `satellite_fy4b_disk` 使用 FY-4B 全圆盘原始大图（每帧约 16MB），首次拉取较慢（约 10 秒），
 > 原始图缓存在 `cache/disk_raw/`，渲染后的成品图缓存在 `cache/frames/`。圆盘图动画首轮会逐帧下载，之后从缓存秒播。
@@ -46,6 +49,9 @@
 | 停止动画 | Animation | Stopped |
 | 短临时间步进 | Nowcast +1.5h | 07-03 18:30 |
 | 短临回当前 | Nowcast | Now |
+| 切换通道 | Channel | Weather Radar / Aircraft ADSB |
+| 飞机雷达量程 | ADSB Range | 100 km |
+| 量程复位 | Range Reset | 100 km |
 
 ### 接线（BCM / I2C）
 
@@ -131,6 +137,65 @@ python3 radar_display.py --no-basemap
 
 > **短临（nowcast）图层例外**：该图层为全国文本天气，不支持缩放，旋钮改为**预报时间步进**（见下）。
 
+> **飞机雷达通道例外**：旋钮改为调节雷达**量程**（20/50/100/150/200/300 km），见下方「飞机雷达通道」。
+
+## 飞机雷达通道（ADSB）
+
+以当前位置为中心，在圆屏上以**雷达形式**显示附近头顶的飞机。数据来自免费 ADSB API（[adsb.lol](https://api.adsb.lol) / adsb.fi / airplanes.live），无需 API key。
+
+### 通道与按键
+
+程序把图层分为两大**通道**：
+
+| 通道 | 包含图层 | 切换方式 |
+|------|----------|----------|
+| **天气** | `radar`、`satellite_fy4b`、`satellite_fy4b_disk`、`nowcast` 等 | 宏键盘**第 1 键**（需在 config 配置） |
+| **飞机** | `adsb_radar`、`adsb_map`、`adsb_sweep` | 宏键盘**第 2 键** |
+
+- **空格短按**：仅在**当前通道内**循环切换图层（天气通道内切雷达/风云/短临；飞机通道内切三种雷达风格）。
+- **空格长按**：播放当前图层历史动画（飞机通道图层无历史帧，动画自然无效）。
+- **宏键盘第 3、4 键**：预留，暂未绑定。
+
+### 飞机通道内三种风格
+
+| 图层 ID | 说明 |
+|---------|------|
+| `adsb_radar` | 纯雷达：同心距离环 + 方位刻度，飞机为亮点 + 航向箭头 |
+| `adsb_map` | 雷达环叠加压暗的高德地图底图 |
+| `adsb_sweep` | 纯雷达 + 旋转扫描线动画（约 10fps） |
+
+圆屏顶部显示量程与飞机数量；最近若干架标注呼号与高度（FL）。飞机按高度分色（地面/低空/中空/高空）。
+
+### 旋钮（飞机通道）
+
+- 向上转（音量+）：**缩小量程**（放大，如 100km → 50km）
+- 向下转（音量-）：**放大量程**（缩小，如 100km → 150km）
+- 按下旋钮：复位为默认量程（默认 100 km，可在 config 调整）
+
+量程可选：20 / 50 / 100 / 150 / 200 / 300 km。
+
+### 配置通道按键
+
+宏键盘键码需写入 `config.json` 的 `channel_keys`。首次配置：
+
+```bash
+python3 radar_display.py --detect-keys
+# 按下宏键盘第 1、2 键，记下输出的 KEY_* 名称，例如 KEY_1、KEY_2
+```
+
+然后编辑 `config.json`：
+
+```json
+"channel_keys": {
+  "weather": "KEY_1",
+  "aircraft": "KEY_2"
+}
+```
+
+未配置时，通道键无效；仍可用空格在**当前通道内**切换图层。
+
+`adsb_ttl_sec` 控制 ADSB 数据缓存秒数（默认 8）；`adsb_default_range_km` 为默认量程（默认 100）。
+
 ## 短临图层（中央气象台文本天气）
 
 `nowcast` 图层不再使用 RainViewer 瓦片，而是从中央气象台（[nmc.cn](http://www.nmc.cn/)）拉取当前位置最近站点的文本天气，在圆屏上以**文字 + 天气图标**展示（天气现象、温度、降水、风、湿度）。定位通过 NMC `rest/position` 按经纬度解析到最近国家站。
@@ -154,11 +219,11 @@ python3 radar_display.py --no-basemap
 
 宏键盘 **KEY_SPACE**（短按/长按）：
 
-- **短按**：循环切换图层（雷达 → 风云4B中国区 → 风云4B圆盘 → 短临预报 → …）
+- **短按**：在**当前通道内**循环切换图层（天气：雷达 → 风云4B → 短临 → …；飞机：纯雷达 → 叠地图 → 扫描线）
 - **长按**（默认 ≥500ms）：播放当前图层近 6 小时历史动画（松手停止）
 - 动画帧率默认 5fps，可在 `config.json` 调整
 
-禁用：`--no-keys` 或 `--no-anim`（仅禁用长按动画）。
+禁用：`--no-keys` 禁用全部键盘；`--no-anim` 仅禁用长按动画（短按切图层仍可用）。
 
 ## 预渲染磁盘缓存
 
@@ -186,6 +251,7 @@ python3 radar_display.py --no-basemap
 | `--no-keys` | - | 禁用空格键图层/动画控制 |
 | `--no-anim` | - | 禁用长按动画（仍可用短按切图层） |
 | `--no-lcd` | - | 禁用 1602 LCD 操作提示 |
+| `--detect-keys` | - | 识别宏键盘按键码后退出（配置 channel_keys） |
 | `--layer` | 配置首项 | 起始图层 ID |
 | `--no-display` | - | 仅下载渲染，不刷屏幕（调试） |
 
@@ -199,21 +265,32 @@ IP 定位失败时使用 `config.json`：
   "default_lon": 116.4074,
   "default_city": "Beijing",
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
+  "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_sweep"],
+  "channel_keys": {
+    "weather": "KEY_1",
+    "aircraft": "KEY_2"
+  },
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,
   "anim_window_hours": 6,
   "lcd_backlight_seconds": 5,
-  "nmc_cache_ttl_sec": 300
+  "nmc_cache_ttl_sec": 300,
+  "adsb_ttl_sec": 8,
+  "adsb_default_range_km": 100
 }
 ```
 
-- `layers`：启用图层及循环顺序
+- `layers`：天气通道图层及顺序
+- `aircraft_layers`：飞机雷达通道图层及顺序
+- `channel_keys`：宏键盘通道切换键（`KEY_*` 名称，空则未绑定）
 - `caiyun_token`：填写后可在 `layers` 中加入 `radar_caiyun`
 - `long_press_ms`：长按判定毫秒数
 - `anim_fps` / `anim_window_hours`：动画帧率与回溯小时数
 - `lcd_backlight_seconds`：1602 LCD 操作提示背光点亮秒数
 - `nmc_cache_ttl_sec`：短临图层的中央气象台数据缓存秒数
+- `adsb_ttl_sec`：飞机雷达 ADSB 数据缓存秒数
+- `adsb_default_range_km`：飞机雷达默认量程（km）
 
 ## 开机自启（可选）
 
@@ -238,6 +315,7 @@ journalctl -u radar.service -f
 | `lcd_i2c.py` | 1602A I2C 字符屏驱动 |
 | `lcd_notifier.py` | 1602 操作提示（背光计时） |
 | `nmc_client.py` | 中央气象台文本天气客户端（短临图层） |
+| `adsb_client.py` | ADSB 飞机数据客户端（飞机雷达通道） |
 | `radar_display.py` | 多图层气象图主程序 |
 | `test_display.py` | 屏幕色彩测试 |
 | `config.json` | 默认经纬度 |
