@@ -30,6 +30,7 @@ Image.MAX_IMAGE_PIXELS = None
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
 from lcd_notifier import LcdNotifier
+from nmc_client import NmcClient, NmcError, NmcReport
 
 TILE_SIZE = 256
 GRID = 3
@@ -60,6 +61,7 @@ BASEMAP_BLEND = 0.35
 USER_AGENT = "gc9a01-radar-display/2.0"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+CJK_FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 CACHE_DIR = BASE_DIR / "cache"
@@ -87,6 +89,10 @@ DEFAULT_LAYERS = ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"]
 DEFAULT_LONG_PRESS_MS = 500
 DEFAULT_ANIM_FPS = 5
 DEFAULT_ANIM_WINDOW_HOURS = 6
+
+# Nowcast 预报时间步进：-1h ~ +8h，每 30 分钟一档
+FORECAST_OFFSETS_MIN = list(range(-60, 481, 30))
+FORECAST_ZERO_INDEX = FORECAST_OFFSETS_MIN.index(0)
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -179,6 +185,22 @@ def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFon
         return ImageFont.truetype(path, size)
     except OSError:
         return ImageFont.load_default()
+
+
+_cjk_font_cache: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
+
+
+def get_cjk_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """带中文字形的字体（Noto Sans CJK），缺失时回退到默认字体。"""
+    cached = _cjk_font_cache.get(size)
+    if cached is not None:
+        return cached
+    try:
+        font = ImageFont.truetype(CJK_FONT_PATH, size)
+    except OSError:
+        font = get_font(size)
+    _cjk_font_cache[size] = font
+    return font
 
 
 def lat_lon_to_global_pixel(lat: float, lon: float, zoom: int) -> tuple[float, float]:
@@ -921,6 +943,161 @@ class CaiyunRadarLayer(LayerProvider):
         return apply_circle_mask(cropped)
 
 
+ICON_COLORS = {
+    "sunny": (255, 200, 60),
+    "cloudy": (200, 210, 225),
+    "overcast": (150, 160, 175),
+    "rain": (90, 170, 245),
+    "thunder": (150, 120, 240),
+    "snow": (210, 230, 255),
+    "fog": (170, 180, 190),
+    "dust": (200, 170, 110),
+    "unknown": (170, 180, 195),
+}
+
+
+def _draw_cloud(draw: ImageDraw.ImageDraw, cx: int, cy: int, s: float, color) -> None:
+    draw.ellipse([cx - s, cy - s * 0.5, cx, cy + s * 0.5], fill=color)
+    draw.ellipse([cx - s * 0.4, cy - s * 0.8, cx + s * 0.6, cy + s * 0.4], fill=color)
+    draw.ellipse([cx, cy - s * 0.5, cx + s, cy + s * 0.5], fill=color)
+    draw.rectangle([cx - s, cy, cx + s, cy + s * 0.5], fill=color)
+
+
+def draw_weather_icon(
+    draw: ImageDraw.ImageDraw, category: str, cx: int, cy: int, r: int
+) -> None:
+    """在 (cx, cy) 处画一个半径约 r 的简单天气图标。"""
+    color = ICON_COLORS.get(category, ICON_COLORS["unknown"])
+    if category == "sunny":
+        for i in range(8):
+            ang = math.radians(i * 45)
+            x0 = cx + math.cos(ang) * r
+            y0 = cy + math.sin(ang) * r
+            x1 = cx + math.cos(ang) * r * 1.5
+            y1 = cy + math.sin(ang) * r * 1.5
+            draw.line([(x0, y0), (x1, y1)], fill=color, width=3)
+        draw.ellipse([cx - r * 0.7, cy - r * 0.7, cx + r * 0.7, cy + r * 0.7], fill=color)
+        return
+    if category == "cloudy":
+        draw.ellipse(
+            [cx - r * 0.2, cy - r, cx + r * 0.8, cy], fill=(255, 200, 60)
+        )
+        _draw_cloud(draw, cx, cy + r * 0.2, r * 0.85, color)
+        return
+    if category in ("overcast", "fog", "dust", "unknown"):
+        _draw_cloud(draw, cx, cy, r, color)
+        if category == "fog":
+            for i in range(3):
+                y = cy + r * 0.6 + i * 6
+                draw.line([(cx - r, y), (cx + r, y)], fill=(200, 205, 215), width=3)
+        return
+    # rain / thunder / snow: cloud + falling elements
+    _draw_cloud(draw, cx, cy - r * 0.3, r * 0.9, (150, 160, 175))
+    base_y = cy + r * 0.5
+    if category == "rain":
+        for dx in (-r * 0.5, 0, r * 0.5):
+            draw.line([(cx + dx, base_y), (cx + dx - 4, base_y + 12)], fill=color, width=3)
+    elif category == "thunder":
+        draw.polygon(
+            [
+                (cx + 4, base_y), (cx - 8, base_y + 14),
+                (cx, base_y + 14), (cx - 4, base_y + 26),
+                (cx + 12, base_y + 8), (cx + 3, base_y + 8),
+            ],
+            fill=(255, 220, 60),
+        )
+    elif category == "snow":
+        for dx in (-r * 0.5, 0, r * 0.5):
+            _cx = cx + dx
+            draw.line([(_cx - 5, base_y + 6), (_cx + 5, base_y + 6)], fill=color, width=2)
+            draw.line([(_cx, base_y + 1), (_cx, base_y + 11)], fill=color, width=2)
+
+
+def format_offset_label(offset_min: int) -> str:
+    if offset_min == 0:
+        return "现在"
+    sign = "+" if offset_min > 0 else "-"
+    mins = abs(offset_min)
+    hours = mins / 60.0
+    if mins % 60 == 0:
+        return f"{sign}{mins // 60}h"
+    return f"{sign}{hours:.1f}h"
+
+
+def _draw_centered(draw, y, text, font, fill):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    draw.text(((WIDTH - tw) // 2, y), text, fill=fill, font=font)
+
+
+def render_nmc_report(report: NmcReport, city: str) -> Image.Image:
+    """把 NMC 文本天气报告绘制到 240x240 圆屏上（文本 + 图标）。"""
+    img = Image.new("RGB", (WIDTH, HEIGHT), (12, 16, 28))
+    draw = ImageDraw.Draw(img)
+
+    target_txt = report.target_time.strftime("%m-%d %H:%M")
+    offset_txt = format_offset_label(
+        round((report.target_time - datetime.now().astimezone()).total_seconds() / 60)
+    )
+    _draw_centered(draw, 24, f"{city}  {offset_txt}", get_cjk_font(16), (255, 255, 255))
+    _draw_centered(draw, 46, target_txt, get_cjk_font(13), (150, 160, 180))
+    _draw_centered(draw, 64, report.valid_label, get_cjk_font(12), (120, 170, 210))
+
+    draw_weather_icon(draw, report.icon, WIDTH // 2, 104, 20)
+
+    if report.weather_text:
+        _draw_centered(draw, 128, report.weather_text, get_cjk_font(20), (235, 240, 250))
+    _draw_centered(draw, 156, report.temperature, get_cjk_font(24), (255, 210, 90))
+
+    y = 188
+    _draw_centered(draw, y, f"降水 {report.precip}", get_cjk_font(13), (140, 190, 240))
+    y += 18
+    line = f"风 {report.wind}"
+    if report.humidity:
+        line = f"湿度 {report.humidity}  {line}"
+    _draw_centered(draw, y, line, get_cjk_font(12), (170, 180, 195))
+
+    return apply_circle_mask(img)
+
+
+class NmcNowcastLayer(LayerProvider):
+    """中央气象台文本天气（Nowcast），旋钮做时间步进。"""
+
+    layer_id = "nowcast"
+    display_name = "短临"
+
+    def __init__(self, client: NmcClient) -> None:
+        self.client = client
+        self.state: "AppState | None" = None
+
+    def supports_zoom(self) -> bool:
+        return False
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        offset = self.state.get_forecast_offset() if self.state else 0
+        bucket = int(time.time() // 60)  # 每分钟刷新一次缓存键
+        return [WeatherFrame(token=f"nmc_{offset}_{bucket}", timestamp=int(time.time()))]
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        offset = self.state.get_forecast_offset() if self.state else 0
+        try:
+            report = self.client.pick_report(lat, lon, offset)
+        except NmcError as exc:
+            return make_error_image(f"NMC\n{exc}")
+        except Exception as exc:
+            return make_error_image(f"短临\n{exc}")
+        return render_nmc_report(report, city)
+
+
 LAYER_LCD_LABELS = {
     "radar": "Radar",
     "nowcast": "Nowcast",
@@ -943,9 +1120,11 @@ def frame_lcd_time(frame: WeatherFrame) -> str | None:
 
 
 def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
+    nmc_ttl = float(cfg.get("nmc_cache_ttl_sec", 300))
+    nmc_client = NmcClient(session=SESSION, weather_ttl_sec=nmc_ttl)
     registry: dict[str, LayerProvider] = {
         "radar": RainViewerLayer("radar", "雷达", "past"),
-        "nowcast": RainViewerLayer("nowcast", "短临", "nowcast"),
+        "nowcast": NmcNowcastLayer(nmc_client),
         "satellite_fy4b": FY4BLayer(),
         "satellite_fy4b_disk": FY4BDiskLayer(),
     }
@@ -1158,6 +1337,7 @@ class AppState:
                     break
         self.layer_index = idx
         self.notifier: LcdNotifier | None = None
+        self._forecast_step_index = FORECAST_ZERO_INDEX
 
     def _lcd_notify(self, line1: str, line2: str = "") -> None:
         if self.notifier is not None:
@@ -1165,6 +1345,35 @@ class AppState:
 
     def notify_lcd(self, line1: str, line2: str = "") -> None:
         self._lcd_notify(line1, line2)
+
+    def is_nowcast_layer(self) -> bool:
+        with self._lock:
+            return self.layers[self.layer_index].layer_id == "nowcast"
+
+    def get_forecast_offset(self) -> int:
+        with self._lock:
+            return FORECAST_OFFSETS_MIN[self._forecast_step_index]
+
+    def _lcd_forecast(self, offset: int) -> None:
+        label = format_offset_label(offset)
+        target = (datetime.now().astimezone() + timedelta(minutes=offset))
+        self._lcd_notify(f"Nowcast {label}", target.strftime("%m-%d %H:%M"))
+
+    def step_forecast(self, direction: int) -> None:
+        with self._lock:
+            n = len(FORECAST_OFFSETS_MIN)
+            self._forecast_step_index = (self._forecast_step_index + direction) % n
+            offset = FORECAST_OFFSETS_MIN[self._forecast_step_index]
+        print(f"短临: 预报偏移 -> {format_offset_label(offset)}")
+        self._lcd_forecast(offset)
+        self.wake.set()
+
+    def reset_nowcast(self) -> None:
+        with self._lock:
+            self._forecast_step_index = FORECAST_ZERO_INDEX
+        print("短临: 回到当前实况")
+        self._lcd_notify("Nowcast", "Now")
+        self.wake.set()
 
     @staticmethod
     def _clamp(z: int) -> int:
@@ -1208,6 +1417,7 @@ class AppState:
         with self._lock:
             self.layer_index = (self.layer_index + 1) % len(self.layers)
             self.anim_active = False
+            self._forecast_step_index = FORECAST_ZERO_INDEX
             layer = self.layers[self.layer_index]
             name = layer.display_name
         print(f"图层: -> {name}")
@@ -1290,12 +1500,22 @@ class KnobController(threading.Thread):
                 for ev in dev.read_loop():
                     if ev.type != ecodes.EV_KEY or ev.value != 1:
                         continue
+                    nowcast = self.state.is_nowcast_layer()
                     if ev.code == ecodes.KEY_VOLUMEUP:
-                        self.state.bump_zoom(+1)
+                        if nowcast:
+                            self.state.step_forecast(+1)
+                        else:
+                            self.state.bump_zoom(+1)
                     elif ev.code == ecodes.KEY_VOLUMEDOWN:
-                        self.state.bump_zoom(-1)
+                        if nowcast:
+                            self.state.step_forecast(-1)
+                        else:
+                            self.state.bump_zoom(-1)
                     elif ev.code == ecodes.KEY_MUTE:
-                        self.state.reset_zoom()
+                        if nowcast:
+                            self.state.reset_nowcast()
+                        else:
+                            self.state.reset_zoom()
             except OSError as exc:
                 print(f"旋钮读取中断: {exc}")
                 time.sleep(2)
@@ -1480,6 +1700,9 @@ def main() -> None:
         start_layer=args.layer,
         long_press_ms=long_press_ms,
     )
+    for layer in layers:
+        if isinstance(layer, NmcNowcastLayer):
+            layer.state = state
     notifier: LcdNotifier | None = None
     if not args.no_lcd and not args.once:
         lcd_backlight_seconds = float(cfg.get("lcd_backlight_seconds", 5))
@@ -1516,6 +1739,7 @@ def main() -> None:
         while True:
             zoom = state.get_zoom()
             layer = state.get_layer()
+            forecast_offset = state.get_forecast_offset() if state.is_nowcast_layer() else 0
             try:
                 lat, lon, city = fetch_location(args.lat, args.lon)
                 if last_lat is not None and (
@@ -1556,7 +1780,10 @@ def main() -> None:
                     f"位置: {city} ({lat:.4f}, {lon:.4f}), "
                     f"图层={layer.display_name}, zoom={zoom}"
                 )
-                print(f"  帧: {frame.token} ({frame.timestamp})")
+                if state.is_nowcast_layer():
+                    print(f"  预报偏移: {format_offset_label(forecast_offset)}")
+                else:
+                    print(f"  帧: {frame.token} ({frame.timestamp})")
 
                 t0 = time.time()
                 img, from_cache = render_layer_frame(
@@ -1567,6 +1794,10 @@ def main() -> None:
                     state.get_zoom() != zoom
                     or state.get_layer().layer_id != layer.layer_id
                     or state.is_anim_active()
+                    or (
+                        state.is_nowcast_layer()
+                        and state.get_forecast_offset() != forecast_offset
+                    )
                 ):
                     continue
 

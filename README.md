@@ -9,7 +9,7 @@
 | `radar` | [RainViewer](https://www.rainviewer.com/) 雷达回波（默认，免 token） | ~2 小时 |
 | `satellite_fy4b` | 国家卫星气象中心 FY-4B 中国区真彩色（15 分钟/帧） | ~72 小时 |
 | `satellite_fy4b_disk` | FY-4B 全圆盘真彩色（DISK GCLR，GEOS 投影，以当前位置为中心、可缩放） | ~72 小时 |
-| `nowcast` | RainViewer 降水短临预报（有降雨时才有帧） | 未来数小时 |
+| `nowcast` | 中央气象台（NMC）文本天气信息（文本+图标，旋钮做时间步进 -1h~+8h） | 见下方说明 |
 | `radar_caiyun` | 彩云雷达拼图（需在 config 填写 `caiyun_token`） | ~2 小时 |
 
 > `satellite_fy4b_disk` 使用 FY-4B 全圆盘原始大图（每帧约 16MB），首次拉取较慢（约 10 秒），
@@ -44,6 +44,8 @@
 | 旋钮按下 | Zoom Reset | z7 |
 | 长按动画 | Animation | Play Radar |
 | 停止动画 | Animation | Stopped |
+| 短临时间步进 | Nowcast +1.5h | 07-03 18:30 |
+| 短临回当前 | Nowcast | Now |
 
 ### 接线（BCM / I2C）
 
@@ -127,6 +129,27 @@ python3 radar_display.py --no-basemap
 
 缩放范围 `3`~`12`，转动后立即重绘。需要 `python3-evdev`，且运行用户要能读取 `/dev/input/event*`。用 `--no-knob` 可禁用。
 
+> **短临（nowcast）图层例外**：该图层为全国文本天气，不支持缩放，旋钮改为**预报时间步进**（见下）。
+
+## 短临图层（中央气象台文本天气）
+
+`nowcast` 图层不再使用 RainViewer 瓦片，而是从中央气象台（[nmc.cn](http://www.nmc.cn/)）拉取当前位置最近站点的文本天气，在圆屏上以**文字 + 天气图标**展示（天气现象、温度、降水、风、湿度）。定位通过 NMC `rest/position` 按经纬度解析到最近国家站。
+
+在该图层下，**旋钮**语义变为预报时间步进：
+
+- 向上转（音量+）：预报时间 **+30 分钟**
+- 向下转（音量-）：预报时间 **-30 分钟**
+- 按下旋钮（静音键）：回到**当前实况**
+
+时间偏移在 **[-1h, +8h]** 内循环。圆屏与 1602 LCD 会标注请求的目标时间与数据实际时段。
+
+数据粒度限制：
+- **过去/当前**（-1h~0）：逐小时实况（`passedchart`/`real`）
+- **未来**（+0.5h~+8h）：中央气象台逐日**白天/夜间**预报（半天粒度），落在同一时段的多个 30 分钟档会显示相同预报文字，圆屏顶部标注实际数据时段
+- 境外坐标（如香港）会映射到最近的国内站点
+
+空格键在该图层仍可切换到其它图层。`nmc_cache_ttl_sec` 控制 NMC 数据缓存秒数（默认 300）。
+
 ## 空格键图层切换与动画
 
 宏键盘 **KEY_SPACE**（短按/长按）：
@@ -180,7 +203,8 @@ IP 定位失败时使用 `config.json`：
   "long_press_ms": 500,
   "anim_fps": 5,
   "anim_window_hours": 6,
-  "lcd_backlight_seconds": 5
+  "lcd_backlight_seconds": 5,
+  "nmc_cache_ttl_sec": 300
 }
 ```
 
@@ -189,6 +213,7 @@ IP 定位失败时使用 `config.json`：
 - `long_press_ms`：长按判定毫秒数
 - `anim_fps` / `anim_window_hours`：动画帧率与回溯小时数
 - `lcd_backlight_seconds`：1602 LCD 操作提示背光点亮秒数
+- `nmc_cache_ttl_sec`：短临图层的中央气象台数据缓存秒数
 
 ## 开机自启（可选）
 
@@ -212,6 +237,7 @@ journalctl -u radar.service -f
 | `gc9a01.py` | GC9A01 屏幕驱动 |
 | `lcd_i2c.py` | 1602A I2C 字符屏驱动 |
 | `lcd_notifier.py` | 1602 操作提示（背光计时） |
+| `nmc_client.py` | 中央气象台文本天气客户端（短临图层） |
 | `radar_display.py` | 多图层气象图主程序 |
 | `test_display.py` | 屏幕色彩测试 |
 | `config.json` | 默认经纬度 |
