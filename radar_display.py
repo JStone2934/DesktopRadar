@@ -29,7 +29,19 @@ CARTO_BASE = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
 USER_AGENT = "gc9a01-radar-display/1.0"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+CACHE_DIR = BASE_DIR / "cache"
+
+# Natural Earth 矢量轮廓（经纬度 GeoJSON），本地缓存后离线可用
+OUTLINE_SOURCES = {
+    "ne_50m_coastline.geojson":
+        "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_coastline.geojson",
+    "ne_50m_admin_0_boundary_lines_land.geojson":
+        "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_boundary_lines_land.geojson",
+}
+OUTLINE_COLOR = (110, 130, 150)  # 冷灰色勾线
+OUTLINE_WIDTH = 1
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -121,6 +133,80 @@ def basemap_available(zoom: int, tx: int, ty: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def load_outline_geometries() -> list:
+    """加载海岸线/国界 GeoJSON，返回 LineString 坐标序列列表；本地缓存优先。"""
+    CACHE_DIR.mkdir(exist_ok=True)
+    features_coords: list = []
+
+    for fname, url in OUTLINE_SOURCES.items():
+        cache_file = CACHE_DIR / fname
+        if not cache_file.exists():
+            try:
+                print(f"  下载轮廓数据: {fname}")
+                resp = SESSION.get(url, timeout=30)
+                resp.raise_for_status()
+                cache_file.write_bytes(resp.content)
+            except Exception as exc:
+                print(f"  轮廓数据下载失败 {fname}: {exc}")
+                continue
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"  轮廓数据解析失败 {fname}: {exc}")
+            continue
+
+        for feature in data.get("features", []):
+            geom = feature.get("geometry") or {}
+            gtype = geom.get("type")
+            coords = geom.get("coordinates")
+            if gtype == "LineString":
+                features_coords.append(coords)
+            elif gtype == "MultiLineString":
+                features_coords.extend(coords)
+
+    return features_coords
+
+
+def draw_outline(
+    composite: Image.Image,
+    lat: float,
+    lon: float,
+    zoom: int,
+    geometries: list,
+) -> None:
+    """把海岸线/国界勾线画到 composite（像素坐标系）上。"""
+    if not geometries:
+        return
+
+    origin_tx, origin_ty = lat_lon_to_tile(lat, lon, zoom)
+    origin_tx -= GRID // 2
+    origin_ty -= GRID // 2
+    origin_px = origin_tx * TILE_SIZE
+    origin_py = origin_ty * TILE_SIZE
+
+    # composite 覆盖的经度范围，用于快速裁剪
+    scale = TILE_SIZE * (2 ** zoom)
+    lon_min = origin_px / scale * 360.0 - 180.0
+    lon_max = (origin_px + COMPOSITE_SIZE) / scale * 360.0 - 180.0
+
+    draw = ImageDraw.Draw(composite)
+    for line in geometries:
+        # 粗过滤：整段经度都在窗口外则跳过
+        lons = [pt[0] for pt in line]
+        if max(lons) < lon_min or min(lons) > lon_max:
+            continue
+
+        pts = []
+        for lon_pt, lat_pt in line:
+            gx, gy = lat_lon_to_global_pixel(lat_pt, lon_pt, zoom)
+            px = gx - origin_px
+            py = gy - origin_py
+            pts.append((px, py))
+        if len(pts) >= 2:
+            draw.line(pts, fill=OUTLINE_COLOR, width=OUTLINE_WIDTH, joint="curve")
 
 
 def build_composite(
@@ -233,11 +319,14 @@ def render_radar_frame(
     city: str,
     zoom: int,
     use_basemap: bool,
+    outline_geometries: list | None,
 ) -> Image.Image:
     host, radar_path, frame_ts = fetch_rainviewer_frame()
     print(f"  雷达帧: {radar_path} ({frame_ts})")
 
     composite = build_composite(lat, lon, zoom, host, radar_path, use_basemap)
+    if outline_geometries:
+        draw_outline(composite, lat, lon, zoom, outline_geometries)
     cropped = crop_centered(composite, lat, lon, zoom)
     cropped = draw_overlay(cropped, city, frame_ts)
     return apply_circle_mask(cropped)
@@ -251,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", type=int, default=300, help="刷新间隔秒数（默认 300）")
     parser.add_argument("--once", action="store_true", help="只刷新一次")
     parser.add_argument("--no-basemap", action="store_true", help="不加载底图瓦片")
+    parser.add_argument("--no-outline", action="store_true", help="不绘制海岸线/国界轮廓勾线")
     parser.add_argument("--no-display", action="store_true", help="仅下载渲染，不刷屏幕（调试用）")
     return parser.parse_args()
 
@@ -258,6 +348,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     use_basemap = not args.no_basemap
+
+    outline_geometries: list = []
+    if not args.no_outline:
+        outline_geometries = load_outline_geometries()
+        print(f"轮廓线段: {len(outline_geometries)} 条")
 
     lcd = None
     if not args.no_display:
@@ -275,7 +370,9 @@ def main() -> None:
                 lat, lon, city = fetch_location(args.lat, args.lon)
                 print(f"位置: {city} ({lat:.4f}, {lon:.4f}), zoom={args.zoom}")
 
-                img = render_radar_frame(lat, lon, city, args.zoom, use_basemap)
+                img = render_radar_frame(
+                    lat, lon, city, args.zoom, use_basemap, outline_geometries
+                )
                 show(img)
                 print("雷达图已更新")
             except Exception as exc:
