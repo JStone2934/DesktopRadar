@@ -24,6 +24,9 @@ from typing import Callable
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+# 圆盘图分辨率高达上亿像素，放开 Pillow 的解压炸弹保护
+Image.MAX_IMAGE_PIXELS = None
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
 
@@ -34,14 +37,18 @@ HALF = WIDTH // 2
 
 IP_API_URL = "http://ip-api.com/json"
 RAINVIEWER_API = "https://api.rainviewer.com/public/weather-maps.json"
-GIBS_WMTS = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best"
-GIBS_LAYER = "Himawari_AHI_Band13_Clean_Infrared"
 FY4B_XML_URL = (
     "http://img.nsmc.org.cn/CLOUDIMAGE/FY4B/AGRI/GCLR/SEC/xml/FY4B-china-72h.xml"
+)
+FY4B_DISK_XML_URL = (
+    "http://img.nsmc.org.cn/PORTAL/NSMC/XML/FY4B/FY4B_AGRI_IMG_DISK_GCLR_NOM.xml"
 )
 NSMC_REFERER = "http://www.nsmc.org.cn/"
 # FY-4B 中国区缩略图近似经纬度范围（等经纬度裁切）
 FY4B_CHINA_BOUNDS = (70.0, 4.0, 140.0, 54.0)  # west, south, east, north
+# FY-4B 全圆盘 GEOS 地球静止投影参数（星下点经度 105E）
+FY4B_SUB_LON = 105.0
+FY4B_DISK_KEEP_RAW = 30  # 保留的原始圆盘 JPEG 帧数（约 6h 动画，每帧约 16MB）
 AMAP_TILE = (
     "https://webrd0{sub}.is.autonavi.com/appmaptile"
     "?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
@@ -56,6 +63,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 CACHE_DIR = BASE_DIR / "cache"
 FRAMES_DIR = CACHE_DIR / "frames"
+FY4B_DISK_RAW_DIR = CACHE_DIR / "disk_raw"
 BASEMAP_OK_FILE = CACHE_DIR / "basemap_ok"
 KEEP_FRAME_DIRS = 40
 LOCATION_THRESHOLD = 0.05
@@ -72,10 +80,9 @@ OUTLINE_WIDTH = 1
 ZOOM_MIN = 3
 ZOOM_MAX = 12
 RADAR_MAX_ZOOM = 7
-GIBS_MAX_ZOOM = 6
 KNOB_DEBOUNCE = 0.15
 FRAME_TTL = 60
-DEFAULT_LAYERS = ["radar", "satellite_fy4b", "satellite_gibs", "nowcast"]
+DEFAULT_LAYERS = ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"]
 DEFAULT_LONG_PRESS_MS = 500
 DEFAULT_ANIM_FPS = 5
 DEFAULT_ANIM_WINDOW_HOURS = 6
@@ -94,6 +101,7 @@ _TILE_POOL = ThreadPoolExecutor(max_workers=9)
 
 _rv_cache: tuple[float, dict] | None = None
 _fy4b_cache: tuple[float, list[WeatherFrame]] | None = None
+_fy4b_disk_cache: tuple[float, list[WeatherFrame]] | None = None
 FY4B_XML_TTL = 300
 
 
@@ -240,30 +248,72 @@ def rainviewer_frames(kind: str, window_hours: float) -> list[WeatherFrame]:
     ]
 
 
-def gibs_time_str(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def geos_norm(lat: float, lon: float, sub_lon: float = FY4B_SUB_LON) -> tuple[float, float] | None:
+    """经纬度 -> 地球静止圆盘归一化坐标 (nx, ny)，各 [-1, 1]；不可见返回 None。"""
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    slon_r = math.radians(sub_lon)
+    r_eq = 6378137.0
+    r_pol = 6356752.31414
+    h = 42164160.0
+    e2 = 1.0 - (r_pol ** 2) / (r_eq ** 2)
+    c_lat = math.atan((r_pol ** 2) / (r_eq ** 2) * math.tan(lat_r))
+    rl = r_pol / math.sqrt(1.0 - e2 * math.cos(c_lat) ** 2)
+    r1 = h - rl * math.cos(c_lat) * math.cos(lon_r - slon_r)
+    r2 = -rl * math.cos(c_lat) * math.sin(lon_r - slon_r)
+    r3 = rl * math.sin(c_lat)
+    if r1 <= 0:
+        return None
+    max_a = math.asin(r_eq / h)
+    nx = math.atan(-r2 / r1) / max_a
+    ny = math.atan(r3 / math.sqrt(r1 * r1 + r2 * r2)) / max_a
+    if nx * nx + ny * ny > 1.0:
+        return None
+    return nx, ny
 
 
-def gibs_frames(window_hours: float) -> list[WeatherFrame]:
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=window_hours)
+def parse_fy4b_disk_xml(xml_text: str) -> list[WeatherFrame]:
+    root = ET.fromstring(xml_text)
+    seen: set[str] = set()
     frames: list[WeatherFrame] = []
-    t = now.replace(second=0, microsecond=0)
-    minute = (t.minute // 10) * 10
-    t = t.replace(minute=minute)
-    while t >= cutoff:
-        ts = int(t.timestamp())
-        token = f"gibs_{t.strftime('%Y%m%d%H%M')}"
-        frames.append(WeatherFrame(token=token, timestamp=ts, payload={"time": gibs_time_str(ts)}))
-        t -= timedelta(minutes=10)
-    frames.reverse()
-    return frames if frames else [
-        WeatherFrame(
-            token=f"gibs_{now.strftime('%Y%m%d%H%M')}",
-            timestamp=int(now.timestamp()),
-            payload={"time": gibs_time_str(int(now.timestamp()))},
+    for image in root.findall("image"):
+        url = image.get("url", "")
+        if not url or "thumb" in url.lower():
+            continue
+        if url.startswith("//"):
+            url = "http:" + url
+        m = re.search(r"(\d{14})", url)
+        if not m:
+            continue
+        stamp = m.group(1)
+        if stamp in seen:
+            continue
+        seen.add(stamp)
+        dt = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        frames.append(
+            WeatherFrame(
+                token=f"fy4bdisk_{stamp}",
+                timestamp=int(dt.timestamp()),
+                payload={"url": url},
+            )
         )
-    ]
+    frames.sort(key=lambda f: f.timestamp)
+    return frames
+
+
+def fetch_fy4b_disk_frames(window_hours: float) -> list[WeatherFrame]:
+    global _fy4b_disk_cache
+    now = time.time()
+    if _fy4b_disk_cache and now - _fy4b_disk_cache[0] < FY4B_XML_TTL:
+        all_frames = _fy4b_disk_cache[1]
+    else:
+        resp = SESSION.get(FY4B_DISK_XML_URL, timeout=20, headers={"Referer": NSMC_REFERER})
+        resp.raise_for_status()
+        all_frames = parse_fy4b_disk_xml(resp.text)
+        _fy4b_disk_cache = (now, all_frames)
+    cutoff = int(time.time() - window_hours * 3600)
+    recent = [f for f in all_frames if f.timestamp >= cutoff]
+    return recent if recent else (all_frames[-1:] if all_frames else [])
 
 
 def parse_fy4b_xml(xml_text: str) -> list[WeatherFrame]:
@@ -662,15 +712,48 @@ class RainViewerLayer(LayerProvider):
         )
 
 
-class GIBSSatelliteLayer(LayerProvider):
-    layer_id = "satellite_gibs"
-    display_name = "卫星GIBS"
+class FY4BDiskLayer(LayerProvider):
+    """FY-4B 全圆盘真彩色（DISK GCLR NOM），GEOS 投影，以当前位置为中心，可缩放。"""
+
+    layer_id = "satellite_fy4b_disk"
+    display_name = "风云4B盘"
 
     def supports_zoom(self) -> bool:
         return True
 
     def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
-        return gibs_frames(window_hours)
+        return fetch_fy4b_disk_frames(window_hours)
+
+    def _raw_path(self, frame: WeatherFrame) -> Path:
+        return FY4B_DISK_RAW_DIR / f"{frame_token_slug(frame.token)}.jpg"
+
+    def _raw_bytes(self, frame: WeatherFrame) -> bytes:
+        path = self._raw_path(frame)
+        if path.exists():
+            try:
+                return path.read_bytes()
+            except Exception:
+                pass
+        resp = SESSION.get(frame.payload["url"], timeout=60, headers={"Referer": NSMC_REFERER})
+        resp.raise_for_status()
+        FY4B_DISK_RAW_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_bytes(resp.content)
+            self._prune_raw()
+        except Exception:
+            pass
+        return resp.content
+
+    def _prune_raw(self) -> None:
+        if not FY4B_DISK_RAW_DIR.exists():
+            return
+        files = sorted(
+            FY4B_DISK_RAW_DIR.glob("*.jpg"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in files[FY4B_DISK_KEEP_RAW:]:
+            old.unlink(missing_ok=True)
 
     def render(
         self,
@@ -682,21 +765,35 @@ class GIBSSatelliteLayer(LayerProvider):
         use_basemap: bool,
         outline_geometries: list | None,
     ) -> Image.Image:
-        time_str = frame.payload["time"]
-        eff_zoom = min(zoom, GIBS_MAX_ZOOM)
+        # 缩放：frac 是屏幕半宽占圆盘半径的比例，zoom 越大看得越近
+        frac = 1.0 / (1.6 ** (zoom - ZOOM_MIN))
+        frac = max(0.012, min(1.0, frac))
+        desired_w = int(min(10992, max(480, 240 / frac)))
 
-        def overlay_fn(z: int, tx: int, ty: int) -> tuple[str, str] | None:
-            url = (
-                f"{GIBS_WMTS}/{GIBS_LAYER}/default/{time_str}/"
-                f"GoogleMapsCompatible_Level6/{z}/{ty}/{tx}.png"
-            )
-            key = f"gibs/{frame.token}/{z}/{tx}/{ty}"
-            return url, key
+        raw = self._raw_bytes(frame)
+        im = Image.open(BytesIO(raw))
+        im.draft("RGB", (desired_w, desired_w))
+        im = im.convert("RGB")
 
-        return render_tile_layer(
-            lat, lon, city, eff_zoom, frame.timestamp, self.display_name,
-            overlay_fn, use_basemap, outline_geometries,
-        )
+        w = im.width
+        radius = w / 2.0
+        center = w / 2.0  # 圆盘水平充满图宽，圆心 (w/2, w/2)
+        pos = geos_norm(lat, lon)
+        if pos is None:
+            nx, ny = 0.0, 0.0
+        else:
+            nx, ny = pos
+        px = center + nx * radius
+        py = center - ny * radius
+        half = max(HALF, frac * radius)
+        left = int(round(px - half))
+        top = int(round(py - half))
+        size = int(round(2 * half))
+        crop = im.crop((left, top, left + size, top + size))
+        if crop.size != (WIDTH, HEIGHT):
+            crop = crop.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        crop = draw_overlay(crop, city, frame.timestamp, zoom, self.display_name)
+        return apply_circle_mask(crop)
 
 
 class FY4BLayer(LayerProvider):
@@ -827,8 +924,8 @@ def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
     registry: dict[str, LayerProvider] = {
         "radar": RainViewerLayer("radar", "雷达", "past"),
         "nowcast": RainViewerLayer("nowcast", "短临", "nowcast"),
-        "satellite_gibs": GIBSSatelliteLayer(),
         "satellite_fy4b": FY4BLayer(),
+        "satellite_fy4b_disk": FY4BDiskLayer(),
     }
     token = (cfg.get("caiyun_token") or "").strip()
     if token:

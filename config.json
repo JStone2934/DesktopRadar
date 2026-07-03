@@ -2,7 +2,7 @@
   "default_lat": 39.9042,
   "default_lon": 116.4074,
   "default_city": "Beijing",
-  "layers": ["radar", "satellite_fy4b", "satellite_gibs", "nowcast"],
+  "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,

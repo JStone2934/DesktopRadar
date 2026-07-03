@@ -8,9 +8,12 @@
 |---------|------|----------|
 | `radar` | [RainViewer](https://www.rainviewer.com/) 雷达回波（默认，免 token） | ~2 小时 |
 | `satellite_fy4b` | 国家卫星气象中心 FY-4B 中国区真彩色（15 分钟/帧） | ~72 小时 |
-| `satellite_gibs` | NASA GIBS Himawari 红外（墨卡托瓦片，10 分钟/帧） | ~6 小时 |
+| `satellite_fy4b_disk` | FY-4B 全圆盘真彩色（DISK GCLR，GEOS 投影，以当前位置为中心、可缩放） | ~72 小时 |
 | `nowcast` | RainViewer 降水短临预报（有降雨时才有帧） | 未来数小时 |
 | `radar_caiyun` | 彩云雷达拼图（需在 config 填写 `caiyun_token`） | ~2 小时 |
+
+> `satellite_fy4b_disk` 使用 FY-4B 全圆盘原始大图（每帧约 16MB），首次拉取较慢（约 10 秒），
+> 原始图缓存在 `cache/disk_raw/`，渲染后的成品图缓存在 `cache/frames/`。圆盘图动画首轮会逐帧下载，之后从缓存秒播。
 
 定位：公网 IP 自动定位（[ip-api.com](http://ip-api.com)），失败时回退到 `config.json` 默认坐标。
 
@@ -93,7 +96,7 @@ python3 radar_display.py --no-basemap
 
 宏键盘 **KEY_SPACE**（短按/长按）：
 
-- **短按**：循环切换图层（雷达 → 风云4B → GIBS卫星 → 短临预报 → …）
+- **短按**：循环切换图层（雷达 → 风云4B中国区 → 风云4B圆盘 → 短临预报 → …）
 - **长按**（默认 ≥500ms）：播放当前图层近 6 小时历史动画（松手停止）
 - 动画帧率默认 5fps，可在 `config.json` 调整
 
@@ -136,7 +139,7 @@ IP 定位失败时使用 `config.json`：
   "default_lat": 39.9042,
   "default_lon": 116.4074,
   "default_city": "Beijing",
-  "layers": ["radar", "satellite_fy4b", "satellite_gibs", "nowcast"],
+  "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,
