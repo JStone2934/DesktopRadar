@@ -6,5 +6,6 @@
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,
-  "anim_window_hours": 6
+  "anim_window_hours": 6,
+  "lcd_backlight_seconds": 5
 }

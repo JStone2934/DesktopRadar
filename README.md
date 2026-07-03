@@ -33,6 +33,39 @@
 
 > 本模块背光内部常亮，无独立 BLK 引脚。VCC 接 3.3V。
 
+## 1602A LCD 操作提示（可选）
+
+可额外连接一块 **1602A I2C 字符屏**（PCF8574 背包），在用户操作时点亮背光 5 秒并显示当前图层或操作（英文 ASCII）：
+
+| 操作 | 第一行 | 第二行示例 |
+|------|--------|-----------|
+| 切换图层 | Layer | Radar / FY-4B CN / … |
+| 旋钮缩放 | Zoom | z7 |
+| 旋钮按下 | Zoom Reset | z7 |
+| 长按动画 | Animation | Play Radar |
+| 停止动画 | Animation | Stopped |
+
+### 接线（BCM / I2C）
+
+| LCD 引脚 | 树莓派引脚 |
+|---------|-----------|
+| VCC | 5V（物理引脚 2 或 4）|
+| GND | GND（物理引脚 6）|
+| SDA | GPIO2（物理引脚 3）|
+| SCL | GPIO3（物理引脚 5）|
+
+> VCC 必须接 **5V**（不能 3.3V）。I2C 地址通常为 `0x27` 或 `0x3F`，可用 `i2cdetect -y 1` 确认。
+
+启用 I2C：
+
+```bash
+sudo raspi-config   # Interface Options -> I2C -> Enable
+# 或确认 /boot/firmware/config.txt 中有：
+# dtparam=i2c_arm=on
+```
+
+背光点亮时长可在 `config.json` 的 `lcd_backlight_seconds` 调整（默认 5 秒）。禁用 LCD：`--no-lcd`。
+
 ## 启用 SPI
 
 ```bash
@@ -55,6 +88,8 @@ cd /home/js/Project/gc9a01-display
 pip3 install -r requirements.txt
 # 系统包（如未安装）：
 sudo apt install python3-lgpio fonts-dejavu-core python3-evdev
+# 1602 LCD（可选）：
+sudo apt install i2c-tools python3-smbus
 ```
 
 ## 屏幕测试
@@ -127,6 +162,7 @@ python3 radar_display.py --no-basemap
 | `--no-knob` | - | 禁用旋钮缩放控制 |
 | `--no-keys` | - | 禁用空格键图层/动画控制 |
 | `--no-anim` | - | 禁用长按动画（仍可用短按切图层） |
+| `--no-lcd` | - | 禁用 1602 LCD 操作提示 |
 | `--layer` | 配置首项 | 起始图层 ID |
 | `--no-display` | - | 仅下载渲染，不刷屏幕（调试） |
 
@@ -143,7 +179,8 @@ IP 定位失败时使用 `config.json`：
   "caiyun_token": "",
   "long_press_ms": 500,
   "anim_fps": 5,
-  "anim_window_hours": 6
+  "anim_window_hours": 6,
+  "lcd_backlight_seconds": 5
 }
 ```
 
@@ -151,6 +188,7 @@ IP 定位失败时使用 `config.json`：
 - `caiyun_token`：填写后可在 `layers` 中加入 `radar_caiyun`
 - `long_press_ms`：长按判定毫秒数
 - `anim_fps` / `anim_window_hours`：动画帧率与回溯小时数
+- `lcd_backlight_seconds`：1602 LCD 操作提示背光点亮秒数
 
 ## 开机自启（可选）
 
@@ -172,6 +210,8 @@ journalctl -u radar.service -f
 | 文件 | 说明 |
 |------|------|
 | `gc9a01.py` | GC9A01 屏幕驱动 |
+| `lcd_i2c.py` | 1602A I2C 字符屏驱动 |
+| `lcd_notifier.py` | 1602 操作提示（背光计时） |
 | `radar_display.py` | 多图层气象图主程序 |
 | `test_display.py` | 屏幕色彩测试 |
 | `config.json` | 默认经纬度 |

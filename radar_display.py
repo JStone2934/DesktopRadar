@@ -29,6 +29,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
+from lcd_notifier import LcdNotifier
 
 TILE_SIZE = 256
 GRID = 3
@@ -920,6 +921,27 @@ class CaiyunRadarLayer(LayerProvider):
         return apply_circle_mask(cropped)
 
 
+LAYER_LCD_LABELS = {
+    "radar": "Radar",
+    "nowcast": "Nowcast",
+    "satellite_fy4b": "FY-4B CN",
+    "satellite_fy4b_disk": "FY-4B Disk",
+    "radar_caiyun": "Caiyun Radar",
+}
+
+
+def layer_lcd_label(layer: LayerProvider) -> str:
+    return LAYER_LCD_LABELS.get(layer.layer_id, layer.layer_id)
+
+
+def frame_lcd_time(frame: WeatherFrame) -> str | None:
+    """把帧时间戳格式化为本地时间 'MM-DD HH:MM'，无有效时间戳返回 None。"""
+    if not frame.timestamp or frame.timestamp <= 0:
+        return None
+    local = datetime.fromtimestamp(frame.timestamp, tz=timezone.utc).astimezone()
+    return local.strftime("%m-%d %H:%M")
+
+
 def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
     registry: dict[str, LayerProvider] = {
         "radar": RainViewerLayer("radar", "雷达", "past"),
@@ -1135,6 +1157,14 @@ class AppState:
                     idx = i
                     break
         self.layer_index = idx
+        self.notifier: LcdNotifier | None = None
+
+    def _lcd_notify(self, line1: str, line2: str = "") -> None:
+        if self.notifier is not None:
+            self.notifier.notify(line1, line2)
+
+    def notify_lcd(self, line1: str, line2: str = "") -> None:
+        self._lcd_notify(line1, line2)
 
     @staticmethod
     def _clamp(z: int) -> int:
@@ -1163,23 +1193,25 @@ class AppState:
                 return
             self.zoom = new
         print(f"旋钮: zoom -> {new}")
+        self._lcd_notify("Zoom", f"z{new}")
         self.wake.set()
 
     def reset_zoom(self) -> None:
         with self._lock:
-            if self.zoom == self.default_zoom:
-                self.wake.set()
-                return
-            self.zoom = self.default_zoom
+            if self.zoom != self.default_zoom:
+                self.zoom = self.default_zoom
         print(f"旋钮按下: zoom 重置为 {self.default_zoom}")
+        self._lcd_notify("Zoom Reset", f"z{self.default_zoom}")
         self.wake.set()
 
     def next_layer(self) -> None:
         with self._lock:
             self.layer_index = (self.layer_index + 1) % len(self.layers)
             self.anim_active = False
-            name = self.layers[self.layer_index].display_name
+            layer = self.layers[self.layer_index]
+            name = layer.display_name
         print(f"图层: -> {name}")
+        self._lcd_notify("Layer", layer_lcd_label(layer))
         self.wake.set()
 
     def start_anim(self) -> None:
@@ -1187,7 +1219,9 @@ class AppState:
             if self.anim_active:
                 return
             self.anim_active = True
+            layer = self.layers[self.layer_index]
         print("动画: 开始播放")
+        self._lcd_notify("Animation", f"Play {layer_lcd_label(layer)}")
         self.wake.set()
 
     def stop_anim(self) -> None:
@@ -1196,6 +1230,7 @@ class AppState:
                 return
             self.anim_active = False
         print("动画: 停止")
+        self._lcd_notify("Animation", "Stopped")
         self.wake.set()
 
 
@@ -1376,6 +1411,7 @@ def play_animation(
         return
     interval = 1.0 / max(1, fps)
     print(f"动画: {layer.display_name} {len(frames)} 帧 @ {fps}fps")
+    label = layer_lcd_label(layer)
     while state.is_anim_active():
         for frame in frames:
             if not state.is_anim_active():
@@ -1388,6 +1424,9 @@ def play_animation(
                     use_basemap, outline_geometries, frame_cache,
                 )
                 show(img)
+                time_str = frame_lcd_time(frame)
+                if time_str is not None:
+                    state.notify_lcd(label, time_str)
             except Exception as exc:
                 print(f"  动画帧失败: {exc}")
             deadline = time.time() + interval
@@ -1413,6 +1452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--layer", default=None, help="起始图层 ID")
     parser.add_argument("--no-anim", action="store_true", help="禁用长按动画")
+    parser.add_argument("--no-lcd", action="store_true", help="禁用 1602 LCD 操作提示")
     return parser.parse_args()
 
 
@@ -1440,6 +1480,13 @@ def main() -> None:
         start_layer=args.layer,
         long_press_ms=long_press_ms,
     )
+    notifier: LcdNotifier | None = None
+    if not args.no_lcd and not args.once:
+        lcd_backlight_seconds = float(cfg.get("lcd_backlight_seconds", 5))
+        notifier = LcdNotifier(backlight_seconds=lcd_backlight_seconds)
+        if notifier.enabled:
+            state.notifier = notifier
+            notifier.notify("Weather Radar", layer_lcd_label(state.get_layer()))
     frame_cache = FrameCache()
     prefetch: PrefetchWorker | None = None
     if not args.once:
@@ -1546,6 +1593,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n退出")
     finally:
+        if notifier is not None:
+            notifier.close()
         if lcd:
             lcd.close()
 
