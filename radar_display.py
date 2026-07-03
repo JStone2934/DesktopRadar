@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""在 GC9A01 圆屏上显示以当前位置为中心的气象雷达图（RainViewer）。"""
+"""在 GC9A01 圆屏上显示以当前位置为中心的多图层气象图。"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import re
 import shutil
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
+from abc import ABC, abstractmethod
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -29,15 +34,22 @@ HALF = WIDTH // 2
 
 IP_API_URL = "http://ip-api.com/json"
 RAINVIEWER_API = "https://api.rainviewer.com/public/weather-maps.json"
-# 高德矢量底图（style=8 路网+地名，国内可达，最高约 z18）
+GIBS_WMTS = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best"
+GIBS_LAYER = "Himawari_AHI_Band13_Clean_Infrared"
+FY4B_XML_URL = (
+    "http://img.nsmc.org.cn/CLOUDIMAGE/FY4B/AGRI/GCLR/SEC/xml/FY4B-china-72h.xml"
+)
+NSMC_REFERER = "http://www.nsmc.org.cn/"
+# FY-4B 中国区缩略图近似经纬度范围（等经纬度裁切）
+FY4B_CHINA_BOUNDS = (70.0, 4.0, 140.0, 54.0)  # west, south, east, north
 AMAP_TILE = (
     "https://webrd0{sub}.is.autonavi.com/appmaptile"
     "?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
 )
 AMAP_REFERER = "https://www.amap.com/"
 BASEMAP_PROVIDER = "amap"
-BASEMAP_BLEND = 0.35  # 压暗亮色底图，突出雷达回波
-USER_AGENT = "gc9a01-radar-display/1.0"
+BASEMAP_BLEND = 0.35
+USER_AGENT = "gc9a01-radar-display/2.0"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,47 +57,102 @@ CONFIG_PATH = BASE_DIR / "config.json"
 CACHE_DIR = BASE_DIR / "cache"
 FRAMES_DIR = CACHE_DIR / "frames"
 BASEMAP_OK_FILE = CACHE_DIR / "basemap_ok"
-KEEP_FRAME_DIRS = 2
-LOCATION_THRESHOLD = 0.05  # 坐标变化超过此值则作废内存热缓存
+KEEP_FRAME_DIRS = 40
+LOCATION_THRESHOLD = 0.05
 
-# Natural Earth 矢量轮廓（经纬度 GeoJSON），本地缓存后离线可用
 OUTLINE_SOURCES = {
     "ne_50m_coastline.geojson":
         "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_coastline.geojson",
     "ne_50m_admin_0_boundary_lines_land.geojson":
         "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_boundary_lines_land.geojson",
 }
-OUTLINE_COLOR = (110, 130, 150)  # 冷灰色勾线
+OUTLINE_COLOR = (110, 130, 150)
 OUTLINE_WIDTH = 1
 
 ZOOM_MIN = 3
 ZOOM_MAX = 12
-RADAR_MAX_ZOOM = 7  # RainViewer 雷达瓦片最高 zoom
-KNOB_DEBOUNCE = 0.15  # 连续转动合并窗口（秒）
+RADAR_MAX_ZOOM = 7
+GIBS_MAX_ZOOM = 6
+KNOB_DEBOUNCE = 0.15
+FRAME_TTL = 60
+DEFAULT_LAYERS = ["radar", "satellite_fy4b", "satellite_gibs", "nowcast"]
+DEFAULT_LONG_PRESS_MS = 500
+DEFAULT_ANIM_FPS = 5
+DEFAULT_ANIM_WINDOW_HOURS = 6
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
-# 连接池，供并行瓦片下载复用
 _adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
-TILE_TIMEOUT = 6  # 单瓦片超时（秒）
+TILE_TIMEOUT = 6
 
-# 瓦片内存缓存（LRU）；重复缩放/刷新时秒开
 _TILE_CACHE: OrderedDict[str, Image.Image] = OrderedDict()
 _TILE_CACHE_MAX = 2000
-# 底图可达性只探测一次（None=未知, True/False=结果）
 _basemap_reachable: bool | None = None
-# 并行下载线程池
 _TILE_POOL = ThreadPoolExecutor(max_workers=9)
 
+_rv_cache: tuple[float, dict] | None = None
+_fy4b_cache: tuple[float, list[WeatherFrame]] | None = None
+FY4B_XML_TTL = 300
 
-def radar_path_slug(radar_path: str) -> str:
-    return radar_path.rstrip("/").split("/")[-1]
+
+@dataclass
+class WeatherFrame:
+    token: str
+    timestamp: int
+    payload: dict = field(default_factory=dict)
+
+
+class LayerProvider(ABC):
+    layer_id: str
+    display_name: str
+
+    @abstractmethod
+    def supports_zoom(self) -> bool:
+        ...
+
+    @abstractmethod
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        ...
+
+    @abstractmethod
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        ...
+
+
+def load_config() -> dict:
+    defaults = {
+        "default_lat": 39.9042,
+        "default_lon": 116.4074,
+        "default_city": "Beijing",
+        "layers": DEFAULT_LAYERS,
+        "caiyun_token": "",
+        "long_press_ms": DEFAULT_LONG_PRESS_MS,
+        "anim_fps": DEFAULT_ANIM_FPS,
+        "anim_window_hours": DEFAULT_ANIM_WINDOW_HOURS,
+    }
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        defaults.update(cfg)
+    return defaults
+
+
+def frame_token_slug(token: str) -> str:
+    return re.sub(r"[^\w\-.]+", "_", token)
 
 
 def zoom_priority_order(center: int) -> list[int]:
-    """从当前 zoom 向外扩展的预取优先级。"""
     order = [center]
     for delta in range(1, ZOOM_MAX - ZOOM_MIN + 1):
         up = center + delta
@@ -97,13 +164,6 @@ def zoom_priority_order(center: int) -> list[int]:
     return order
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return {"default_lat": 39.9042, "default_lon": 116.4074, "default_city": "Beijing"}
-
-
 def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     path = FONT_BOLD_PATH if bold else FONT_PATH
     try:
@@ -113,7 +173,6 @@ def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFon
 
 
 def lat_lon_to_global_pixel(lat: float, lon: float, zoom: int) -> tuple[float, float]:
-    """将经纬度转换为 zoom 级别下的全局像素坐标。"""
     scale = TILE_SIZE * (2 ** zoom)
     x = (lon + 180.0) / 360.0 * scale
     lat_rad = math.radians(lat)
@@ -127,11 +186,9 @@ def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
 
 
 def fetch_location(lat: float | None, lon: float | None) -> tuple[float, float, str]:
-    """获取位置：命令行参数 > IP 定位 > 配置文件默认值。"""
     cfg = load_config()
     if lat is not None and lon is not None:
         return lat, lon, cfg.get("default_city", "Custom")
-
     try:
         resp = SESSION.get(IP_API_URL, timeout=10)
         resp.raise_for_status()
@@ -141,7 +198,6 @@ def fetch_location(lat: float | None, lon: float | None) -> tuple[float, float, 
             return float(data["lat"]), float(data["lon"]), city
     except Exception as exc:
         print(f"IP 定位失败: {exc}，使用配置文件默认坐标")
-
     return (
         float(cfg.get("default_lat", 39.9042)),
         float(cfg.get("default_lon", 116.4074)),
@@ -149,28 +205,114 @@ def fetch_location(lat: float | None, lon: float | None) -> tuple[float, float, 
     )
 
 
-_frame_cache: tuple[float, tuple[str, str, int]] | None = None
-FRAME_TTL = 120  # 雷达帧元数据缓存秒数（雷达约 10 分钟更新一次）
-
-
-def fetch_rainviewer_frame() -> tuple[str, str, int]:
-    """返回 (host, path, timestamp)，短期缓存以避免缩放时反复请求 API。"""
-    global _frame_cache
+def fetch_rainviewer_data() -> dict:
+    global _rv_cache
     now = time.time()
-    if _frame_cache and now - _frame_cache[0] < FRAME_TTL:
-        return _frame_cache[1]
-
+    if _rv_cache and now - _rv_cache[0] < FRAME_TTL:
+        return _rv_cache[1]
     resp = SESSION.get(RAINVIEWER_API, timeout=15)
     resp.raise_for_status()
     data = resp.json()
+    _rv_cache = (now, data)
+    return data
+
+
+def rainviewer_frames(kind: str, window_hours: float) -> list[WeatherFrame]:
+    data = fetch_rainviewer_data()
     host = data["host"]
-    past = data.get("radar", {}).get("past", [])
-    if not past:
-        raise RuntimeError("RainViewer 无可用雷达帧")
-    latest = past[-1]
-    result = (host, latest["path"], int(latest["time"]))
-    _frame_cache = (now, result)
-    return result
+    items = data.get("radar", {}).get(kind, [])
+    if not items:
+        return []
+    cutoff = int(time.time() - window_hours * 3600)
+    frames = []
+    for item in items:
+        ts = int(item["time"])
+        path = item["path"]
+        token = f"{kind}_{path.rstrip('/').split('/')[-1]}"
+        frames.append(WeatherFrame(token=token, timestamp=ts, payload={"host": host, "path": path}))
+    frames = [f for f in frames if f.timestamp >= cutoff]
+    return frames if frames else [
+        WeatherFrame(
+            token=f"{kind}_{items[-1]['path'].rstrip('/').split('/')[-1]}",
+            timestamp=int(items[-1]["time"]),
+            payload={"host": host, "path": items[-1]["path"]},
+        )
+    ]
+
+
+def gibs_time_str(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def gibs_frames(window_hours: float) -> list[WeatherFrame]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=window_hours)
+    frames: list[WeatherFrame] = []
+    t = now.replace(second=0, microsecond=0)
+    minute = (t.minute // 10) * 10
+    t = t.replace(minute=minute)
+    while t >= cutoff:
+        ts = int(t.timestamp())
+        token = f"gibs_{t.strftime('%Y%m%d%H%M')}"
+        frames.append(WeatherFrame(token=token, timestamp=ts, payload={"time": gibs_time_str(ts)}))
+        t -= timedelta(minutes=10)
+    frames.reverse()
+    return frames if frames else [
+        WeatherFrame(
+            token=f"gibs_{now.strftime('%Y%m%d%H%M')}",
+            timestamp=int(now.timestamp()),
+            payload={"time": gibs_time_str(int(now.timestamp()))},
+        )
+    ]
+
+
+def parse_fy4b_xml(xml_text: str) -> list[WeatherFrame]:
+    root = ET.fromstring(xml_text)
+    seen: set[str] = set()
+    frames: list[WeatherFrame] = []
+    for image in root.findall("image"):
+        url = image.get("url", "")
+        if not url or "thumb" in url.lower():
+            continue
+        if url.startswith("//"):
+            url = "http:" + url
+        thumb = url + "-thumb.JPG"
+        m = re.search(r"(\d{14})", url)
+        if not m:
+            continue
+        stamp = m.group(1)
+        if stamp in seen:
+            continue
+        seen.add(stamp)
+        dt = datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        frames.append(
+            WeatherFrame(
+                token=f"fy4b_{stamp}",
+                timestamp=int(dt.timestamp()),
+                payload={"url": thumb},
+            )
+        )
+    frames.sort(key=lambda f: f.timestamp)
+    return frames
+
+
+def fetch_fy4b_frames(window_hours: float) -> list[WeatherFrame]:
+    global _fy4b_cache
+    now = time.time()
+    if _fy4b_cache and now - _fy4b_cache[0] < FY4B_XML_TTL:
+        all_frames = _fy4b_cache[1]
+    else:
+        resp = SESSION.get(
+            FY4B_XML_URL,
+            timeout=20,
+            headers={"Referer": NSMC_REFERER},
+        )
+        resp.raise_for_status()
+        all_frames = parse_fy4b_xml(resp.text)
+        _fy4b_cache = (now, all_frames)
+    cutoff = int(time.time() - window_hours * 3600)
+    recent = [f for f in all_frames if f.timestamp >= cutoff]
+    return recent if recent else (all_frames[-1:] if all_frames else [])
 
 
 def amap_tile_url(zoom: int, tx: int, ty: int) -> str:
@@ -179,7 +321,6 @@ def amap_tile_url(zoom: int, tx: int, ty: int) -> str:
 
 
 def prepare_basemap_tile(tile: Image.Image) -> Image.Image:
-    """将亮色高德瓦片压暗后叠加，避免盖住雷达回波。"""
     tile = tile.convert("RGBA")
     backdrop = Image.new("RGBA", tile.size, (15, 20, 30, 255))
     return Image.blend(backdrop, tile, BASEMAP_BLEND)
@@ -199,6 +340,8 @@ def fetch_tile(
     try:
         resp = SESSION.get(url, timeout=TILE_TIMEOUT, headers=extra_headers or {})
         resp.raise_for_status()
+        if len(resp.content) < 200:
+            return None
         img = Image.open(BytesIO(resp.content)).convert("RGBA")
     except Exception as exc:
         if not quiet:
@@ -219,13 +362,8 @@ def fetch_basemap_tile(zoom: int, tx: int, ty: int) -> Image.Image | None:
         _TILE_CACHE.move_to_end(key)
         return cached
     try:
-        resp = SESSION.get(
-            url,
-            timeout=TILE_TIMEOUT,
-            headers={"Referer": AMAP_REFERER},
-        )
+        resp = SESSION.get(url, timeout=TILE_TIMEOUT, headers={"Referer": AMAP_REFERER})
         resp.raise_for_status()
-        # 高德对无数据区域返回带 “Zoom Level Not Supported” 的占位小图
         if len(resp.content) < 2000:
             return None
         img = Image.open(BytesIO(resp.content)).convert("RGBA")
@@ -239,7 +377,6 @@ def fetch_basemap_tile(zoom: int, tx: int, ty: int) -> Image.Image | None:
 
 
 def basemap_available(zoom: int, tx: int, ty: int) -> bool:
-    """探测高德底图是否可达；内存 + 磁盘缓存，只探测一次。"""
     global _basemap_reachable
     if _basemap_reachable is not None:
         return _basemap_reachable
@@ -254,11 +391,7 @@ def basemap_available(zoom: int, tx: int, ty: int) -> bool:
             return False
     url = amap_tile_url(zoom, tx, ty)
     try:
-        resp = SESSION.get(
-            url,
-            timeout=3,
-            headers={"Referer": AMAP_REFERER},
-        )
+        resp = SESSION.get(url, timeout=3, headers={"Referer": AMAP_REFERER})
         resp.raise_for_status()
         _basemap_reachable = True
         BASEMAP_OK_FILE.write_text(BASEMAP_PROVIDER, encoding="utf-8")
@@ -269,10 +402,8 @@ def basemap_available(zoom: int, tx: int, ty: int) -> bool:
 
 
 def load_outline_geometries() -> list:
-    """加载海岸线/国界 GeoJSON，返回 LineString 坐标序列列表；本地缓存优先。"""
     CACHE_DIR.mkdir(exist_ok=True)
     features_coords: list = []
-
     for fname, url in OUTLINE_SOURCES.items():
         cache_file = CACHE_DIR / fname
         if not cache_file.exists():
@@ -290,7 +421,6 @@ def load_outline_geometries() -> list:
         except Exception as exc:
             print(f"  轮廓数据解析失败 {fname}: {exc}")
             continue
-
         for feature in data.get("features", []):
             geom = feature.get("geometry") or {}
             gtype = geom.get("type")
@@ -299,89 +429,102 @@ def load_outline_geometries() -> list:
                 features_coords.append(coords)
             elif gtype == "MultiLineString":
                 features_coords.extend(coords)
-
     return features_coords
 
 
-def draw_outline(
+def draw_outline_mercator(
     composite: Image.Image,
     lat: float,
     lon: float,
     zoom: int,
     geometries: list,
 ) -> None:
-    """把海岸线/国界勾线画到 composite（像素坐标系）上。"""
     if not geometries:
         return
-
     origin_tx, origin_ty = lat_lon_to_tile(lat, lon, zoom)
     origin_tx -= GRID // 2
     origin_ty -= GRID // 2
     origin_px = origin_tx * TILE_SIZE
     origin_py = origin_ty * TILE_SIZE
-
-    # composite 覆盖的经度范围，用于快速裁剪
     scale = TILE_SIZE * (2 ** zoom)
     lon_min = origin_px / scale * 360.0 - 180.0
     lon_max = (origin_px + COMPOSITE_SIZE) / scale * 360.0 - 180.0
-
     draw = ImageDraw.Draw(composite)
     for line in geometries:
-        # 粗过滤：整段经度都在窗口外则跳过
         lons = [pt[0] for pt in line]
         if max(lons) < lon_min or min(lons) > lon_max:
             continue
-
         pts = []
         for lon_pt, lat_pt in line:
             gx, gy = lat_lon_to_global_pixel(lat_pt, lon_pt, zoom)
-            px = gx - origin_px
-            py = gy - origin_py
+            pts.append((gx - origin_px, gy - origin_py))
+        if len(pts) >= 2:
+            draw.line(pts, fill=OUTLINE_COLOR, width=OUTLINE_WIDTH, joint="curve")
+
+
+def draw_outline_equirect(
+    img: Image.Image,
+    geometries: list,
+    bounds: tuple[float, float, float, float],
+) -> None:
+    if not geometries:
+        return
+    west, south, east, north = bounds
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    for line in geometries:
+        lons = [pt[0] for pt in line]
+        lats = [pt[1] for pt in line]
+        if max(lons) < west or min(lons) > east or max(lats) < south or min(lats) > north:
+            continue
+        pts = []
+        for lon_pt, lat_pt in line:
+            px = (lon_pt - west) / (east - west) * w
+            py = (north - lat_pt) / (north - south) * h
             pts.append((px, py))
         if len(pts) >= 2:
             draw.line(pts, fill=OUTLINE_COLOR, width=OUTLINE_WIDTH, joint="curve")
 
 
-def build_composite(
+OverlayFn = Callable[[int, int, int], tuple[str, str] | None]
+
+
+def build_composite_tiles(
     lat: float,
     lon: float,
     zoom: int,
-    host: str,
-    radar_path: str,
     use_basemap: bool,
+    overlay_fn: OverlayFn,
+    overlay_zoom: int | None = None,
 ) -> Image.Image:
-    """拼接 3x3 瓦片并叠加雷达。"""
+    tile_zoom = overlay_zoom if overlay_zoom is not None else zoom
     center_tx, center_ty = lat_lon_to_tile(lat, lon, zoom)
     origin_tx = center_tx - GRID // 2
     origin_ty = center_ty - GRID // 2
-
     composite = Image.new("RGBA", (COMPOSITE_SIZE, COMPOSITE_SIZE), (15, 20, 30, 255))
 
     load_basemap = use_basemap
     if load_basemap and not basemap_available(zoom, center_tx, center_ty):
-        print("  底图不可达，跳过高德底图（仅显示雷达层）")
+        print("  底图不可达，跳过高德底图")
         load_basemap = False
 
-    # 收集所有瓦片请求，并行下载
-    jobs = []  # (px, py, kind, future)
+    jobs: list[tuple[int, int, str, object]] = []
     for dy in range(GRID):
         for dx in range(GRID):
             tx = origin_tx + dx
             ty = origin_ty + dy
             px = dx * TILE_SIZE
             py = dy * TILE_SIZE
-
             if load_basemap:
-                jobs.append((px, py, "base",
-                             _TILE_POOL.submit(fetch_basemap_tile, zoom, tx, ty)))
+                jobs.append((px, py, "base", _TILE_POOL.submit(fetch_basemap_tile, zoom, tx, ty)))
+            otx = int(tx * (2 ** (tile_zoom - zoom))) if tile_zoom != zoom else tx
+            oty = int(ty * (2 ** (tile_zoom - zoom))) if tile_zoom != zoom else ty
+            spec = overlay_fn(tile_zoom, otx, oty)
+            if spec:
+                url, key = spec
+                jobs.append((px, py, "overlay", _TILE_POOL.submit(fetch_tile, url, True, key)))
 
-            radar_url = f"{host}{radar_path}/256/{zoom}/{tx}/{ty}/4/1_1.png"
-            radar_key = f"radar/{radar_path}/{zoom}/{tx}/{ty}"
-            jobs.append((px, py, "radar",
-                         _TILE_POOL.submit(fetch_tile, radar_url, True, radar_key)))
-
-    # 先贴底图再叠雷达，保证图层顺序
-    for kind in ("base", "radar"):
+    for kind in ("base", "overlay"):
         for px, py, k, future in jobs:
             if k != kind:
                 continue
@@ -393,20 +536,16 @@ def build_composite(
                 composite.paste(tile, (px, py), tile)
             else:
                 composite.alpha_composite(tile, (px, py))
-
     return composite
 
 
 def crop_centered(composite: Image.Image, lat: float, lon: float, zoom: int) -> Image.Image:
-    """以当前位置为中心裁出 240x240。"""
     gx, gy = lat_lon_to_global_pixel(lat, lon, zoom)
     origin_tx, origin_ty = lat_lon_to_tile(lat, lon, zoom)
     origin_tx -= GRID // 2
     origin_ty -= GRID // 2
-
     local_x = gx - origin_tx * TILE_SIZE
     local_y = gy - origin_ty * TILE_SIZE
-
     left = int(local_x - HALF)
     top = int(local_y - HALF)
     return composite.crop((left, top, left + WIDTH, top + HEIGHT)).convert("RGB")
@@ -421,21 +560,26 @@ def apply_circle_mask(img: Image.Image) -> Image.Image:
     return out
 
 
-def draw_overlay(img: Image.Image, city: str, frame_ts: int, zoom: int) -> Image.Image:
+def draw_overlay(
+    img: Image.Image,
+    city: str,
+    frame_ts: int,
+    zoom: int | None,
+    layer_name: str,
+) -> Image.Image:
     draw = ImageDraw.Draw(img)
     cx, cy = HALF, HALF
-
-    # 位置标记：十字 + 圆点
     mark_color = (255, 255, 255)
     arm = 8
     draw.line([(cx - arm, cy), (cx + arm, cy)], fill=mark_color, width=2)
     draw.line([(cx, cy - arm), (cx, cy + arm)], fill=mark_color, width=2)
     draw.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=(255, 60, 60))
-
-    # 底部信息条
     frame_time = datetime.fromtimestamp(frame_ts, tz=timezone.utc).astimezone()
     time_str = frame_time.strftime("%H:%M")
-    label = f"{city}  {time_str}  z{zoom}"
+    if zoom is not None:
+        label = f"{layer_name} {city} {time_str} z{zoom}"
+    else:
+        label = f"{layer_name} {city} {time_str}"
     font = get_font(14)
     bbox = draw.textbbox((0, 0), label, font=font)
     tw = bbox[2] - bbox[0]
@@ -450,9 +594,8 @@ def make_error_image(message: str) -> Image.Image:
     img = Image.new("RGB", (WIDTH, HEIGHT), (20, 25, 40))
     draw = ImageDraw.Draw(img)
     font = get_font(16, bold=True)
-    lines = message.split("\n")
     y = 90
-    for line in lines:
+    for line in message.split("\n"):
         bbox = draw.textbbox((0, 0), line, font=font)
         tw = bbox[2] - bbox[0]
         draw.text(((WIDTH - tw) // 2, y), line, fill=(255, 100, 100), font=font)
@@ -460,65 +603,291 @@ def make_error_image(message: str) -> Image.Image:
     return apply_circle_mask(img)
 
 
-def render_radar_frame_internal(
+def render_tile_layer(
     lat: float,
     lon: float,
     city: str,
     zoom: int,
-    host: str,
-    radar_path: str,
     frame_ts: int,
+    layer_name: str,
+    overlay_fn: OverlayFn,
     use_basemap: bool,
     outline_geometries: list | None,
+    overlay_zoom: int | None = None,
 ) -> Image.Image:
-    """纯渲染：瓦片拼接 + 轮廓 + 裁切 + 叠加 + 圆形蒙版。"""
-    composite = build_composite(lat, lon, zoom, host, radar_path, use_basemap)
+    composite = build_composite_tiles(
+        lat, lon, zoom, use_basemap, overlay_fn, overlay_zoom=overlay_zoom
+    )
     if outline_geometries:
-        draw_outline(composite, lat, lon, zoom, outline_geometries)
+        draw_outline_mercator(composite, lat, lon, zoom, outline_geometries)
     cropped = crop_centered(composite, lat, lon, zoom)
-    cropped = draw_overlay(cropped, city, frame_ts, zoom)
+    cropped = draw_overlay(cropped, city, frame_ts, zoom, layer_name)
     return apply_circle_mask(cropped)
 
 
+class RainViewerLayer(LayerProvider):
+    def __init__(self, layer_id: str, display_name: str, kind: str) -> None:
+        self.layer_id = layer_id
+        self.display_name = display_name
+        self.kind = kind
+
+    def supports_zoom(self) -> bool:
+        return True
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        return rainviewer_frames(self.kind, window_hours)
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        host = frame.payload["host"]
+        path = frame.payload["path"]
+        eff_zoom = min(zoom, RADAR_MAX_ZOOM)
+
+        def overlay_fn(z: int, tx: int, ty: int) -> tuple[str, str] | None:
+            url = f"{host}{path}/256/{z}/{tx}/{ty}/4/1_1.png"
+            key = f"{self.layer_id}/{frame.token}/{z}/{tx}/{ty}"
+            return url, key
+
+        return render_tile_layer(
+            lat, lon, city, eff_zoom, frame.timestamp, self.display_name,
+            overlay_fn, use_basemap, outline_geometries,
+        )
+
+
+class GIBSSatelliteLayer(LayerProvider):
+    layer_id = "satellite_gibs"
+    display_name = "卫星GIBS"
+
+    def supports_zoom(self) -> bool:
+        return True
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        return gibs_frames(window_hours)
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        time_str = frame.payload["time"]
+        eff_zoom = min(zoom, GIBS_MAX_ZOOM)
+
+        def overlay_fn(z: int, tx: int, ty: int) -> tuple[str, str] | None:
+            url = (
+                f"{GIBS_WMTS}/{GIBS_LAYER}/default/{time_str}/"
+                f"GoogleMapsCompatible_Level6/{z}/{ty}/{tx}.png"
+            )
+            key = f"gibs/{frame.token}/{z}/{tx}/{ty}"
+            return url, key
+
+        return render_tile_layer(
+            lat, lon, city, eff_zoom, frame.timestamp, self.display_name,
+            overlay_fn, use_basemap, outline_geometries,
+        )
+
+
+class FY4BLayer(LayerProvider):
+    layer_id = "satellite_fy4b"
+    display_name = "风云4B"
+
+    def supports_zoom(self) -> bool:
+        return False
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        return fetch_fy4b_frames(window_hours)
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        url = frame.payload["url"]
+        key = f"fy4b/{frame.token}"
+        cached = _TILE_CACHE.get(key)
+        if cached is None:
+            resp = SESSION.get(url, timeout=20, headers={"Referer": NSMC_REFERER})
+            resp.raise_for_status()
+            src = Image.open(BytesIO(resp.content)).convert("RGB")
+            _TILE_CACHE[key] = src
+        else:
+            src = cached.copy()
+
+        west, south, east, north = FY4B_CHINA_BOUNDS
+        w, h = src.size
+        cx = (lon - west) / (east - west) * w
+        cy = (north - lat) / (north - south) * h
+        half_w = WIDTH / 2
+        half_h = HEIGHT / 2
+        left = max(0, int(cx - half_w))
+        top = max(0, int(cy - half_h))
+        right = min(w, left + WIDTH)
+        bottom = min(h, top + HEIGHT)
+        if right - left < WIDTH:
+            left = max(0, right - WIDTH)
+        if bottom - top < HEIGHT:
+            top = max(0, bottom - HEIGHT)
+        cropped = src.crop((left, top, left + WIDTH, top + HEIGHT))
+        if cropped.size != (WIDTH, HEIGHT):
+            cropped = cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        if outline_geometries:
+            draw_outline_equirect(cropped, outline_geometries, FY4B_CHINA_BOUNDS)
+        cropped = draw_overlay(cropped, city, frame.timestamp, None, self.display_name)
+        return apply_circle_mask(cropped)
+
+
+class CaiyunRadarLayer(LayerProvider):
+    layer_id = "radar_caiyun"
+    display_name = "彩云雷达"
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+    def supports_zoom(self) -> bool:
+        return False
+
+    def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
+        url = (
+            f"http://api.caiyunapp.com/v1/radar/images"
+            f"?lon=116.4&lat=39.9&level=2&token={self.token}"
+        )
+        resp = SESSION.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "ok":
+            raise RuntimeError(data.get("msg", "彩云雷达不可用"))
+        cutoff = int(time.time() - window_hours * 3600)
+        frames = []
+        for item in data.get("images", []):
+            img_url, ts, bounds = item[0], int(item[1]), item[2]
+            if ts < cutoff:
+                continue
+            frames.append(
+                WeatherFrame(
+                    token=f"caiyun_{ts}",
+                    timestamp=ts,
+                    payload={"url": img_url, "bounds": bounds},
+                )
+            )
+        return frames if frames else []
+
+    def render(
+        self,
+        frame: WeatherFrame,
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        use_basemap: bool,
+        outline_geometries: list | None,
+    ) -> Image.Image:
+        south, west, north, east = frame.payload["bounds"]
+        url = frame.payload["url"]
+        if url.startswith("/"):
+            url = "https://cdn.caiyunapp.com" + url
+        key = f"caiyun/{frame.token}"
+        cached = _TILE_CACHE.get(key)
+        if cached is None:
+            resp = SESSION.get(url, timeout=20)
+            resp.raise_for_status()
+            src = Image.open(BytesIO(resp.content)).convert("RGB")
+            _TILE_CACHE[key] = src
+        else:
+            src = cached.copy()
+        w, h = src.size
+        cx = (lon - west) / (east - west) * w
+        cy = (north - lat) / (north - south) * h
+        left = max(0, int(cx - HALF))
+        top = max(0, int(cy - HALF))
+        cropped = src.crop((left, top, left + WIDTH, top + HEIGHT))
+        if cropped.size != (WIDTH, HEIGHT):
+            cropped = cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        cropped = draw_overlay(cropped, city, frame.timestamp, None, self.display_name)
+        return apply_circle_mask(cropped)
+
+
+def build_layer_registry(cfg: dict) -> dict[str, LayerProvider]:
+    registry: dict[str, LayerProvider] = {
+        "radar": RainViewerLayer("radar", "雷达", "past"),
+        "nowcast": RainViewerLayer("nowcast", "短临", "nowcast"),
+        "satellite_gibs": GIBSSatelliteLayer(),
+        "satellite_fy4b": FY4BLayer(),
+    }
+    token = (cfg.get("caiyun_token") or "").strip()
+    if token:
+        registry["radar_caiyun"] = CaiyunRadarLayer(token)
+    return registry
+
+
+def resolve_layers(cfg: dict) -> list[LayerProvider]:
+    registry = build_layer_registry(cfg)
+    ids = cfg.get("layers", DEFAULT_LAYERS)
+    layers: list[LayerProvider] = []
+    for lid in ids:
+        if lid in registry:
+            layers.append(registry[lid])
+        else:
+            print(f"未知图层 {lid}，已跳过")
+    if not layers:
+        layers = [registry["radar"]]
+    return layers
+
+
 def make_frame_meta(
+    layer_id: str,
+    frame: WeatherFrame,
     lat: float,
     lon: float,
     city: str,
-    host: str,
-    radar_path: str,
-    frame_ts: int,
 ) -> dict:
     return {
+        "layer_id": layer_id,
+        "frame_token": frame.token,
+        "frame_ts": frame.timestamp,
         "lat": lat,
         "lon": lon,
         "city": city,
-        "host": host,
-        "radar_path": radar_path,
-        "frame_ts": frame_ts,
     }
 
 
 class FrameCache:
-    """预渲染成品图：内存热缓存 + 磁盘 cache/frames/{slug}/zNN.png。"""
+    """预渲染成品图：内存 + 磁盘 cache/frames/{layer}/{token}/zNN.png。"""
 
     def __init__(self) -> None:
-        self._mem: dict[tuple[str, int], Image.Image] = {}
+        self._mem: dict[tuple[str, str, int], Image.Image] = {}
         self._lock = threading.Lock()
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _frame_dir(self, radar_path: str) -> Path:
-        return FRAMES_DIR / radar_path_slug(radar_path)
+    def _frame_dir(self, layer_id: str, frame_token: str) -> Path:
+        return FRAMES_DIR / layer_id / frame_token_slug(frame_token)
 
-    def _zoom_path(self, radar_path: str, zoom: int) -> Path:
-        return self._frame_dir(radar_path) / f"z{zoom:02d}.png"
+    def _zoom_path(self, layer_id: str, frame_token: str, zoom: int) -> Path:
+        return self._frame_dir(layer_id, frame_token) / f"z{zoom:02d}.png"
 
-    def get(self, radar_path: str, zoom: int) -> Image.Image | None:
-        key = (radar_path, zoom)
+    def get(self, layer_id: str, frame_token: str, zoom: int) -> Image.Image | None:
+        key = (layer_id, frame_token, zoom)
         with self._lock:
             cached = self._mem.get(key)
             if cached is not None:
                 return cached.copy()
-        path = self._zoom_path(radar_path, zoom)
+        path = self._zoom_path(layer_id, frame_token, zoom)
         if not path.exists():
             return None
         try:
@@ -529,16 +898,22 @@ class FrameCache:
             self._mem[key] = img
         return img.copy()
 
-    def put(self, radar_path: str, zoom: int, img: Image.Image, meta: dict) -> None:
-        frame_dir = self._frame_dir(radar_path)
+    def put(
+        self,
+        layer_id: str,
+        frame_token: str,
+        zoom: int,
+        img: Image.Image,
+        meta: dict,
+    ) -> None:
+        frame_dir = self._frame_dir(layer_id, frame_token)
         frame_dir.mkdir(parents=True, exist_ok=True)
         meta_path = frame_dir / "meta.json"
         if not meta_path.exists():
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False)
-        self._zoom_path(radar_path, zoom).parent.mkdir(parents=True, exist_ok=True)
-        img.save(self._zoom_path(radar_path, zoom), optimize=True)
-        key = (radar_path, zoom)
+        img.save(self._zoom_path(layer_id, frame_token, zoom), optimize=True)
+        key = (layer_id, frame_token, zoom)
         with self._lock:
             self._mem[key] = img.copy()
 
@@ -546,38 +921,41 @@ class FrameCache:
         with self._lock:
             self._mem.clear()
 
-    def invalidate_old(self, keep_path: str) -> None:
-        """只保留当前雷达帧 + 最多一个上一帧目录。"""
-        if not FRAMES_DIR.exists():
+    def invalidate_old(self, layer_id: str, keep_token: str) -> None:
+        layer_dir = FRAMES_DIR / layer_id
+        if not layer_dir.exists():
             return
-        keep_slug = radar_path_slug(keep_path)
-        dirs = [d for d in FRAMES_DIR.iterdir() if d.is_dir()]
+        keep_slug = frame_token_slug(keep_token)
+        dirs = [d for d in layer_dir.iterdir() if d.is_dir()]
         others = sorted(
             (d for d in dirs if d.name != keep_slug),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
         keep_names = {keep_slug}
-        if others:
-            keep_names.add(others[0].name)
+        for d in others[: max(0, KEEP_FRAME_DIRS - 1)]:
+            keep_names.add(d.name)
         for d in dirs:
             if d.name not in keep_names:
                 shutil.rmtree(d, ignore_errors=True)
         with self._lock:
-            self._mem.clear()
+            self._mem = {
+                k: v for k, v in self._mem.items()
+                if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
+            }
 
 
 class PrefetchWorker(threading.Thread):
-    """后台按优先级预渲染全部 zoom 并落盘。"""
-
     def __init__(
         self,
         frame_cache: FrameCache,
+        state: AppState,
         use_basemap: bool,
         outline_geometries: list | None,
     ) -> None:
         super().__init__(daemon=True)
         self.frame_cache = frame_cache
+        self.state = state
         self.use_basemap = use_basemap
         self.outline_geometries = outline_geometries
         self._lock = threading.Lock()
@@ -587,24 +965,22 @@ class PrefetchWorker(threading.Thread):
 
     def schedule(
         self,
+        layer: LayerProvider,
+        frame: WeatherFrame,
         lat: float,
         lon: float,
         city: str,
-        host: str,
-        radar_path: str,
-        frame_ts: int,
         center_zoom: int,
     ) -> None:
         with self._lock:
             self._generation += 1
             self._job = (
                 self._generation,
+                layer,
+                frame,
                 lat,
                 lon,
                 city,
-                host,
-                radar_path,
-                frame_ts,
                 center_zoom,
             )
         self._wake.set()
@@ -618,40 +994,50 @@ class PrefetchWorker(threading.Thread):
                 self._job = None
             if job is None:
                 continue
-            gen, lat, lon, city, host, radar_path, frame_ts, center_zoom = job
-            meta = make_frame_meta(lat, lon, city, host, radar_path, frame_ts)
+            gen, layer, frame, lat, lon, city, center_zoom = job
+            if not layer.supports_zoom():
+                continue
+            meta = make_frame_meta(layer.layer_id, frame, lat, lon, city)
             for z in zoom_priority_order(center_zoom):
                 with self._lock:
                     if self._generation != gen:
                         break
-                if self.frame_cache.get(radar_path, z) is not None:
+                if self.frame_cache.get(layer.layer_id, frame.token, z) is not None:
                     continue
                 try:
-                    img = render_radar_frame_internal(
-                        lat,
-                        lon,
-                        city,
-                        z,
-                        host,
-                        radar_path,
-                        frame_ts,
-                        self.use_basemap,
-                        self.outline_geometries,
+                    img = layer.render(
+                        frame, lat, lon, city, z,
+                        self.use_basemap, self.outline_geometries,
                     )
-                    self.frame_cache.put(radar_path, z, img, meta)
-                    print(f"  预取: z{z}")
+                    self.frame_cache.put(layer.layer_id, frame.token, z, img, meta)
+                    print(f"  预取 {layer.display_name} z{z}")
                 except Exception as exc:
-                    print(f"  预取 z{z} 失败: {exc}")
+                    print(f"  预取 {layer.display_name} z{z} 失败: {exc}")
 
 
 class AppState:
-    """线程共享状态：缩放级别 + 唤醒事件（供旋钮打断刷新等待）。"""
-
-    def __init__(self, zoom: int, default_zoom: int):
+    def __init__(
+        self,
+        layers: list[LayerProvider],
+        zoom: int,
+        default_zoom: int,
+        start_layer: str | None = None,
+        long_press_ms: int = DEFAULT_LONG_PRESS_MS,
+    ) -> None:
+        self.layers = layers
         self.zoom = self._clamp(zoom)
         self.default_zoom = self._clamp(default_zoom)
+        self.long_press_ms = long_press_ms
         self._lock = threading.Lock()
         self.wake = threading.Event()
+        self.anim_active = False
+        idx = 0
+        if start_layer:
+            for i, layer in enumerate(layers):
+                if layer.layer_id == start_layer:
+                    idx = i
+                    break
+        self.layer_index = idx
 
     @staticmethod
     def _clamp(z: int) -> int:
@@ -660,6 +1046,18 @@ class AppState:
     def get_zoom(self) -> int:
         with self._lock:
             return self.zoom
+
+    def get_layer(self) -> LayerProvider:
+        with self._lock:
+            return self.layers[self.layer_index]
+
+    def get_layer_index(self) -> int:
+        with self._lock:
+            return self.layer_index
+
+    def is_anim_active(self) -> bool:
+        with self._lock:
+            return self.anim_active
 
     def bump_zoom(self, delta: int) -> None:
         with self._lock:
@@ -673,16 +1071,38 @@ class AppState:
     def reset_zoom(self) -> None:
         with self._lock:
             if self.zoom == self.default_zoom:
-                # 已是默认值，则触发一次立即刷新
                 self.wake.set()
                 return
             self.zoom = self.default_zoom
         print(f"旋钮按下: zoom 重置为 {self.default_zoom}")
         self.wake.set()
 
+    def next_layer(self) -> None:
+        with self._lock:
+            self.layer_index = (self.layer_index + 1) % len(self.layers)
+            self.anim_active = False
+            name = self.layers[self.layer_index].display_name
+        print(f"图层: -> {name}")
+        self.wake.set()
+
+    def start_anim(self) -> None:
+        with self._lock:
+            if self.anim_active:
+                return
+            self.anim_active = True
+        print("动画: 开始播放")
+        self.wake.set()
+
+    def stop_anim(self) -> None:
+        with self._lock:
+            if not self.anim_active:
+                return
+            self.anim_active = False
+        print("动画: 停止")
+        self.wake.set()
+
 
 def find_knob_device():
-    """查找带音量键的输入设备（旋钮通过 Consumer Control 发送音量键）。"""
     try:
         import evdev
         from evdev import ecodes
@@ -699,10 +1119,25 @@ def find_knob_device():
     return None
 
 
-class KnobController(threading.Thread):
-    """后台监听旋钮：向上转放大、向下转缩小、按下重置缩放。"""
+def find_keyboard_device():
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        return None
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except Exception:
+            continue
+        keys = dev.capabilities().get(ecodes.EV_KEY, [])
+        if ecodes.KEY_SPACE in keys:
+            return dev
+    return None
 
-    def __init__(self, state: AppState):
+
+class KnobController(threading.Thread):
+    def __init__(self, state: AppState) -> None:
         super().__init__(daemon=True)
         self.state = state
 
@@ -713,7 +1148,6 @@ class KnobController(threading.Thread):
         except ImportError:
             print("未安装 python3-evdev，旋钮功能禁用")
             return
-
         while True:
             dev = find_knob_device()
             if dev is None:
@@ -723,7 +1157,7 @@ class KnobController(threading.Thread):
             try:
                 for ev in dev.read_loop():
                     if ev.type != ecodes.EV_KEY or ev.value != 1:
-                        continue  # 只处理按下（每档一次）
+                        continue
                     if ev.code == ecodes.KEY_VOLUMEUP:
                         self.state.bump_zoom(+1)
                     elif ev.code == ecodes.KEY_VOLUMEDOWN:
@@ -731,42 +1165,194 @@ class KnobController(threading.Thread):
                     elif ev.code == ecodes.KEY_MUTE:
                         self.state.reset_zoom()
             except OSError as exc:
-                print(f"旋钮读取中断（可能已拔出）: {exc}")
+                print(f"旋钮读取中断: {exc}")
                 time.sleep(2)
 
 
+class LayerKeyController(threading.Thread):
+    """KEY_SPACE 短按切换图层，长按播放动画。"""
+
+    def __init__(self, state: AppState) -> None:
+        super().__init__(daemon=True)
+        self.state = state
+        self._press_t: float | None = None
+        self._long_triggered = False
+        self._held = False
+        self._timer: threading.Timer | None = None
+
+    def _on_long_press(self) -> None:
+        if self._held and not self._long_triggered:
+            self._long_triggered = True
+            self.state.start_anim()
+
+    def _cancel_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def run(self) -> None:
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            print("未安装 python3-evdev，空格键图层切换禁用")
+            return
+        while True:
+            dev = find_keyboard_device()
+            if dev is None:
+                time.sleep(5)
+                continue
+            print(f"键盘已连接: {dev.name}")
+            try:
+                for ev in dev.read_loop():
+                    if ev.type != ecodes.EV_KEY or ev.code != ecodes.KEY_SPACE:
+                        continue
+                    if ev.value == 1:
+                        self._press_t = time.time()
+                        self._long_triggered = False
+                        self._held = True
+                        self._cancel_timer()
+                        self._timer = threading.Timer(
+                            self.state.long_press_ms / 1000.0,
+                            self._on_long_press,
+                        )
+                        self._timer.daemon = True
+                        self._timer.start()
+                    elif ev.value == 0 and self._press_t is not None:
+                        self._held = False
+                        self._cancel_timer()
+                        held_ms = (time.time() - self._press_t) * 1000
+                        if held_ms < self.state.long_press_ms:
+                            self.state.next_layer()
+                        elif self._long_triggered:
+                            self.state.stop_anim()
+                        self._press_t = None
+                        self._long_triggered = False
+            except OSError as exc:
+                print(f"键盘读取中断: {exc}")
+                time.sleep(2)
+
+
+def cache_zoom_for_layer(layer: LayerProvider, zoom: int) -> int:
+    return 0 if not layer.supports_zoom() else zoom
+
+
+def render_layer_frame(
+    layer: LayerProvider,
+    frame: WeatherFrame,
+    lat: float,
+    lon: float,
+    city: str,
+    zoom: int,
+    use_basemap: bool,
+    outline_geometries: list | None,
+    frame_cache: FrameCache,
+) -> tuple[Image.Image, bool]:
+    cache_z = cache_zoom_for_layer(layer, zoom)
+    cached = frame_cache.get(layer.layer_id, frame.token, cache_z)
+    if cached is not None:
+        return cached, True
+    img = layer.render(
+        frame, lat, lon, city, zoom, use_basemap, outline_geometries,
+    )
+    meta = make_frame_meta(layer.layer_id, frame, lat, lon, city)
+    frame_cache.put(layer.layer_id, frame.token, cache_z, img, meta)
+    return img, False
+
+
+def play_animation(
+    layer: LayerProvider,
+    frames: list[WeatherFrame],
+    lat: float,
+    lon: float,
+    city: str,
+    zoom: int,
+    use_basemap: bool,
+    outline_geometries: list | None,
+    frame_cache: FrameCache,
+    state: AppState,
+    show: Callable[[Image.Image], None],
+    fps: int,
+) -> None:
+    if len(frames) < 2:
+        print("动画: 可用帧不足，跳过")
+        return
+    interval = 1.0 / max(1, fps)
+    print(f"动画: {layer.display_name} {len(frames)} 帧 @ {fps}fps")
+    while state.is_anim_active():
+        for frame in frames:
+            if not state.is_anim_active():
+                break
+            if state.wake.is_set():
+                break
+            try:
+                img, _ = render_layer_frame(
+                    layer, frame, lat, lon, city, zoom,
+                    use_basemap, outline_geometries, frame_cache,
+                )
+                show(img)
+            except Exception as exc:
+                print(f"  动画帧失败: {exc}")
+            deadline = time.time() + interval
+            while time.time() < deadline:
+                if not state.is_anim_active() or state.wake.is_set():
+                    break
+                time.sleep(0.02)
+        if state.wake.is_set():
+            break
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GC9A01 气象雷达图显示")
-    parser.add_argument("--lat", type=float, default=None, help="手动指定纬度")
-    parser.add_argument("--lon", type=float, default=None, help="手动指定经度")
-    parser.add_argument("--zoom", type=int, default=7, help="地图缩放级别（默认 7）")
-    parser.add_argument("--interval", type=int, default=300, help="刷新间隔秒数（默认 300）")
-    parser.add_argument("--once", action="store_true", help="只刷新一次")
-    parser.add_argument("--no-basemap", action="store_true", help="不加载底图瓦片")
-    parser.add_argument("--no-outline", action="store_true", help="不绘制海岸线/国界轮廓勾线")
-    parser.add_argument("--no-knob", action="store_true", help="禁用旋钮缩放控制")
-    parser.add_argument("--no-display", action="store_true", help="仅下载渲染，不刷屏幕（调试用）")
+    parser = argparse.ArgumentParser(description="GC9A01 多图层气象图显示")
+    parser.add_argument("--lat", type=float, default=None)
+    parser.add_argument("--lon", type=float, default=None)
+    parser.add_argument("--zoom", type=int, default=7)
+    parser.add_argument("--interval", type=int, default=300)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--no-basemap", action="store_true")
+    parser.add_argument("--no-outline", action="store_true")
+    parser.add_argument("--no-knob", action="store_true")
+    parser.add_argument("--no-keys", action="store_true", help="禁用空格键图层/动画控制")
+    parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--layer", default=None, help="起始图层 ID")
+    parser.add_argument("--no-anim", action="store_true", help="禁用长按动画")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    cfg = load_config()
     use_basemap = not args.no_basemap
+    anim_fps = int(cfg.get("anim_fps", DEFAULT_ANIM_FPS))
+    anim_hours = float(cfg.get("anim_window_hours", DEFAULT_ANIM_WINDOW_HOURS))
+    long_press_ms = int(cfg.get("long_press_ms", DEFAULT_LONG_PRESS_MS))
 
     outline_geometries: list = []
     if not args.no_outline:
         outline_geometries = load_outline_geometries()
         print(f"轮廓线段: {len(outline_geometries)} 条")
 
-    state = AppState(zoom=args.zoom, default_zoom=args.zoom)
+    layers = resolve_layers(cfg)
+    layer_names = ", ".join(l.display_name for l in layers)
+    print(f"图层: {layer_names}")
+
+    state = AppState(
+        layers=layers,
+        zoom=args.zoom,
+        default_zoom=args.zoom,
+        start_layer=args.layer,
+        long_press_ms=long_press_ms,
+    )
     frame_cache = FrameCache()
     prefetch: PrefetchWorker | None = None
     if not args.once:
-        prefetch = PrefetchWorker(frame_cache, use_basemap, outline_geometries)
+        prefetch = PrefetchWorker(frame_cache, state, use_basemap, outline_geometries)
         prefetch.start()
 
     if not args.no_knob and not args.once:
         KnobController(state).start()
+    if not args.no_keys and not args.once and not args.no_anim:
+        LayerKeyController(state).start()
 
     lcd = None
     if not args.no_display:
@@ -780,11 +1366,12 @@ def main() -> None:
 
     last_lat: float | None = None
     last_lon: float | None = None
-    last_radar_path: str | None = None
+    last_tokens: dict[str, str] = {}
 
     try:
         while True:
             zoom = state.get_zoom()
+            layer = state.get_layer()
             try:
                 lat, lon, city = fetch_location(args.lat, args.lon)
                 if last_lat is not None and (
@@ -795,53 +1382,59 @@ def main() -> None:
                     frame_cache.clear_memory()
                 last_lat, last_lon = lat, lon
 
-                host, radar_path, frame_ts = fetch_rainviewer_frame()
-                if radar_path != last_radar_path:
-                    frame_cache.invalidate_old(radar_path)
-                    last_radar_path = radar_path
+                if state.is_anim_active():
+                    anim_frames = layer.frames(anim_hours)
+                    play_animation(
+                        layer, anim_frames, lat, lon, city, zoom,
+                        use_basemap, outline_geometries, frame_cache,
+                        state, show, anim_fps,
+                    )
+                    state.wake.clear()
+                    continue
 
-                print(f"位置: {city} ({lat:.4f}, {lon:.4f}), zoom={zoom}")
-                print(f"  雷达帧: {radar_path} ({frame_ts})")
+                frames = layer.frames(anim_hours)
+                if not frames:
+                    print(f"{layer.display_name} 当前无可用帧")
+                    show(make_error_image(f"{layer.display_name}\n暂无数据"))
+                    if args.once:
+                        break
+                    if state.wake.wait(timeout=min(30, args.interval)):
+                        time.sleep(KNOB_DEBOUNCE)
+                        state.wake.clear()
+                    continue
+                frame = frames[-1]
+
+                if last_tokens.get(layer.layer_id) != frame.token:
+                    frame_cache.invalidate_old(layer.layer_id, frame.token)
+                    last_tokens[layer.layer_id] = frame.token
+
+                print(
+                    f"位置: {city} ({lat:.4f}, {lon:.4f}), "
+                    f"图层={layer.display_name}, zoom={zoom}"
+                )
+                print(f"  帧: {frame.token} ({frame.timestamp})")
 
                 t0 = time.time()
-                img = frame_cache.get(radar_path, zoom)
-                from_cache = img is not None
-                if img is None:
-                    meta = make_frame_meta(lat, lon, city, host, radar_path, frame_ts)
-                    img = render_radar_frame_internal(
-                        lat,
-                        lon,
-                        city,
-                        zoom,
-                        host,
-                        radar_path,
-                        frame_ts,
-                        use_basemap,
-                        outline_geometries,
-                    )
-                    if state.wake.is_set() and state.get_zoom() != zoom:
-                        continue
-                    frame_cache.put(radar_path, zoom, img, meta)
-                elif state.wake.is_set() and state.get_zoom() != zoom:
+                img, from_cache = render_layer_frame(
+                    layer, frame, lat, lon, city, zoom,
+                    use_basemap, outline_geometries, frame_cache,
+                )
+                if state.wake.is_set() and (
+                    state.get_zoom() != zoom
+                    or state.get_layer().layer_id != layer.layer_id
+                    or state.is_anim_active()
+                ):
                     continue
 
                 show(img)
                 elapsed_ms = (time.time() - t0) * 1000
                 if from_cache:
-                    print(f"缓存命中 z{zoom} ({elapsed_ms:.0f}ms)")
+                    print(f"缓存命中 ({elapsed_ms:.0f}ms)")
                 else:
-                    print(f"雷达图已更新 ({elapsed_ms:.0f}ms)")
+                    print(f"已更新 ({elapsed_ms:.0f}ms)")
 
-                if prefetch is not None:
-                    prefetch.schedule(
-                        lat,
-                        lon,
-                        city,
-                        host,
-                        radar_path,
-                        frame_ts,
-                        state.get_zoom(),
-                    )
+                if prefetch is not None and layer.supports_zoom():
+                    prefetch.schedule(layer, frame, lat, lon, city, state.get_zoom())
             except Exception as exc:
                 print(f"刷新失败: {exc}")
                 show(make_error_image("离线\n重试中..."))
@@ -849,7 +1442,7 @@ def main() -> None:
             if args.once:
                 break
 
-            print(f"等待 {args.interval} 秒后刷新（旋钮可打断）...")
+            print(f"等待 {args.interval} 秒（旋钮/空格可打断）...")
             if state.wake.wait(timeout=args.interval):
                 time.sleep(KNOB_DEBOUNCE)
                 state.wake.clear()

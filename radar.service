@@ -1,5 +1,5 @@
 [Unit]
-Description=GC9A01 weather radar display
+Description=GC9A01 multi-layer weather display
 After=network-online.target
 Wants=network-online.target
 
