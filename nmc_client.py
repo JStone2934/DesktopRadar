@@ -6,16 +6,23 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import requests
 
 NMC_BASE = "http://www.nmc.cn"
-POSITION_URL = NMC_BASE + "/rest/position"
+PROVINCE_URL = NMC_BASE + "/rest/province"
 WEATHER_URL = NMC_BASE + "/rest/weather"
+GEOCODE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
+CACHE_DIR = Path(__file__).resolve().parent / "cache"
+CITY_CATALOG_PATH = CACHE_DIR / "nmc_cities.json"
+GEOCODE_CACHE_PATH = CACHE_DIR / "nmc_geocode.json"
 NMC_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) gc9a01-radar-display/2.0",
     "Referer": "http://www.nmc.cn/",
@@ -48,6 +55,13 @@ def weather_icon_category(code: str | None) -> str:
 
 
 @dataclass
+class NmcStation:
+    code: str
+    province: str
+    city: str
+
+
+@dataclass
 class NmcReport:
     target_time: datetime
     valid_label: str
@@ -58,10 +72,18 @@ class NmcReport:
     wind: str
     humidity: str | None
     is_forecast: bool
+    station_city: str = ""
+    station_province: str = ""
 
     @property
     def icon(self) -> str:
         return weather_icon_category(self.weather_code)
+
+    @property
+    def display_city(self) -> str:
+        if self.station_city:
+            return self.station_city
+        return "未知"
 
 
 class NmcError(RuntimeError):
@@ -81,28 +103,27 @@ class NmcClient:
         self._weather_ttl = weather_ttl_sec
         self._station_ttl = station_ttl_sec
         self._lock = threading.Lock()
-        self._station_cache: tuple[float, str] | None = None
+        self._station_cache: dict[str, tuple[float, NmcStation]] = {}
         self._weather_cache: dict[str, tuple[float, dict]] = {}
+        self._city_catalog: list[dict] | None = None
+        self._geocode_cache: dict[str, tuple[str, str]] | None = None
 
     def resolve_station(self, lat: float, lon: float) -> str:
+        return self.resolve_station_info(lat, lon).code
+
+    def resolve_station_info(self, lat: float, lon: float) -> NmcStation:
+        """按经纬度逆地理编码后匹配 NMC 城市站点（非 IP 定位）。"""
+        key = f"{lat:.3f},{lon:.3f}"
         now = time.time()
         with self._lock:
-            if self._station_cache and now - self._station_cache[0] < self._station_ttl:
-                return self._station_cache[1]
-        resp = self._session.get(
-            POSITION_URL,
-            params={"lat": f"{lat:.4f}", "lon": f"{lon:.4f}"},
-            headers=NMC_HEADERS,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        code = data.get("code")
-        if not code:
-            raise NmcError(f"NMC 定位无结果: {data}")
+            cached = self._station_cache.get(key)
+            if cached and now - cached[0] < self._station_ttl:
+                return cached[1]
+        province, city = self._reverse_geocode(lat, lon)
+        station = self._match_city_station(province, city)
         with self._lock:
-            self._station_cache = (now, code)
-        return code
+            self._station_cache[key] = (now, station)
+        return station
 
     def fetch_weather(self, station_id: str) -> dict:
         now = time.time()
@@ -134,11 +155,141 @@ class NmcClient:
     ) -> NmcReport:
         now = now or datetime.now().astimezone()
         target = now + timedelta(minutes=offset_min)
-        station = self.resolve_station(lat, lon)
-        data = self.fetch_weather(station)
+        station = self.resolve_station_info(lat, lon)
+        data = self.fetch_weather(station.code)
         if offset_min <= 0:
-            return self._report_from_observation(data, target, offset_min, now)
-        return self._report_from_forecast(data, target)
+            report = self._report_from_observation(data, target, offset_min, now)
+        else:
+            report = self._report_from_forecast(data, target)
+        report.station_city = station.city
+        report.station_province = station.province
+        return report
+
+    def _load_city_catalog(self) -> list[dict]:
+        if self._city_catalog is not None:
+            return self._city_catalog
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if CITY_CATALOG_PATH.exists():
+            try:
+                with open(CITY_CATALOG_PATH, encoding="utf-8") as f:
+                    catalog = json.load(f)
+                if isinstance(catalog, list) and catalog:
+                    self._city_catalog = catalog
+                    return catalog
+            except (json.JSONDecodeError, OSError):
+                pass
+        resp = self._session.get(PROVINCE_URL, headers=NMC_HEADERS, timeout=15)
+        resp.raise_for_status()
+        provinces = resp.json()
+        catalog: list[dict] = []
+        for prov in provinces:
+            code = prov.get("code")
+            if not code:
+                continue
+            try:
+                cr = self._session.get(
+                    f"{PROVINCE_URL}/{code}",
+                    headers=NMC_HEADERS,
+                    timeout=15,
+                )
+                cr.raise_for_status()
+                catalog.extend(cr.json())
+            except Exception:
+                continue
+        if not catalog:
+            raise NmcError("无法加载 NMC 城市列表")
+        with open(CITY_CATALOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(catalog, f, ensure_ascii=False)
+        self._city_catalog = catalog
+        return catalog
+
+    def _load_geocode_cache(self) -> dict[str, tuple[str, str]]:
+        if self._geocode_cache is not None:
+            return self._geocode_cache
+        cache: dict[str, tuple[str, str]] = {}
+        if GEOCODE_CACHE_PATH.exists():
+            try:
+                with open(GEOCODE_CACHE_PATH, encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    cache = {k: tuple(v) for k, v in raw.items()}
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+        self._geocode_cache = cache
+        return cache
+
+    def _save_geocode_cache(self) -> None:
+        if self._geocode_cache is None:
+            return
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(GEOCODE_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(self._geocode_cache, f, ensure_ascii=False)
+
+    def _reverse_geocode(self, lat: float, lon: float) -> tuple[str, str]:
+        key = f"{lat:.3f},{lon:.3f}"
+        cache = self._load_geocode_cache()
+        if key in cache:
+            return cache[key]
+        resp = self._session.get(
+            GEOCODE_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "localityLanguage": "zh",
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        province = str(data.get("principalSubdivision") or "")
+        city = str(
+            data.get("city")
+            or data.get("locality")
+            or data.get("principalSubdivision")
+            or "",
+        )
+        if not province:
+            raise NmcError(f"逆地理编码无省份: {data}")
+        cache[key] = (province, city)
+        self._save_geocode_cache()
+        return province, city
+
+    def _match_city_station(self, province: str, city: str) -> NmcStation:
+        catalog = self._load_city_catalog()
+        prov_key = province[:2]
+        candidates = [
+            c for c in catalog
+            if prov_key in str(c.get("province", ""))
+        ]
+        if not candidates:
+            raise NmcError(f"NMC 无匹配省份: {province}")
+
+        geo_norm = _norm_place_name(city)
+        best: dict | None = None
+        best_score = -1
+        for item in candidates:
+            nmc_city = str(item.get("city", ""))
+            nmc_norm = _norm_place_name(nmc_city)
+            score = 0
+            if geo_norm and nmc_norm == geo_norm:
+                score = 100
+            elif geo_norm and geo_norm in nmc_city:
+                score = 80
+            elif geo_norm and nmc_norm and nmc_norm in geo_norm:
+                score = 70
+            elif geo_norm and nmc_norm and geo_norm in nmc_norm:
+                score = 60
+            if score > best_score:
+                best_score = score
+                best = item
+
+        if best is None or best_score <= 0:
+            best = candidates[0]
+        return NmcStation(
+            code=str(best["code"]),
+            province=str(best.get("province", province)),
+            city=str(best.get("city", city)),
+        )
 
     def _report_from_observation(
         self,
@@ -221,6 +372,15 @@ class NmcClient:
             humidity=None,
             is_forecast=True,
         )
+
+
+def _norm_place_name(name: str) -> str:
+    """地名归一化：去括号、行政后缀，便于与 NMC 站名匹配。"""
+    text = re.sub(r"[（(].*?[）)]", "", name or "")
+    for suffix in ("特别行政区", "自治区", "自治州", "地区", "盟", "市", "区", "县"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+    return text.strip()
 
 
 def _resolve_slot(by_date: dict, date: str, slot: str):

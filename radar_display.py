@@ -1245,7 +1245,7 @@ def render_nmc_report(report: NmcReport, city: str) -> Image.Image:
     offset_txt = format_offset_label(
         round((report.target_time - datetime.now().astimezone()).total_seconds() / 60)
     )
-    _draw_centered(draw, 24, f"{city}  {offset_txt}", get_cjk_font(16), (255, 255, 255))
+    _draw_centered(draw, 24, f"{report.display_city}  {offset_txt}", get_cjk_font(16), (255, 255, 255))
     _draw_centered(draw, 46, target_txt, get_cjk_font(13), (150, 160, 180))
     _draw_centered(draw, 64, report.valid_label, get_cjk_font(12), (120, 170, 210))
 
@@ -1647,6 +1647,11 @@ class NmcNowcastLayer(LayerProvider):
         self.state: "AppState | None" = None
 
     def supports_zoom(self) -> bool:
+        return False
+
+    def cacheable(self) -> bool:
+        # 文本渲染开销极小，且成品图缓存键不含经纬度；关闭缓存
+        # 以保证城市/天气始终跟随当前 RADAR 坐标，不返回旧位置的图。
         return False
 
     def frames(self, window_hours: float = DEFAULT_ANIM_WINDOW_HOURS) -> list[WeatherFrame]:
@@ -2831,10 +2836,19 @@ def main() -> None:
                     frame_cache.invalidate_layer(layer.layer_id)
                 last_render_centers[layer.layer_id] = (r_lat, r_lon)
 
+                display_city = city
+                if state.is_nowcast_layer() and isinstance(layer, NmcNowcastLayer):
+                    try:
+                        display_city = layer.client.resolve_station_info(
+                            r_lat, r_lon,
+                        ).city
+                    except Exception:
+                        pass
+
                 if state.is_anim_active():
                     anim_frames = layer.frames(anim_hours)
                     play_animation(
-                        layer, anim_frames, r_lat, r_lon, city, zoom,
+                        layer, anim_frames, r_lat, r_lon, display_city, zoom,
                         use_basemap, outline_geometries, frame_cache,
                         state, show, anim_fps,
                     )
@@ -2862,7 +2876,7 @@ def main() -> None:
 
                 if not quiet:
                     print(
-                        f"位置: {city} ({r_lat:.4f}, {r_lon:.4f}), "
+                        f"位置: {display_city} ({r_lat:.4f}, {r_lon:.4f}), "
                         f"图层={layer.display_name}, zoom={zoom}"
                     )
                     if state.is_nowcast_layer():
@@ -2874,7 +2888,7 @@ def main() -> None:
 
                 t0 = time.time()
                 img, from_cache = render_layer_frame(
-                    layer, frame, r_lat, r_lon, city, zoom,
+                    layer, frame, r_lat, r_lon, display_city, zoom,
                     use_basemap, outline_geometries, frame_cache,
                 )
                 if state.wake.is_set() and (
@@ -2901,7 +2915,7 @@ def main() -> None:
                         print(f"已更新 ({elapsed_ms:.0f}ms)")
 
                 if prefetch is not None and layer.supports_zoom():
-                    prefetch.schedule(layer, frame, r_lat, r_lon, city, state.get_zoom())
+                    prefetch.schedule(layer, frame, r_lat, r_lon, display_city, state.get_zoom())
             except Exception as exc:
                 print(f"刷新失败: {exc}")
                 show(make_error_image("离线\n重试中..."))
