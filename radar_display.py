@@ -87,7 +87,8 @@ OUTLINE_WIDTH = 1
 
 ZOOM_MIN = 3
 ZOOM_MAX = 12
-RADAR_MAX_ZOOM = 7
+# RainViewer 免费 API 原生雷达瓦片最高 zoom（见 rainviewer.com/api/weather-maps-api.html）
+RAINVIEWER_MAX_ZOOM = 7
 KNOB_DEBOUNCE = 0.15
 FRAME_TTL = 60
 DEFAULT_LAYERS = ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"]
@@ -688,6 +689,20 @@ def draw_outline_equirect(
 OverlayFn = Callable[[int, int, int], tuple[str, str] | None]
 
 
+def paste_clipped_alpha(composite: Image.Image, tile: Image.Image, dest_x: int, dest_y: int) -> None:
+    """将 RGBA 瓦片贴到 composite 上，超出边界部分自动裁切。"""
+    cw, ch = composite.size
+    tw, th = tile.size
+    x0 = max(0, dest_x)
+    y0 = max(0, dest_y)
+    x1 = min(cw, dest_x + tw)
+    y1 = min(ch, dest_y + th)
+    if x0 >= x1 or y0 >= y1:
+        return
+    region = tile.crop((x0 - dest_x, y0 - dest_y, x1 - dest_x, y1 - dest_y))
+    composite.alpha_composite(region, (x0, y0))
+
+
 def build_composite_tiles(
     lat: float,
     lon: float,
@@ -708,7 +723,8 @@ def build_composite_tiles(
         print("  底图不可达，跳过高德底图")
         load_basemap = False
 
-    jobs: list[tuple[int, int, str, object]] = []
+    base_jobs: list[tuple[int, int, object]] = []
+    overlay_jobs: list[tuple[int, int, object]] = []
     for dy in range(GRID):
         for dx in range(GRID):
             tx = origin_tx + dx
@@ -716,26 +732,52 @@ def build_composite_tiles(
             px = dx * TILE_SIZE
             py = dy * TILE_SIZE
             if load_basemap:
-                jobs.append((px, py, "base", _TILE_POOL.submit(fetch_basemap_tile, zoom, tx, ty)))
-            otx = int(tx * (2 ** (tile_zoom - zoom))) if tile_zoom != zoom else tx
-            oty = int(ty * (2 ** (tile_zoom - zoom))) if tile_zoom != zoom else ty
-            spec = overlay_fn(tile_zoom, otx, oty)
-            if spec:
-                url, key = spec
-                jobs.append((px, py, "overlay", _TILE_POOL.submit(fetch_tile, url, True, key)))
+                base_jobs.append((px, py, _TILE_POOL.submit(fetch_basemap_tile, zoom, tx, ty)))
+            if tile_zoom == zoom:
+                spec = overlay_fn(tile_zoom, tx, ty)
+                if spec:
+                    url, key = spec
+                    overlay_jobs.append((
+                        px, py, _TILE_POOL.submit(fetch_tile, url, True, key), 1,
+                    ))
 
-    for kind in ("base", "overlay"):
-        for px, py, k, future in jobs:
-            if k != kind:
-                continue
-            tile = future.result()
-            if not tile:
-                continue
-            if kind == "base":
-                tile = prepare_basemap_tile(tile, bright=basemap_bright)
-                composite.paste(tile, (px, py), tile)
-            else:
-                composite.alpha_composite(tile, (px, py))
+    if tile_zoom != zoom:
+        scale = 2 ** (zoom - tile_zoom)
+        comp_ox = origin_tx * TILE_SIZE
+        comp_oy = origin_ty * TILE_SIZE
+        otx_min = int(math.floor(comp_ox / scale / TILE_SIZE))
+        oty_min = int(math.floor(comp_oy / scale / TILE_SIZE))
+        otx_max = int(math.floor((comp_ox + COMPOSITE_SIZE - 1) / scale / TILE_SIZE))
+        oty_max = int(math.floor((comp_oy + COMPOSITE_SIZE - 1) / scale / TILE_SIZE))
+        for oty in range(oty_min, oty_max + 1):
+            for otx in range(otx_min, otx_max + 1):
+                spec = overlay_fn(tile_zoom, otx, oty)
+                if not spec:
+                    continue
+                url, key = spec
+                paste_x = int(otx * TILE_SIZE * scale - comp_ox)
+                paste_y = int(oty * TILE_SIZE * scale - comp_oy)
+                overlay_jobs.append((
+                    paste_x, paste_y,
+                    _TILE_POOL.submit(fetch_tile, url, True, key),
+                    scale,
+                ))
+
+    for px, py, future in base_jobs:
+        tile = future.result()
+        if not tile:
+            continue
+        tile = prepare_basemap_tile(tile, bright=basemap_bright)
+        composite.paste(tile, (px, py), tile)
+
+    for px, py, future, scale in overlay_jobs:
+        tile = future.result()
+        if not tile:
+            continue
+        if scale > 1:
+            size = TILE_SIZE * scale
+            tile = tile.resize((size, size), Image.Resampling.LANCZOS)
+        paste_clipped_alpha(composite, tile, px, py)
     return composite
 
 
@@ -920,7 +962,7 @@ class RainViewerLayer(LayerProvider):
     ) -> Image.Image:
         host = frame.payload["host"]
         path = frame.payload["path"]
-        eff_zoom = min(zoom, RADAR_MAX_ZOOM)
+        overlay_zoom = min(zoom, RAINVIEWER_MAX_ZOOM)
 
         def overlay_fn(z: int, tx: int, ty: int) -> tuple[str, str] | None:
             url = f"{host}{path}/256/{z}/{tx}/{ty}/4/1_1.png"
@@ -928,8 +970,9 @@ class RainViewerLayer(LayerProvider):
             return url, key
 
         return render_tile_layer(
-            lat, lon, city, eff_zoom, frame.timestamp, self.display_name,
+            lat, lon, city, zoom, frame.timestamp, self.display_name,
             overlay_fn, use_basemap, outline_geometries,
+            overlay_zoom=overlay_zoom,
         )
 
 
