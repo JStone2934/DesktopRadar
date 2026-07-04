@@ -1374,7 +1374,35 @@ def _draw_aircraft_blip(
 
 SWEEP_TRAIL_DEG = 150.0   # 拖影跨度
 SWEEP_TRAIL_STEP = 5.0    # 拖影分段角度
-SWEEP_MAX_ALPHA = 150     # 拖影根部最大不透明度
+SWEEP_MAX_ALPHA = 115     # 拖影根部最大不透明度（略压暗）
+
+
+def _compass_to_pil(bearing: float) -> float:
+    """指南针方位(北0顺时针) -> PIL pieslice 角度(东0逆时针)。"""
+    return (bearing - 90.0) % 360.0
+
+
+def _pieslice_compass(
+    draw: ImageDraw.ImageDraw,
+    box: list,
+    b0: float,
+    b1: float,
+    fill,
+) -> None:
+    """绘制指南针小扇区 b0→b1（与 _aircraft_polar_xy 同一坐标系）。"""
+    b0 %= 360.0
+    b1 %= 360.0
+    if b0 < b1:
+        p0, p1 = _compass_to_pil(b0), _compass_to_pil(b1)
+        if p0 <= p1:
+            draw.pieslice(box, start=p0, end=p1, fill=fill)
+        else:
+            draw.pieslice(box, start=p0, end=p1 + 360.0, fill=fill)
+    elif b0 > b1:
+        p0 = _compass_to_pil(b0)
+        draw.pieslice(box, start=p0, end=270.0, fill=fill)
+        if b1 > 0:
+            draw.pieslice(box, start=270.0, end=_compass_to_pil(b1), fill=fill)
 
 
 def _draw_sweep(
@@ -1384,32 +1412,22 @@ def _draw_sweep(
     max_r: float,
     angle_deg: float,
 ) -> Image.Image:
-    """老式 PPI 雷达扫描：亮绿扫描线 + 后方绿色渐变余晖拖影。"""
+    """老式 PPI 雷达扫描：顺时针旋转的绿色渐变余晖（前沿 = angle_deg）。"""
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     box = [cx - max_r, cy - max_r, cx + max_r, cy + max_r]
-    # 拖影：从扫描线往"后方"（角度递减方向）逐段渐暗
+    # 拖影在视觉前沿后方（指南针方位递减侧）
     k = 0.0
     while k < SWEEP_TRAIL_DEG:
         frac = 1.0 - (k / SWEEP_TRAIL_DEG)
         alpha = int(SWEEP_MAX_ALPHA * frac * frac)
         if alpha > 0:
-            a0 = angle_deg - k - SWEEP_TRAIL_STEP
-            a1 = angle_deg - k
-            # 屏幕角度(正北0,顺时针) -> PIL 角度(正东0,顺时针)
-            draw.pieslice(
-                box,
-                start=90 - a1,
-                end=90 - a0,
-                fill=(0, 230, 90, alpha),
+            b0 = (angle_deg - k - SWEEP_TRAIL_STEP) % 360.0
+            b1 = (angle_deg - k) % 360.0
+            _pieslice_compass(
+                draw, box, b0, b1, fill=(0, 185, 78, alpha),
             )
         k += SWEEP_TRAIL_STEP
-    # 亮扫描线 + 前端光点
-    rad = math.radians(angle_deg)
-    ex = cx + max_r * math.sin(rad)
-    ey = cy - max_r * math.cos(rad)
-    draw.line([(cx, cy), (ex, ey)], fill=(150, 255, 170, 230), width=2)
-    draw.ellipse([ex - 3, ey - 3, ex + 3, ey + 3], fill=(200, 255, 210, 230))
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -1440,6 +1458,64 @@ def draw_outline_centered(
 
 
 SWEEP_DEG_PER_SEC = 45.0  # 老式雷达转速（度/秒），约 8 秒一圈
+
+
+@dataclass
+class SweepBlip:
+    dist_km: float
+    bearing_deg: float
+    ac: Aircraft
+
+
+@dataclass
+class SweepState:
+    display_cache: dict[str, SweepBlip] = field(default_factory=dict)
+    context_key: tuple | None = None
+
+
+def _sweep_leading_angle(now: float) -> float:
+    """余晖前沿视觉方位（北0顺时针，北→东→南→西）。"""
+    return (now * SWEEP_DEG_PER_SEC) % 360.0
+
+
+def _sweep_wedge_contains(bearing: float, leading_angle: float) -> bool:
+    """飞机方位是否落在当前视觉余晖扇区内（前沿=leading，跨度 SWEEP_TRAIL_DEG）。"""
+    lo = (leading_angle - SWEEP_TRAIL_DEG) % 360.0
+    hi = leading_angle % 360.0
+    b = bearing % 360.0
+    if lo <= hi:
+        return lo <= b <= hi
+    return b >= lo or b <= hi
+
+
+def _update_sweep_cache(
+    state: SweepState,
+    aircraft: list[Aircraft],
+    lat: float,
+    lon: float,
+    range_km: float,
+    now: float,
+) -> None:
+    ctx = (range_km, round(lat, 3), round(lon, 3))
+    if state.context_key != ctx:
+        state.context_key = ctx
+        state.display_cache.clear()
+
+    leading = _sweep_leading_angle(now)
+    active: set[str] = set()
+
+    for ac in aircraft:
+        dist, brng = extrapolated_polar(ac, lat, lon, now)
+        if dist > range_km:
+            continue
+        active.add(ac.hex)
+        # 仅当最新方位落在当前余晖扇区内时更新显示；否则保持上次快照
+        if _sweep_wedge_contains(brng, leading):
+            state.display_cache[ac.hex] = SweepBlip(dist, brng, ac)
+
+    for hex_id in list(state.display_cache):
+        if hex_id not in active:
+            del state.display_cache[hex_id]
 
 
 def render_adsb_background(
@@ -1482,9 +1558,11 @@ def render_adsb(
     range_km: float,
     background: Image.Image,
     now: float | None = None,
+    sweep_state: SweepState | None = None,
 ) -> tuple[Image.Image, tuple[str, float] | None]:
-    """在背景上叠加插值后的飞机点、标签与扫描线。
+    """在背景上叠加飞机点、标签与（可选）扫描余晖。
 
+    sweep_state 非空时采用真实 PPI 规则：显示位置仅在当前余晖扇区内更新，其余时间冻结。
     返回 (成品图, 最近飞机(ident, dist_km) 或 None)。
     """
     if now is None:
@@ -1501,14 +1579,19 @@ def render_adsb(
     img = background.copy()
     draw = ImageDraw.Draw(img)
 
-    # 按航向/地速外推到当前时刻做位置插值
     view: list[tuple[float, float, Aircraft]] = []
-    for ac in aircraft:
-        dist, brng = extrapolated_polar(ac, lat, lon, now)
-        if dist > range_km:
-            continue
-        view.append((dist, brng, ac))
-    view.sort(key=lambda t: t[0])
+    if sweep_state is not None:
+        _update_sweep_cache(sweep_state, aircraft, lat, lon, range_km, now)
+        for blip in sweep_state.display_cache.values():
+            view.append((blip.dist_km, blip.bearing_deg, blip.ac))
+        view.sort(key=lambda t: t[0])
+    else:
+        for ac in aircraft:
+            dist, brng = extrapolated_polar(ac, lat, lon, now)
+            if dist > range_km:
+                continue
+            view.append((dist, brng, ac))
+        view.sort(key=lambda t: t[0])
 
     for dist, brng, ac in view:
         x, y = _aircraft_polar_xy(cx, cy, max_r, brng, dist, range_km)
@@ -1539,8 +1622,7 @@ def render_adsb(
         _draw_centered(draw, cy + 20, "No aircraft", get_font(14), (120, 150, 130))
 
     if style == "sweep":
-        angle = (now * SWEEP_DEG_PER_SEC) % 360
-        img = _draw_sweep(img, cx, cy, max_r, angle)
+        img = _draw_sweep(img, cx, cy, max_r, _sweep_leading_angle(now))
 
     nearest = None
     if view:
@@ -1569,6 +1651,7 @@ class AdsbRadarLayer(LayerProvider):
         self._bg: Image.Image | None = None
         self._bg_key: tuple | None = None
         self._last_lcd: tuple[str | None, float] | None = None
+        self._sweep_state = SweepState() if style == "sweep" else None
 
     def supports_zoom(self) -> bool:
         return False
@@ -1636,6 +1719,7 @@ class AdsbRadarLayer(LayerProvider):
         background = self._background(lat, lon, range_km, outline_geometries)
         img, nearest = render_adsb(
             self.client, self.style, lat, lon, city, range_km, background, now,
+            sweep_state=self._sweep_state,
         )
         self._update_lcd(nearest, now)
         return img
