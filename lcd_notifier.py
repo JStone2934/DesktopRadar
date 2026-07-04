@@ -66,6 +66,16 @@ class LcdNotifier:
             return
         self._queue.put((_ascii(line1), _ascii(line2)))
 
+    def backlight_off(self) -> None:
+        """Turn off backlight immediately without updating display text."""
+        if not self.enabled:
+            return
+        with self._timer_lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        self._backlight_off()
+
     def _reset_backlight_timer(self) -> None:
         with self._timer_lock:
             if self._timer is not None:

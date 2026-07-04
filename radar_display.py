@@ -1607,13 +1607,18 @@ class AdsbRadarLayer(LayerProvider):
             return
         ident = nearest[0] if nearest else None
         last = self._last_lcd
-        changed = last is None or last[0] != ident
-        if not changed and now - last[1] < 3.0:
+
+        if nearest is None:
+            if last is not None and last[0] is not None:
+                if self.state.notifier is not None:
+                    self.state.notifier.backlight_off()
+            self._last_lcd = (None, now)
             return
-        if nearest is not None:
-            self.state.notify_lcd("Nearest", f"{nearest[0]} {int(nearest[1])}km")
-        else:
-            self.state.notify_lcd("Aircraft", "No traffic")
+
+        changed = last is None or last[0] != ident
+        if not changed and last is not None and now - last[1] < 3.0:
+            return
+        self.state.notify_lcd("Nearest", f"{nearest[0]} {int(nearest[1])}km")
         self._last_lcd = (ident, now)
 
     def render(
