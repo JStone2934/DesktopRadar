@@ -2361,21 +2361,38 @@ class AppState:
         self.wake.set()
 
 
+def _is_virtual_volume_device(dev) -> bool:
+    """排除树莓派 HDMI 等虚拟音量节点，避免误占旋钮线程。"""
+    name = (dev.name or "").lower()
+    phys = (dev.phys or "").lower()
+    return "hdmi" in name or "jack" in name or "hdmi" in phys
+
+
 def find_knob_device():
     try:
         import evdev
         from evdev import ecodes
     except ImportError:
         return None
+    candidates = []
     for path in evdev.list_devices():
         try:
             dev = evdev.InputDevice(path)
         except Exception:
             continue
         keys = dev.capabilities().get(ecodes.EV_KEY, [])
-        if ecodes.KEY_VOLUMEUP in keys and ecodes.KEY_VOLUMEDOWN in keys:
+        if (
+            ecodes.KEY_VOLUMEUP in keys
+            and ecodes.KEY_VOLUMEDOWN in keys
+            and not _is_virtual_volume_device(dev)
+        ):
+            candidates.append(dev)
+    if not candidates:
+        return None
+    for dev in candidates:
+        if "consumer control" in (dev.name or "").lower():
             return dev
-    return None
+    return candidates[0]
 
 
 MODIFIER_ALIASES = {
