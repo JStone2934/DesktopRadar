@@ -3,8 +3,8 @@
   "default_lon": 116.4074,
   "default_city": "Beijing",
   "manual_location": true,
-  "manual_lat": 22.649444,
-  "manual_lon": 113.680278,
+  "manual_lat": 22.866111,
+  "manual_lon": 113.513611,
   "fy4b_disk_lat": 11.904167,
   "fy4b_disk_lon": 108.724167,
   "fy4b_cn_lat": 22.618611,
@@ -24,6 +24,15 @@
   "channel_keys": {
     "weather": "ctrl+c",
     "aircraft": "ctrl+v"
+  },
+  "action_keys": {
+    "gpu_status": "0"
+  },
+  "ssh_gpu": {
+    "host": "10.7.162.172",
+    "user": "js",
+    "timeout_sec": 5,
+    "cache_ttl_sec": 3
   },
   "caiyun_token": "",
   "long_press_ms": 500,

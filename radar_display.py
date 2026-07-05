@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gc9a01 import GC9A01, HEIGHT, WIDTH
 from lcd_notifier import LcdNotifier
 from adsb_client import AdsbClient, AdsbError, Aircraft, extrapolated_polar
+from gpu_client import GpuClient, GpuError, format_gpu_lcd_lines
 from nmc_client import NmcClient, NmcError, NmcReport
 
 TILE_SIZE = 256
@@ -2462,18 +2463,17 @@ def modifier_code_map() -> dict[int, str]:
     }
 
 
-def parse_channel_keys(cfg: dict) -> list[tuple[str, frozenset[str], int]]:
-    """解析 config channel_keys，支持单键或组合键（如 'ctrl+c'）。
+def _parse_key_combos(raw: dict) -> list[tuple[str, frozenset[str], int]]:
+    """解析按键配置，支持单键或组合键（如 'ctrl+c'）。
 
-    返回 (channel, required_modifiers, main_key_code) 列表。
+    返回 (name, required_modifiers, main_key_code) 列表。
     """
-    raw = cfg.get("channel_keys") or {}
     combos: list[tuple[str, frozenset[str], int]] = []
     try:
         from evdev import ecodes
     except ImportError:
         return combos
-    for channel, spec in raw.items():
+    for name, spec in raw.items():
         if not spec or not isinstance(spec, str):
             continue
         tokens = [t for t in spec.strip().lower().replace(" ", "").split("+") if t]
@@ -2486,19 +2486,29 @@ def parse_channel_keys(cfg: dict) -> list[tuple[str, frozenset[str], int]]:
             if tok in MODIFIER_ALIASES:
                 mods.add(MODIFIER_ALIASES[tok])
                 continue
-            name = tok.upper()
-            if not name.startswith("KEY_"):
-                name = "KEY_" + name
-            code = ecodes.ecodes.get(name)
+            key_name = tok.upper()
+            if not key_name.startswith("KEY_"):
+                key_name = "KEY_" + key_name
+            code = ecodes.ecodes.get(key_name)
             if code is None:
-                print(f"未知 channel_keys 按键名: {tok}")
+                print(f"未知按键名: {tok}")
                 valid = False
                 break
             main_code = code
         if not valid or main_code is None:
             continue
-        combos.append((channel, frozenset(mods), main_code))
+        combos.append((name, frozenset(mods), main_code))
     return combos
+
+
+def parse_channel_keys(cfg: dict) -> list[tuple[str, frozenset[str], int]]:
+    """解析 config channel_keys。"""
+    return _parse_key_combos(cfg.get("channel_keys") or {})
+
+
+def parse_action_keys(cfg: dict) -> list[tuple[str, frozenset[str], int]]:
+    """解析 config action_keys。"""
+    return _parse_key_combos(cfg.get("action_keys") or {})
 
 
 def find_keyboard_device(extra_codes: list[int] | None = None):
@@ -2656,23 +2666,42 @@ class KnobController(threading.Thread):
 
 
 class LayerKeyController(threading.Thread):
-    """KEY_SPACE 短按切换图层（通道内），长按播放动画；channel_keys 切换通道。"""
+    """KEY_SPACE 短按切换图层（通道内），长按播放动画；channel_keys 切换通道；action_keys 触发操作。"""
 
     def __init__(
         self,
         state: AppState,
         channel_combos: list[tuple[str, frozenset[str], int]] | None = None,
+        action_combos: list[tuple[str, frozenset[str], int]] | None = None,
+        gpu_client: GpuClient | None = None,
         anim_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True)
         self.state = state
         self.channel_combos = channel_combos or []
+        self.action_combos = action_combos or []
+        self.gpu_client = gpu_client
         self.anim_enabled = anim_enabled
         self._press_t: float | None = None
         self._long_triggered = False
         self._held = False
         self._timer: threading.Timer | None = None
         self._pressed_mods: set[str] = set()
+
+    def _on_action(self, action: str) -> None:
+        if action != "gpu_status" or self.gpu_client is None:
+            return
+        self.state.notify_lcd("GPU Query", "Please wait")
+
+        def on_ok(stats) -> None:
+            line1, line2 = format_gpu_lcd_lines(stats)
+            self.state.notify_lcd(line1, line2)
+
+        def on_err(exc: GpuError) -> None:
+            detail = str(exc) or "SSH failed"
+            self.state.notify_lcd("GPU Error", detail[:16])
+
+        self.gpu_client.fetch_async(on_ok, on_err)
 
     def _on_long_press(self) -> None:
         if self._held and not self._long_triggered and self.anim_enabled:
@@ -2693,6 +2722,7 @@ class LayerKeyController(threading.Thread):
             return
         mod_map = modifier_code_map()
         main_codes = [code for _, _, code in self.channel_combos]
+        main_codes.extend(code for _, _, code in self.action_combos)
         while True:
             dev = find_keyboard_device(main_codes)
             if dev is None:
@@ -2737,12 +2767,22 @@ class LayerKeyController(threading.Thread):
                         continue
                     if ev.value == 1:
                         matched = False
-                        for channel, mods, code in self.channel_combos:
+                        for action, mods, code in self.action_combos:
                             if ev.code == code and mods == self._pressed_mods:
-                                self.state.switch_channel(channel)
+                                self._on_action(action)
                                 matched = True
                                 break
-                        if not matched and self.channel_combos and not self._pressed_mods:
+                        if not matched:
+                            for channel, mods, code in self.channel_combos:
+                                if ev.code == code and mods == self._pressed_mods:
+                                    self.state.switch_channel(channel)
+                                    matched = True
+                                    break
+                        if (
+                            not matched
+                            and (self.channel_combos or self.action_combos)
+                            and not self._pressed_mods
+                        ):
                             name = ecodes.keys.get(ev.code, f"CODE_{ev.code}")
                             print(f"未映射按键: {name} (code={ev.code})")
             except OSError as exc:
@@ -2864,6 +2904,16 @@ def main() -> None:
     long_press_ms = int(cfg.get("long_press_ms", DEFAULT_LONG_PRESS_MS))
     default_range_km = int(cfg.get("adsb_default_range_km", 100))
     channel_combos = parse_channel_keys(cfg)
+    action_combos = parse_action_keys(cfg)
+    ssh_gpu_cfg = cfg.get("ssh_gpu") or {}
+    gpu_client: GpuClient | None = None
+    if action_combos:
+        gpu_client = GpuClient(
+            host=str(ssh_gpu_cfg.get("host", "5090")),
+            user=str(ssh_gpu_cfg.get("user", "js")),
+            timeout_sec=float(ssh_gpu_cfg.get("timeout_sec", 5)),
+            cache_ttl_sec=float(ssh_gpu_cfg.get("cache_ttl_sec", 3)),
+        )
 
     outline_geometries: list = []
     if not args.no_outline:
@@ -2922,7 +2972,11 @@ def main() -> None:
         KnobController(state).start()
     if not args.no_keys and not args.once:
         LayerKeyController(
-            state, channel_combos, anim_enabled=not args.no_anim,
+            state,
+            channel_combos,
+            action_combos,
+            gpu_client=gpu_client,
+            anim_enabled=not args.no_anim,
         ).start()
 
     lcd = None
