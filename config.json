@@ -32,7 +32,8 @@
     "host": "10.7.162.172",
     "user": "js",
     "timeout_sec": 5,
-    "cache_ttl_sec": 3
+    "cache_ttl_sec": 3,
+    "live_interval_sec": 2
   },
   "caiyun_token": "",
   "long_press_ms": 500,

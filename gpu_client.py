@@ -124,15 +124,16 @@ class GpuClient:
         except Exception as exc:
             raise GpuError("Bad data") from exc
 
-    def fetch(self) -> list[GpuStats]:
+    def fetch(self, *, force: bool = False) -> list[GpuStats]:
         now = time.time()
-        with self._lock:
-            if self._cache is not None and now - self._cache[0] < self._ttl:
-                return list(self._cache[1])
+        if not force:
+            with self._lock:
+                if self._cache is not None and now - self._cache[0] < self._ttl:
+                    return list(self._cache[1])
 
         stats = self._fetch_remote()
         with self._lock:
-            self._cache = (now, stats)
+            self._cache = (time.time(), stats)
         return list(stats)
 
     def fetch_async(

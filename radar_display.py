@@ -2177,6 +2177,14 @@ class AppState:
     def notify_lcd(self, line1: str, line2: str = "") -> None:
         self._lcd_notify(line1, line2)
 
+    def notify_lcd_transient(self, line1: str, line2: str = "") -> None:
+        if self.notifier is not None:
+            self.notifier.notify_transient(line1, line2)
+
+    def notify_lcd_live(self, line1: str, line2: str = "") -> None:
+        if self.notifier is not None:
+            self.notifier.notify_live(line1, line2)
+
     def is_nowcast_layer(self) -> bool:
         with self._lock:
             return self.layers[self.layer_index].layer_id == "nowcast"
@@ -2674,6 +2682,7 @@ class LayerKeyController(threading.Thread):
         channel_combos: list[tuple[str, frozenset[str], int]] | None = None,
         action_combos: list[tuple[str, frozenset[str], int]] | None = None,
         gpu_client: GpuClient | None = None,
+        gpu_live_interval_sec: float = 2.0,
         anim_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True)
@@ -2681,29 +2690,120 @@ class LayerKeyController(threading.Thread):
         self.channel_combos = channel_combos or []
         self.action_combos = action_combos or []
         self.gpu_client = gpu_client
+        self._gpu_live_interval_sec = max(0.5, float(gpu_live_interval_sec))
         self.anim_enabled = anim_enabled
+        self._gpu_live = False
+        self._gpu_live_stop = threading.Event()
+        self._gpu_live_wake = threading.Event()
+        self._gpu_live_thread: threading.Thread | None = None
         self._press_t: float | None = None
         self._long_triggered = False
         self._held = False
         self._timer: threading.Timer | None = None
         self._pressed_mods: set[str] = set()
 
+    def _gpu_lcd_ok(self, stats) -> None:
+        line1, line2 = format_gpu_lcd_lines(stats)
+        self.state.notify_lcd_live(line1, line2)
+
+    def _gpu_lcd_err(self, exc: GpuError) -> None:
+        detail = str(exc) or "SSH failed"
+        self.state.notify_lcd_live("GPU Error", detail[:16])
+
+    def _gpu_fetch_once(self) -> None:
+        if self.gpu_client is None:
+            return
+        try:
+            stats = self.gpu_client.fetch(force=True)
+        except GpuError as exc:
+            self._gpu_lcd_err(exc)
+        else:
+            self._gpu_lcd_ok(stats)
+
+    def _gpu_live_loop(self) -> None:
+        while not self._gpu_live_stop.is_set():
+            self._gpu_fetch_once()
+            if self._gpu_live_stop.is_set():
+                break
+            self._gpu_live_wake.clear()
+            deadline = time.time() + self._gpu_live_interval_sec
+            while time.time() < deadline:
+                if self._gpu_live_stop.is_set():
+                    return
+                if self._gpu_live_wake.wait(timeout=0.2):
+                    break
+
+    def _start_gpu_live(self) -> None:
+        notifier = self.state.notifier
+        if notifier is None or self.gpu_client is None or self._gpu_live:
+            return
+        if not notifier.enter_live_mode():
+            return
+        self._gpu_live = True
+        self._gpu_live_stop.clear()
+        self._gpu_live_wake.clear()
+        self._gpu_live_thread = threading.Thread(
+            target=self._gpu_live_loop, daemon=True,
+        )
+        self._gpu_live_thread.start()
+        print("GPU: 连续查询模式")
+
+    def _stop_gpu_live(self) -> None:
+        if not self._gpu_live:
+            return
+        self._gpu_live_stop.set()
+        self._gpu_live_wake.set()
+        if self._gpu_live_thread is not None:
+            self._gpu_live_thread.join(timeout=self._gpu_live_interval_sec + 15)
+        self._gpu_live_thread = None
+        self._gpu_live = False
+        if self.state.notifier is not None:
+            self.state.notifier.exit_live_mode()
+        print("GPU: 连续查询已停止")
+
     def _on_action(self, action: str) -> None:
         if action != "gpu_status" or self.gpu_client is None:
             return
-        self.state.notify_lcd("GPU Query", "Please wait")
+        if self._gpu_live:
+            self._gpu_live_wake.set()
+            return
+        self.state.notify_lcd_transient("GPU Query", "Please wait")
 
         def on_ok(stats) -> None:
+            if self._gpu_live:
+                self._gpu_lcd_ok(stats)
+                return
             line1, line2 = format_gpu_lcd_lines(stats)
-            self.state.notify_lcd(line1, line2)
+            self.state.notify_lcd_transient(line1, line2)
 
         def on_err(exc: GpuError) -> None:
+            if self._gpu_live:
+                self._gpu_lcd_err(exc)
+                return
             detail = str(exc) or "SSH failed"
-            self.state.notify_lcd("GPU Error", detail[:16])
+            self.state.notify_lcd_transient("GPU Error", detail[:16])
 
         self.gpu_client.fetch_async(on_ok, on_err)
 
+    def _space_in_gpu_context(self) -> bool:
+        if self._gpu_live:
+            return True
+        notifier = self.state.notifier
+        return notifier is not None and notifier.is_transient_lit()
+
+    def _on_space_short(self) -> None:
+        if self._gpu_live:
+            self._stop_gpu_live()
+            return
+        notifier = self.state.notifier
+        if notifier is not None and notifier.is_transient_lit():
+            self._start_gpu_live()
+            return
+        self.state.next_layer()
+
     def _on_long_press(self) -> None:
+        if self._space_in_gpu_context():
+            return
         if self._held and not self._long_triggered and self.anim_enabled:
             self._long_triggered = True
             self.state.start_anim()
@@ -2747,7 +2847,7 @@ class LayerKeyController(threading.Thread):
                             self._long_triggered = False
                             self._held = True
                             self._cancel_timer()
-                            if self.anim_enabled:
+                            if self.anim_enabled and not self._space_in_gpu_context():
                                 self._timer = threading.Timer(
                                     self.state.long_press_ms / 1000.0,
                                     self._on_long_press,
@@ -2758,8 +2858,8 @@ class LayerKeyController(threading.Thread):
                             self._held = False
                             self._cancel_timer()
                             held_ms = (time.time() - self._press_t) * 1000
-                            if held_ms < self.state.long_press_ms:
-                                self.state.next_layer()
+                            if held_ms < self.state.long_press_ms and not self._long_triggered:
+                                self._on_space_short()
                             elif self._long_triggered:
                                 self.state.stop_anim()
                             self._press_t = None
@@ -2914,6 +3014,7 @@ def main() -> None:
             timeout_sec=float(ssh_gpu_cfg.get("timeout_sec", 5)),
             cache_ttl_sec=float(ssh_gpu_cfg.get("cache_ttl_sec", 3)),
         )
+    gpu_live_interval_sec = float(ssh_gpu_cfg.get("live_interval_sec", 2))
 
     outline_geometries: list = []
     if not args.no_outline:
@@ -2976,6 +3077,7 @@ def main() -> None:
             channel_combos,
             action_combos,
             gpu_client=gpu_client,
+            gpu_live_interval_sec=gpu_live_interval_sec,
             anim_enabled=not args.no_anim,
         ).start()
 
