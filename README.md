@@ -1,6 +1,9 @@
-# GC9A01 多图层气象雷达显示
+# 桌面气象雷达
 
 在树莓派上将 **GC9A01 圆形 IPS 屏（240×240）** 与可选 **1602A I2C 字符屏** 组合，显示以当前位置为中心的多图层气象图、飞机雷达、短临预报，并支持远程 GPU 状态查询。
+<img width="4096" height="3072" alt="5f2d9b2b9efe151d5fd62cbc57716e23" src="https://github.com/user-attachments/assets/9a167de9-d3ce-43b5-8259-5f699aef28ea" />
+
+<img width="1835" height="1370" alt="image" src="https://github.com/user-attachments/assets/cca9febc-5ed4-47bf-96b6-3602aa7d1247" />
 
 ## 功能概览
 
@@ -54,6 +57,11 @@
 ---
 
 ## 硬件接线
+
+### 3D打印外壳
+
+<img width="1126" height="1249" alt="image" src="https://github.com/user-attachments/assets/a82fe59d-608f-4d1e-85df-5e452c7ddeb6" />
+
 
 ### GC9A01 圆屏（SPI，BCM 编号）
 
