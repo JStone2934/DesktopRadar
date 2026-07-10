@@ -234,12 +234,17 @@ def save_config_updates(updates: dict) -> None:
     tmp.replace(CONFIG_PATH)
 
 
-def save_manual_location(lat: float, lon: float) -> None:
-    save_config_updates({
+def save_global_location(lat: float, lon: float) -> None:
+    """保存全局坐标，并同步所有独立中心图层。"""
+    updates: dict = {
         "manual_lat": round(lat, 6),
         "manual_lon": round(lon, 6),
         "manual_location": True,
-    })
+    }
+    for _layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
+        updates[lat_key] = round(lat, 6)
+        updates[lon_key] = round(lon, 6)
+    save_config_updates(updates)
 
 
 def save_layer_center(layer_id: str, lat: float, lon: float) -> None:
@@ -255,6 +260,39 @@ def save_layer_center(layer_id: str, lat: float, lon: float) -> None:
 
 def save_fy4b_disk_location(lat: float, lon: float) -> None:
     save_layer_center(FY4B_DISK_LAYER_ID, lat, lon)
+
+
+def resolve_layer_centers(
+    cfg: dict,
+    manual_lat: float | None,
+    manual_lon: float | None,
+) -> dict[str, tuple[float, float] | None]:
+    """加载独立中心；若与全局坐标偏差过大则视为过期并同步。"""
+    layer_centers: dict[str, tuple[float, float] | None] = {}
+    stale_updates: dict[str, float] = {}
+    for layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
+        try:
+            lat = float(cfg[lat_key])
+            lon = float(cfg[lon_key])
+        except (KeyError, TypeError, ValueError):
+            if manual_lat is not None and manual_lon is not None:
+                layer_centers[layer_id] = (manual_lat, manual_lon)
+            else:
+                layer_centers[layer_id] = None
+            continue
+        if manual_lat is not None and manual_lon is not None:
+            if abs(lon - manual_lon) > 1.0 or abs(lat - manual_lat) > 1.0:
+                lat, lon = manual_lat, manual_lon
+                stale_updates[lat_key] = round(lat, 6)
+                stale_updates[lon_key] = round(lon, 6)
+        layer_centers[layer_id] = (lat, lon)
+    if stale_updates:
+        save_config_updates(stale_updates)
+        print(
+            "独立图层中心与全局坐标偏差过大，已自动同步为 "
+            f"({manual_lat:.6f}, {manual_lon:.6f})",
+        )
+    return layer_centers
 
 
 LON_ARCSEC_MAX = 180 * 3600
@@ -3141,18 +3179,12 @@ class AppState:
             layer_id = self.layers[self.layer_index].layer_id
             if layer_id in INDEPENDENT_CENTERS:
                 self._settings_target = layer_id
-                center = self._layer_centers.get(layer_id)
-                if center is not None:
-                    lat, lon = center
-                else:
-                    lat = self._current_lat
-                    lon = self._current_lon
                 head = INDEPENDENT_CENTERS[layer_id][2]
             else:
                 self._settings_target = "global"
-                lat = self._current_lat
-                lon = self._current_lon
                 head = "Set Coord"
+            lat = self._current_lat
+            lon = self._current_lon
             self.anim_active = False
             self.settings_mode = True
             self.settings_field = 0
@@ -3208,13 +3240,15 @@ class AppState:
                 self.override_lon = lon
                 self._current_lat = lat
                 self._current_lon = lon
+                for layer_id in INDEPENDENT_CENTERS:
+                    self._layer_centers[layer_id] = (lat, lon)
         if target in INDEPENDENT_CENTERS:
             save_layer_center(target, lat, lon)
             _, _, _, saved_lcd = INDEPENDENT_CENTERS[target]
             print(f"{target} 独立中心已保存: ({lat:.6f}, {lon:.6f})")
             self._lcd_notify(saved_lcd, f"{lat:.4f},{lon:.4f}")
         else:
-            save_manual_location(lat, lon)
+            save_global_location(lat, lon)
             print(f"坐标已保存: ({lat:.6f}, {lon:.6f})")
             self._lcd_notify("Coord Saved", f"{lat:.4f},{lon:.4f}")
         self.wake.set()
@@ -3948,12 +3982,7 @@ def main() -> None:
         except (KeyError, TypeError, ValueError):
             manual_lat = manual_lon = None
 
-    layer_centers: dict[str, tuple[float, float] | None] = {}
-    for layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
-        try:
-            layer_centers[layer_id] = (float(cfg[lat_key]), float(cfg[lon_key]))
-        except (KeyError, TypeError, ValueError):
-            layer_centers[layer_id] = None
+    layer_centers = resolve_layer_centers(cfg, manual_lat, manual_lon)
 
     state = AppState(
         layers=layers,
