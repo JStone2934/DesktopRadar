@@ -301,15 +301,24 @@ ssh -o BatchMode=yes js@10.7.162.172 \
 
 长按旋钮进入设置界面：高德地图 + 十字准星，旋转调整度/分/秒，短按切换字段，再长按保存。
 
-**进入设置时**，始终从当前**全局坐标**（`manual_lat` / `manual_lon`）起算，不会跳到 FY-4B 等图层的旧独立中心。
+**每个图层独立保存**中心坐标与缩放（zoom），互不影响：
 
-| 当前图层 | 保存目标 | 写入字段 |
-|----------|----------|----------|
-| 雷达、短临等 | **全局坐标** | `manual_lat` / `manual_lon` / `manual_location`，并**同步** `fy4b_cn_*` / `fy4b_disk_*` |
-| `satellite_fy4b` | FY-4B 中国区独立中心 | 仅 `fy4b_cn_lat` / `fy4b_cn_lon` |
-| `satellite_fy4b_disk` | FY-4B 圆盘独立中心 | 仅 `fy4b_disk_lat` / `fy4b_disk_lon` |
+- 进入设置时，从**当前图层**已保存的坐标起算
+- 保存时只写入当前图层的 `layer_profiles` 条目，不会同步到其他图层
+- 旋钮缩放/重置只影响当前图层；切换图层后自动恢复该图层自己的 zoom
+- 飞机通道的量程（range）同样按图层独立记忆
 
-> 在雷达图层保存广州坐标后，切到风云4B盘也会显示广州附近，不会再误跳到广西等旧坐标。启动时若独立中心与全局偏差超过 1°，会自动同步。
+`config.json` 中的 `layer_profiles` 示例：
+
+```json
+"layer_profiles": {
+  "radar": {"lat": 22.866111, "lon": 113.513611, "zoom": 7},
+  "satellite_fy4b_disk": {"lat": 22.90, "lon": 109.7075, "zoom": 3},
+  "adsb_radar": {"lat": 22.866111, "lon": 113.513611, "zoom": 7, "range_km": 100}
+}
+```
+
+首次启动或缺少条目时，会从旧字段（`manual_lat/lon`、`fy4b_disk_*`、`fy4b_cn_*`）或 `default_lat/lon` 迁移并写回。
 
 ---
 
@@ -337,8 +346,8 @@ ssh -o BatchMode=yes js@10.7.162.172 \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--lat` / `--lon` | 自动 | 手动指定坐标 |
-| `--zoom` | 7 | 缩放级别 |
+| `--lat` / `--lon` | 自动 | 调试时覆盖当前帧渲染坐标（不写入配置） |
+| `--zoom` | 7 | 新图层的默认 zoom；`reset_zoom` 也回到此值 |
 | `--interval` | 300 | 气象图层刷新间隔（秒） |
 | `--once` | - | 只刷新一帧后退出 |
 | `--layer` | 配置首项 | 起始图层 ID |
@@ -363,10 +372,11 @@ ssh -o BatchMode=yes js@10.7.162.172 \
   "manual_location": true,
   "manual_lat": 22.866111,
   "manual_lon": 113.513611,
-  "fy4b_disk_lat": 22.866111,
-  "fy4b_disk_lon": 113.513611,
-  "fy4b_cn_lat": 22.866111,
-  "fy4b_cn_lon": 113.513611,
+  "layer_profiles": {
+    "radar": {"lat": 22.866111, "lon": 113.513611, "zoom": 7},
+    "satellite_fy4b_disk": {"lat": 22.90, "lon": 109.7075, "zoom": 3},
+    "adsb_radar": {"lat": 22.866111, "lon": 113.513611, "zoom": 7, "range_km": 100}
+  },
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
   "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
   "channel_keys": {
@@ -407,6 +417,7 @@ ssh -o BatchMode=yes js@10.7.162.172 \
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
+| `layer_profiles` | （自动迁移） | 各图层独立 `{lat, lon, zoom}`；飞机图层另有 `range_km` |
 | `prefetch_global` | `true` | 后台全局预取（全图层 × 全 zoom × 动画帧） |
 | `prefetch_zoom_min` / `prefetch_zoom_max` | 3 / 12 | 预取与动画常驻内存的 zoom 范围 |
 | `prefetch_anim_frames` | `true` | 预取当前图层动画序列 |

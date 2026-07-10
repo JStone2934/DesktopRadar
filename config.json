@@ -5,10 +5,10 @@
   "manual_location": true,
   "manual_lat": 22.866111,
   "manual_lon": 113.513611,
-  "fy4b_disk_lat": 22.904167,
-  "fy4b_disk_lon": 109.7075,
-  "fy4b_cn_lat": 22.618611,
-  "fy4b_cn_lon": 113.59,
+  "fy4b_disk_lat": 22.866111,
+  "fy4b_disk_lon": 113.513611,
+  "fy4b_cn_lat": 22.866111,
+  "fy4b_cn_lon": 113.513611,
   "layers": [
     "radar",
     "satellite_fy4b",
@@ -29,6 +29,8 @@
   "long_press_ms": 500,
   "anim_fps": 5,
   "anim_window_hours": 6,
+  "adsb_ttl_sec": 8,
+  "adsb_default_range_km": 100,
   "prefetch_anim_frames": true,
   "prefetch_neighbor_layers": true,
   "prefetch_fy4b_disk_raw": true,
@@ -38,8 +40,6 @@
   "prefetch_global": true,
   "prefetch_zoom_min": 3,
   "prefetch_zoom_max": 12,
-  "adsb_ttl_sec": 8,
-  "adsb_default_range_km": 100,
   "action_keys": {
     "gpu_status": "0"
   },
@@ -51,5 +51,51 @@
     "live_interval_sec": 2
   },
   "lcd_backlight_seconds": 5,
-  "nmc_cache_ttl_sec": 300
+  "nmc_cache_ttl_sec": 300,
+  "layer_profiles": {
+    "radar": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7
+    },
+    "satellite_fy4b": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7
+    },
+    "satellite_fy4b_disk": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 4
+    },
+    "nowcast": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7
+    },
+    "adsb_radar": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7,
+      "range_km": 100
+    },
+    "adsb_map": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7,
+      "range_km": 100
+    },
+    "adsb_outline": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7,
+      "range_km": 100
+    },
+    "adsb_sweep": {
+      "lat": 22.866111,
+      "lon": 113.513611,
+      "zoom": 7,
+      "range_km": 100
+    }
+  }
 }

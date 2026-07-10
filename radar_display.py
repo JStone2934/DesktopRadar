@@ -117,10 +117,12 @@ ADSB_MAX_LABELS = 6
 
 FY4B_DISK_LAYER_ID = "satellite_fy4b_disk"
 FY4B_CN_LAYER_ID = "satellite_fy4b"
-# layer_id -> (config_lat_key, config_lon_key, lcd_enter_hint, lcd_saved_hint)
-INDEPENDENT_CENTERS: dict[str, tuple[str, str, str, str]] = {
-    FY4B_DISK_LAYER_ID: ("fy4b_disk_lat", "fy4b_disk_lon", "Set FY4B Ctr", "FY4B Saved"),
-    FY4B_CN_LAYER_ID: ("fy4b_cn_lat", "fy4b_cn_lon", "Set FY4B-CN", "FY4B-CN Saved"),
+LAYER_PROFILES_KEY = "layer_profiles"
+# 旧版独立中心字段（迁移用）
+_LEGACY_LAYER_COORD_KEYS: dict[str, tuple[str, str]] = {
+    "radar": ("manual_lat", "manual_lon"),
+    FY4B_DISK_LAYER_ID: ("fy4b_disk_lat", "fy4b_disk_lon"),
+    FY4B_CN_LAYER_ID: ("fy4b_cn_lat", "fy4b_cn_lon"),
 }
 SETTINGS_FIELD_COUNT = 6
 SETTINGS_FIELD_LCD = [
@@ -151,6 +153,25 @@ class WeatherFrame:
     token: str
     timestamp: int
     payload: dict = field(default_factory=dict)
+
+
+@dataclass
+class LayerView:
+    """每个图层独立保存的中心坐标与缩放。"""
+    lat: float
+    lon: float
+    zoom: int = 7
+    range_km: int | None = None
+
+    def to_config(self) -> dict:
+        out: dict = {
+            "lat": round(self.lat, 6),
+            "lon": round(self.lon, 6),
+            "zoom": int(self.zoom),
+        }
+        if self.range_km is not None:
+            out["range_km"] = int(self.range_km)
+        return out
 
 
 class LayerProvider(ABC):
@@ -234,65 +255,84 @@ def save_config_updates(updates: dict) -> None:
     tmp.replace(CONFIG_PATH)
 
 
-def save_global_location(lat: float, lon: float) -> None:
-    """保存全局坐标，并同步所有独立中心图层。"""
-    updates: dict = {
-        "manual_lat": round(lat, 6),
-        "manual_lon": round(lon, 6),
-        "manual_location": True,
-    }
-    for _layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
-        updates[lat_key] = round(lat, 6)
-        updates[lon_key] = round(lon, 6)
-    save_config_updates(updates)
+def save_layer_profile(layer_id: str, view: LayerView) -> None:
+    cfg = load_config()
+    profiles = dict(cfg.get(LAYER_PROFILES_KEY) or {})
+    profiles[layer_id] = view.to_config()
+    save_config_updates({LAYER_PROFILES_KEY: profiles})
 
 
-def save_layer_center(layer_id: str, lat: float, lon: float) -> None:
-    spec = INDEPENDENT_CENTERS.get(layer_id)
-    if spec is None:
-        raise ValueError(f"图层 {layer_id} 不支持独立中心")
-    lat_key, lon_key, _, _ = spec
-    save_config_updates({
-        lat_key: round(lat, 6),
-        lon_key: round(lon, 6),
-    })
-
-
-def save_fy4b_disk_location(lat: float, lon: float) -> None:
-    save_layer_center(FY4B_DISK_LAYER_ID, lat, lon)
-
-
-def resolve_layer_centers(
-    cfg: dict,
-    manual_lat: float | None,
-    manual_lon: float | None,
-) -> dict[str, tuple[float, float] | None]:
-    """加载独立中心；若与全局坐标偏差过大则视为过期并同步。"""
-    layer_centers: dict[str, tuple[float, float] | None] = {}
-    stale_updates: dict[str, float] = {}
-    for layer_id, (lat_key, lon_key, _, _) in INDEPENDENT_CENTERS.items():
+def _fallback_coords(cfg: dict) -> tuple[float, float]:
+    if cfg.get("manual_location"):
         try:
-            lat = float(cfg[lat_key])
-            lon = float(cfg[lon_key])
+            return float(cfg["manual_lat"]), float(cfg["manual_lon"])
         except (KeyError, TypeError, ValueError):
-            if manual_lat is not None and manual_lon is not None:
-                layer_centers[layer_id] = (manual_lat, manual_lon)
+            pass
+    return float(cfg.get("default_lat", 39.9042)), float(cfg.get("default_lon", 116.4074))
+
+
+def _legacy_layer_coords(cfg: dict, layer_id: str) -> tuple[float, float] | None:
+    keys = _LEGACY_LAYER_COORD_KEYS.get(layer_id)
+    if keys is None:
+        return None
+    try:
+        return float(cfg[keys[0]]), float(cfg[keys[1]])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_layer_profiles(
+    cfg: dict,
+    layers: list[LayerProvider],
+    default_zoom: int,
+    default_range_km: int,
+) -> dict[str, LayerView]:
+    """加载各图层独立视图；缺失项从旧字段或全局默认补齐并写回 config。"""
+    stored_raw = cfg.get(LAYER_PROFILES_KEY) or {}
+    stored = dict(stored_raw) if isinstance(stored_raw, dict) else {}
+    fallback_lat, fallback_lon = _fallback_coords(cfg)
+    default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(default_zoom)))
+    try:
+        default_range_km = ADSB_RANGES_KM[ADSB_RANGES_KM.index(int(default_range_km))]
+    except ValueError:
+        default_range_km = ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX]
+    profiles: dict[str, LayerView] = {}
+    dirty = False
+    for layer in layers:
+        lid = layer.layer_id
+        entry = stored.get(lid)
+        if isinstance(entry, dict) and "lat" in entry and "lon" in entry:
+            lat = float(entry["lat"])
+            lon = float(entry["lon"])
+            zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(entry.get("zoom", default_zoom))))
+            range_km = entry.get("range_km")
+            if range_km is not None:
+                try:
+                    range_km = ADSB_RANGES_KM[ADSB_RANGES_KM.index(int(range_km))]
+                except ValueError:
+                    range_km = default_range_km
+        else:
+            legacy = _legacy_layer_coords(cfg, lid)
+            if legacy is not None:
+                lat, lon = legacy
             else:
-                layer_centers[layer_id] = None
-            continue
-        if manual_lat is not None and manual_lon is not None:
-            if abs(lon - manual_lon) > 1.0 or abs(lat - manual_lat) > 1.0:
-                lat, lon = manual_lat, manual_lon
-                stale_updates[lat_key] = round(lat, 6)
-                stale_updates[lon_key] = round(lon, 6)
-        layer_centers[layer_id] = (lat, lon)
-    if stale_updates:
-        save_config_updates(stale_updates)
-        print(
-            "独立图层中心与全局坐标偏差过大，已自动同步为 "
-            f"({manual_lat:.6f}, {manual_lon:.6f})",
-        )
-    return layer_centers
+                lat, lon = fallback_lat, fallback_lon
+            zoom = default_zoom
+            range_km = default_range_km if getattr(layer, "channel", "weather") == "aircraft" else None
+            dirty = True
+        if getattr(layer, "channel", "weather") == "aircraft":
+            if range_km is None:
+                range_km = default_range_km
+            view = LayerView(lat, lon, zoom=zoom, range_km=range_km)
+        else:
+            view = LayerView(lat, lon, zoom=zoom)
+        profiles[lid] = view
+        if dirty or lid not in stored:
+            stored[lid] = view.to_config()
+            dirty = True
+    if dirty:
+        save_config_updates({LAYER_PROFILES_KEY: stored})
+    return profiles
 
 
 LON_ARCSEC_MAX = 180 * 3600
@@ -379,6 +419,15 @@ def fetch_location(lat: float | None, lon: float | None) -> tuple[float, float, 
     cfg = load_config()
     if lat is not None and lon is not None:
         return lat, lon, cfg.get("default_city", "Custom")
+    if cfg.get("manual_location"):
+        try:
+            return (
+                float(cfg["manual_lat"]),
+                float(cfg["manual_lon"]),
+                cfg.get("default_city", "Custom"),
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
     try:
         resp = SESSION.get(IP_API_URL, timeout=10)
         resp.raise_for_status()
@@ -2892,18 +2941,15 @@ class AppState:
     def __init__(
         self,
         layers: list[LayerProvider],
-        zoom: int,
         default_zoom: int,
+        layer_profiles: dict[str, LayerView],
         start_layer: str | None = None,
         long_press_ms: int = DEFAULT_LONG_PRESS_MS,
         default_range_km: int = ADSB_RANGES_KM[ADSB_DEFAULT_RANGE_INDEX],
-        manual_lat: float | None = None,
-        manual_lon: float | None = None,
-        layer_centers: dict[str, tuple[float, float] | None] | None = None,
     ) -> None:
         self.layers = layers
-        self.zoom = self._clamp(zoom)
         self.default_zoom = self._clamp(default_zoom)
+        self._default_range_km = default_range_km
         self.long_press_ms = long_press_ms
         self._lock = threading.Lock()
         self.wake = threading.Event()
@@ -2920,16 +2966,13 @@ class AppState:
 
         self.settings_mode = False
         self.settings_field = 0
-        self._settings_target = "global"
+        self._settings_layer_id = layers[idx].layer_id
         self._set_lat_arcsec = 0
         self._set_lon_arcsec = 0
-        self.override_lat = manual_lat
-        self.override_lon = manual_lon
-        self._layer_centers: dict[str, tuple[float, float] | None] = dict(
-            layer_centers or {},
-        )
-        self._current_lat = manual_lat or 0.0
-        self._current_lon = manual_lon or 0.0
+        self._layer_profiles: dict[str, LayerView] = {
+            lid: LayerView(v.lat, v.lon, v.zoom, v.range_km)
+            for lid, v in layer_profiles.items()
+        }
 
         self._channel_indices: dict[str, list[int]] = {}
         for i, layer in enumerate(layers):
@@ -2939,13 +2982,16 @@ class AppState:
         for ch, indices in self._channel_indices.items():
             self._channel_last[ch] = indices[0]
 
-        try:
-            range_idx = ADSB_RANGES_KM.index(default_range_km)
-        except ValueError:
-            range_idx = ADSB_DEFAULT_RANGE_INDEX
-        self._adsb_range_index = range_idx
-        self._adsb_default_range_index = range_idx
         self.cache_worker: CacheWorker | None = None
+
+    def _profile(self, layer_id: str) -> LayerView:
+        return self._layer_profiles[layer_id]
+
+    def _current_layer_id(self) -> str:
+        return self.layers[self.layer_index].layer_id
+
+    def _persist_profile(self, layer_id: str) -> None:
+        save_layer_profile(layer_id, self._layer_profiles[layer_id])
 
     def get_channel_layers(self) -> list[LayerProvider]:
         with self._lock:
@@ -2962,27 +3008,41 @@ class AppState:
 
     def get_adsb_range_km(self) -> int:
         with self._lock:
-            return ADSB_RANGES_KM[self._adsb_range_index]
+            prof = self._profile(self._current_layer_id())
+            return prof.range_km or self._default_range_km
 
     def step_range(self, direction: int) -> None:
         """direction +1 = 缩小量程（放大）, -1 = 放大量程（缩小）。"""
         with self._lock:
-            n = len(ADSB_RANGES_KM)
-            new_idx = self._adsb_range_index - direction
-            if new_idx < 0 or new_idx >= n:
+            layer_id = self._current_layer_id()
+            prof = self._profile(layer_id)
+            try:
+                idx = ADSB_RANGES_KM.index(prof.range_km or self._default_range_km)
+            except ValueError:
+                idx = ADSB_DEFAULT_RANGE_INDEX
+            new_idx = idx - direction
+            if new_idx < 0 or new_idx >= len(ADSB_RANGES_KM):
                 return
-            self._adsb_range_index = new_idx
             range_km = ADSB_RANGES_KM[new_idx]
+            self._layer_profiles[layer_id] = LayerView(
+                prof.lat, prof.lon, prof.zoom, range_km=range_km,
+            )
+        self._persist_profile(layer_id)
         print(f"飞机雷达: 量程 -> {range_km} km")
         self._lcd_notify("ADSB Range", f"{range_km} km")
         self.wake.set()
 
     def reset_range(self) -> None:
         with self._lock:
-            if self._adsb_range_index == self._adsb_default_range_index:
+            layer_id = self._current_layer_id()
+            prof = self._profile(layer_id)
+            if prof.range_km == self._default_range_km:
                 return
-            self._adsb_range_index = self._adsb_default_range_index
-            range_km = ADSB_RANGES_KM[self._adsb_range_index]
+            range_km = self._default_range_km
+            self._layer_profiles[layer_id] = LayerView(
+                prof.lat, prof.lon, prof.zoom, range_km=range_km,
+            )
+        self._persist_profile(layer_id)
         print(f"飞机雷达: 量程重置为 {range_km} km")
         self._lcd_notify("Range Reset", f"{range_km} km")
         self.wake.set()
@@ -3059,7 +3119,7 @@ class AppState:
 
     def get_zoom(self) -> int:
         with self._lock:
-            return self.zoom
+            return self._profile(self._current_layer_id()).zoom
 
     def get_layer(self) -> LayerProvider:
         with self._lock:
@@ -3075,18 +3135,29 @@ class AppState:
 
     def bump_zoom(self, delta: int) -> None:
         with self._lock:
-            new = self._clamp(self.zoom + delta)
-            if new == self.zoom:
+            layer_id = self._current_layer_id()
+            prof = self._profile(layer_id)
+            new = self._clamp(prof.zoom + delta)
+            if new == prof.zoom:
                 return
-            self.zoom = new
+            self._layer_profiles[layer_id] = LayerView(
+                prof.lat, prof.lon, zoom=new, range_km=prof.range_km,
+            )
+        self._persist_profile(layer_id)
         print(f"旋钮: zoom -> {new}")
         self._lcd_notify("Zoom", f"z{new}")
         self.wake.set()
 
     def reset_zoom(self) -> None:
         with self._lock:
-            if self.zoom != self.default_zoom:
-                self.zoom = self.default_zoom
+            layer_id = self._current_layer_id()
+            prof = self._profile(layer_id)
+            if prof.zoom == self.default_zoom:
+                return
+            self._layer_profiles[layer_id] = LayerView(
+                prof.lat, prof.lon, zoom=self.default_zoom, range_km=prof.range_km,
+            )
+        self._persist_profile(layer_id)
         print(f"旋钮按下: zoom 重置为 {self.default_zoom}")
         self._lcd_notify("Zoom Reset", f"z{self.default_zoom}")
         self.wake.set()
@@ -3127,72 +3198,29 @@ class AppState:
         self._lcd_notify("Animation", "Stopped")
         self.wake.set()
 
-    def update_current_location(self, lat: float, lon: float) -> None:
-        with self._lock:
-            self._current_lat = lat
-            self._current_lon = lon
-
-    def get_current_location(self) -> tuple[float, float]:
-        with self._lock:
-            return self._current_lat, self._current_lon
-
-    def get_location_override(self) -> tuple[float, float] | None:
-        with self._lock:
-            if self.override_lat is not None and self.override_lon is not None:
-                return self.override_lat, self.override_lon
-            return None
-
-    def is_settings_mode(self) -> bool:
-        with self._lock:
-            return self.settings_mode
-
-    def get_settings_dms(self) -> tuple[dict[str, list[int]], int]:
-        with self._lock:
-            dms = {
-                "lat": arcsec_to_dms(self._set_lat_arcsec, True),
-                "lon": arcsec_to_dms(self._set_lon_arcsec, False),
-            }
-            return dms, self.settings_field
-
-    def get_setting_center(self) -> tuple[float, float]:
-        with self._lock:
-            return self._set_lat_arcsec / 3600.0, self._set_lon_arcsec / 3600.0
-
-    def _lcd_settings_field(self, field: int) -> None:
-        label = SETTINGS_FIELD_LCD[field]
-        lat = self._set_lat_arcsec / 3600.0
-        lon = self._set_lon_arcsec / 3600.0
-        self._lcd_notify("Set Coord", f"{label} {lat:.4f},{lon:.4f}")
-
     def get_render_center(
         self, layer_id: str, global_lat: float, global_lon: float,
     ) -> tuple[float, float]:
-        """独立中心图层使用各自坐标，其余图层用全局坐标。"""
         with self._lock:
-            center = self._layer_centers.get(layer_id)
-            if center is not None:
-                return center
+            prof = self._layer_profiles.get(layer_id)
+            if prof is not None:
+                return prof.lat, prof.lon
         return global_lat, global_lon
 
     def enter_settings(self) -> None:
         with self._lock:
-            layer_id = self.layers[self.layer_index].layer_id
-            if layer_id in INDEPENDENT_CENTERS:
-                self._settings_target = layer_id
-                head = INDEPENDENT_CENTERS[layer_id][2]
-            else:
-                self._settings_target = "global"
-                head = "Set Coord"
-            lat = self._current_lat
-            lon = self._current_lon
+            layer = self.layers[self.layer_index]
+            prof = self._profile(layer.layer_id)
+            lat, lon = prof.lat, prof.lon
+            self._settings_layer_id = layer.layer_id
             self.anim_active = False
             self.settings_mode = True
             self.settings_field = 0
             self._set_lat_arcsec = clamp_lat_arcsec(round(lat * 3600))
             self._set_lon_arcsec = wrap_lon_arcsec(round(lon * 3600))
-            target = self._settings_target
-        print(f"进入坐标设置[{target}]: ({lat:.6f}, {lon:.6f})")
-        self._lcd_notify(head, "Long press save")
+            layer_name = layer_lcd_label(layer)
+        print(f"进入坐标设置 [{layer_name}]: ({lat:.6f}, {lon:.6f})")
+        self._lcd_notify("Set Coord", f"{layer_name} save")
         self.wake.set()
 
     def settings_next_field(self) -> None:
@@ -3231,27 +3259,42 @@ class AppState:
                 return
             lat = self._set_lat_arcsec / 3600.0
             lon = self._set_lon_arcsec / 3600.0
-            target = self._settings_target
+            layer_id = self._settings_layer_id
+            prof = self._profile(layer_id)
             self.settings_mode = False
-            if target in INDEPENDENT_CENTERS:
-                self._layer_centers[target] = (lat, lon)
-            else:
-                self.override_lat = lat
-                self.override_lon = lon
-                self._current_lat = lat
-                self._current_lon = lon
-                for layer_id in INDEPENDENT_CENTERS:
-                    self._layer_centers[layer_id] = (lat, lon)
-        if target in INDEPENDENT_CENTERS:
-            save_layer_center(target, lat, lon)
-            _, _, _, saved_lcd = INDEPENDENT_CENTERS[target]
-            print(f"{target} 独立中心已保存: ({lat:.6f}, {lon:.6f})")
-            self._lcd_notify(saved_lcd, f"{lat:.4f},{lon:.4f}")
-        else:
-            save_global_location(lat, lon)
-            print(f"坐标已保存: ({lat:.6f}, {lon:.6f})")
-            self._lcd_notify("Coord Saved", f"{lat:.4f},{lon:.4f}")
+            self._layer_profiles[layer_id] = LayerView(
+                lat, lon, prof.zoom, prof.range_km,
+            )
+        self._persist_profile(layer_id)
+        layer_name = next(
+            (l.display_name for l in self.layers if l.layer_id == layer_id),
+            layer_id,
+        )
+        print(f"{layer_name} 坐标已保存: ({lat:.6f}, {lon:.6f})")
+        self._lcd_notify("Coord Saved", f"{lat:.4f},{lon:.4f}")
         self.wake.set()
+
+    def is_settings_mode(self) -> bool:
+        with self._lock:
+            return self.settings_mode
+
+    def get_settings_dms(self) -> tuple[dict[str, list[int]], int]:
+        with self._lock:
+            dms = {
+                "lat": arcsec_to_dms(self._set_lat_arcsec, True),
+                "lon": arcsec_to_dms(self._set_lon_arcsec, False),
+            }
+            return dms, self.settings_field
+
+    def get_setting_center(self) -> tuple[float, float]:
+        with self._lock:
+            return self._set_lat_arcsec / 3600.0, self._set_lon_arcsec / 3600.0
+
+    def _lcd_settings_field(self, field: int) -> None:
+        label = SETTINGS_FIELD_LCD[field]
+        lat = self._set_lat_arcsec / 3600.0
+        lon = self._set_lon_arcsec / 3600.0
+        self._lcd_notify("Set Coord", f"{label} {lat:.4f},{lon:.4f}")
 
 
 def _is_virtual_volume_device(dev) -> bool:
@@ -3972,28 +4015,24 @@ def main() -> None:
     layer_names = ", ".join(l.display_name for l in layers)
     print(f"图层: {layer_names}")
 
-    manual_lat: float | None = None
-    manual_lon: float | None = None
-    if args.lat is None and args.lon is None and cfg.get("manual_location"):
-        try:
-            manual_lat = float(cfg["manual_lat"])
-            manual_lon = float(cfg["manual_lon"])
-            print(f"使用持久化坐标: ({manual_lat:.6f}, {manual_lon:.6f})")
-        except (KeyError, TypeError, ValueError):
-            manual_lat = manual_lon = None
-
-    layer_centers = resolve_layer_centers(cfg, manual_lat, manual_lon)
+    layer_profiles = resolve_layer_profiles(
+        cfg, layers, args.zoom, default_range_km,
+    )
+    for layer in layers:
+        prof = layer_profiles[layer.layer_id]
+        extra = f", range={prof.range_km}km" if prof.range_km else ""
+        print(
+            f"  {layer.display_name}: ({prof.lat:.4f}, {prof.lon:.4f}), "
+            f"z{prof.zoom}{extra}",
+        )
 
     state = AppState(
         layers=layers,
-        zoom=args.zoom,
         default_zoom=args.zoom,
+        layer_profiles=layer_profiles,
         start_layer=args.layer,
         long_press_ms=long_press_ms,
         default_range_km=default_range_km,
-        manual_lat=manual_lat,
-        manual_lon=manual_lon,
-        layer_centers=layer_centers,
     )
     for layer in layers:
         if isinstance(layer, (NmcNowcastLayer, AdsbRadarLayer)):
@@ -4049,8 +4088,6 @@ def main() -> None:
         if lcd:
             lcd.display(img)
 
-    last_lat: float | None = None
-    last_lon: float | None = None
     last_tokens: dict[str, str] = {}
     last_render_centers: dict[str, tuple[float, float]] = {}
     last_layer_id: str | None = None
@@ -4071,24 +4108,16 @@ def main() -> None:
             forecast_offset = state.get_forecast_offset() if state.is_nowcast_layer() else 0
             adsb_range = state.get_adsb_range_km() if state.is_aircraft_channel() else 0
             try:
-                override = state.get_location_override()
                 if args.lat is not None and args.lon is not None:
-                    lat, lon, city = fetch_location_cached(args.lat, args.lon)
-                elif override is not None:
-                    lat, lon = override
-                    city = cfg.get("default_city", "Custom")
+                    r_lat, r_lon = args.lat, args.lon
+                    _, _, city = fetch_location_cached(args.lat, args.lon)
                 else:
-                    lat, lon, city = fetch_location_cached(args.lat, args.lon)
-                state.update_current_location(lat, lon)
-                if last_lat is not None and (
-                    abs(lat - last_lat) > LOCATION_THRESHOLD
-                    or abs(lon - last_lon) > LOCATION_THRESHOLD
-                ):
-                    print("位置变化，清空内存热缓存")
-                    frame_cache.clear_memory()
-                    if cache_worker is not None:
-                        cache_worker.invalidate_all_tasks()
-                last_lat, last_lon = lat, lon
+                    fallback_lat, fallback_lon, city = fetch_location_cached(None, None)
+                    r_lat, r_lon = state.get_render_center(
+                        layer.layer_id, fallback_lat, fallback_lon,
+                    )
+                    if abs(r_lat - fallback_lat) > 0.01 or abs(r_lon - fallback_lon) > 0.01:
+                        _, _, city = fetch_location_cached(r_lat, r_lon)
 
                 if state.is_settings_mode():
                     dms, active_field = state.get_settings_dms()
@@ -4101,7 +4130,6 @@ def main() -> None:
                     state.wake.clear()
                     continue
 
-                r_lat, r_lon = state.get_render_center(layer.layer_id, lat, lon)
                 prev_center = last_render_centers.get(layer.layer_id)
                 if prev_center is not None and (
                     abs(r_lat - prev_center[0]) > LOCATION_THRESHOLD
