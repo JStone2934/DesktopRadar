@@ -2226,12 +2226,14 @@ class CacheWorker(threading.Thread):
         self._pause_low_priority = False
         self._all_tasks: set[tuple] = set()
         self._done_tasks: set[tuple] = set()
+        self._failed_tasks: set[tuple] = set()
         self._pending: list[tuple] = []
         self._focus = FocusContext("", 7, 0.0, 0.0, "", {})
 
     def get_progress(self) -> CacheProgressSnapshot:
         with self._lock:
-            return CacheProgressSnapshot(len(self._done_tasks), len(self._all_tasks))
+            completed = len(self._done_tasks) + len(self._failed_tasks)
+            return CacheProgressSnapshot(completed, len(self._all_tasks))
 
     def is_prefetch_active(self) -> bool:
         """全局缓存未完成（圆环应显示）。与后台是否暂停低优先级无关。"""
@@ -2261,6 +2263,14 @@ class CacheWorker(threading.Thread):
             if task not in self._all_tasks or task in self._done_tasks:
                 return
             self._done_tasks.add(task)
+            self._failed_tasks.discard(task)
+            self._rebuild_pending_locked()
+
+    def _mark_task_failed(self, task: tuple) -> None:
+        with self._lock:
+            if task not in self._all_tasks or task in self._done_tasks:
+                return
+            self._failed_tasks.add(task)
             self._rebuild_pending_locked()
 
     def _task_priority_score(self, task: tuple) -> tuple:
@@ -2285,7 +2295,7 @@ class CacheWorker(threading.Thread):
         return (4, layer_id, zoom, token)
 
     def _rebuild_pending_locked(self) -> None:
-        pending = self._all_tasks - self._done_tasks
+        pending = self._all_tasks - self._done_tasks - self._failed_tasks
         self._pending = sorted(pending, key=self._task_priority_score)
 
     def _collect_latest_tokens(self) -> dict[str, str]:
@@ -2326,6 +2336,7 @@ class CacheWorker(threading.Thread):
         latest_tokens = self._collect_latest_tokens()
         with self._lock:
             prev_done = self._done_tasks
+            prev_failed = self._failed_tasks
             self._focus = FocusContext(
                 focus_layer_id, focus_zoom, lat, lon, city, latest_tokens,
             )
@@ -2334,6 +2345,7 @@ class CacheWorker(threading.Thread):
                 t for t in new_tasks
                 if t in prev_done or self._is_task_satisfied(t)
             }
+            self._failed_tasks = {t for t in prev_failed if t in new_tasks} - self._done_tasks
             self._rebuild_pending_locked()
 
     def invalidate_layer_tasks(self, layer_id: str) -> None:
@@ -2345,6 +2357,7 @@ class CacheWorker(threading.Thread):
         with self._lock:
             self._all_tasks = {t for t in self._all_tasks if not affects(t)}
             self._done_tasks = {t for t in self._done_tasks if not affects(t)}
+            self._failed_tasks = {t for t in self._failed_tasks if not affects(t)}
             self._rebuild_pending_locked()
             self._render_generation += 1
         self._wake.set()
@@ -2353,6 +2366,7 @@ class CacheWorker(threading.Thread):
         with self._lock:
             self._all_tasks.clear()
             self._done_tasks.clear()
+            self._failed_tasks.clear()
             self._pending.clear()
             self._render_generation += 1
         self._wake.set()
@@ -2382,6 +2396,7 @@ class CacheWorker(threading.Thread):
             layer_id, token = task[1], task[2]
             disk = self._layers_by_id.get(layer_id)
             if not isinstance(disk, FY4BDiskLayer):
+                self._mark_task_failed(task)
                 return
             frame = self._find_frame(disk, token)
             if frame is None:
@@ -2390,16 +2405,21 @@ class CacheWorker(threading.Thread):
             if disk.prefetch_raw(frame):
                 print(f"  预下载 FY4B 圆盘 {frame.token[-12:]}")
                 self._mark_task_done(task)
+            else:
+                self._mark_task_failed(task)
             return
         _kind, layer_id, token, render_zoom = task
         layer = self._layers_by_id.get(layer_id)
         if layer is None or not layer.cacheable():
+            self._mark_task_failed(task)
             return
         frame = self._find_frame(layer, token)
         if frame is None:
             self._mark_task_done(task)
             return
         if self._render_cancelled(gen):
+            with self._lock:
+                self._rebuild_pending_locked()
             return
         focus = self._focus
         r_lat, r_lon = self.state.get_render_center(layer_id, focus.lat, focus.lon)
@@ -2416,8 +2436,12 @@ class CacheWorker(threading.Thread):
             print(f"  预取 {layer.display_name} {token[-12:]} z{cache_z}")
             if not self._render_cancelled(gen):
                 self._mark_task_done(task)
+            else:
+                with self._lock:
+                    self._rebuild_pending_locked()
         except Exception as exc:
             print(f"  预取 {layer.display_name} 失败: {exc}")
+            self._mark_task_failed(task)
 
     def _pop_next_task(self) -> tuple | None:
         with self._lock:
@@ -2515,6 +2539,7 @@ class CacheWorker(threading.Thread):
         with self._lock:
             self._all_tasks = tasks
             self._done_tasks = done
+            self._failed_tasks = set()
             self._rebuild_pending_locked()
 
     def _build_plan_legacy(
@@ -2594,8 +2619,8 @@ class CacheWorker(threading.Thread):
         if layer is None or not frames:
             return
         self.merge_global_plan(lat, lon, city, layer.layer_id, zoom)
-        for frame in frames[-5:]:
-            cache_z = cache_zoom_for_layer(layer, zoom)
+        cache_z = cache_zoom_for_layer(layer, zoom)
+        for frame in frames:
             task = ("frame", layer.layer_id, frame.token, cache_z)
             self._execute_task(task)
 
@@ -3636,8 +3661,6 @@ def play_animation(
     interval = 1.0 / max(1, fps)
     print(f"动画: {layer.display_name} {len(frames)} 帧 @ {fps}fps")
     label = layer_lcd_label(layer)
-    cache_z = cache_zoom_for_layer(layer, zoom)
-    skip_remaining = 0
     try:
         while state.is_anim_active():
             for frame in frames:
@@ -3645,12 +3668,6 @@ def play_animation(
                     break
                 if state.wake.is_set():
                     break
-                if skip_remaining > 0:
-                    if layer.cacheable() and not frame_cache.has(
-                        layer.layer_id, frame.token, cache_z,
-                    ):
-                        continue
-                    skip_remaining -= 1
                 frame_start = time.time()
                 try:
                     img, _ = render_layer_frame(
@@ -3659,8 +3676,8 @@ def play_animation(
                     )
                     show_layer_frame(
                         lcd, frame_cache, layer, frame, zoom, img,
-                        progress=get_cache_progress() if get_cache_progress else None,
-                        show_progress_ring=show_progress_ring,
+                        progress=None,
+                        show_progress_ring=False,
                     )
                     time_str = frame_lcd_time(frame)
                     if time_str is not None:
@@ -3669,17 +3686,12 @@ def play_animation(
                     print(f"  动画帧失败: {exc}")
                 elapsed = time.time() - frame_start
                 sleep_time = interval - elapsed
-                if sleep_time < 0:
-                    skip_remaining = min(
-                        len(frames),
-                        skip_remaining + int(-sleep_time / interval) + 1,
-                    )
-                    sleep_time = 0
-                deadline = time.time() + sleep_time
-                while time.time() < deadline:
-                    if not state.is_anim_active() or state.wake.is_set():
-                        break
-                    time.sleep(0.02)
+                if sleep_time > 0:
+                    deadline = time.time() + sleep_time
+                    while time.time() < deadline:
+                        if not state.is_anim_active() or state.wake.is_set():
+                            break
+                        time.sleep(0.02)
             if state.wake.is_set():
                 break
     finally:
@@ -4025,7 +4037,23 @@ def main() -> None:
                 and cache_worker.is_prefetch_active()
             )
             if prefetching:
-                wait_timeout = 0.25
+                while (
+                    cache_worker is not None
+                    and cache_worker.is_prefetch_active()
+                ):
+                    woke = state.wake.wait(timeout=0.25)
+                    if woke:
+                        time.sleep(KNOB_DEBOUNCE)
+                        state.wake.clear()
+                        break
+                    if last_show is not None:
+                        ly, fr, im, z = last_show
+                        show_layer_frame(
+                            lcd, frame_cache, ly, fr, z, im,
+                            progress=prefetch_progress(),
+                            show_progress_ring=cache_progress_ring,
+                        )
+                continue
             else:
                 wait_timeout = refresh_sec if refresh_sec is not None else args.interval
             if not high_freq and not prefetching:
@@ -4034,14 +4062,6 @@ def main() -> None:
             if woke:
                 time.sleep(KNOB_DEBOUNCE)
                 state.wake.clear()
-            elif prefetching and last_show is not None:
-                ly, fr, im, z = last_show
-                show_layer_frame(
-                    lcd, frame_cache, ly, fr, z, im,
-                    progress=prefetch_progress(),
-                    show_progress_ring=cache_progress_ring,
-                )
-                continue
     except KeyboardInterrupt:
         print("\n退出")
     finally:
