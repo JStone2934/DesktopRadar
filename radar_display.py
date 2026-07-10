@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 Image.MAX_IMAGE_PIXELS = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gc9a01 import GC9A01, HEIGHT, WIDTH
+from gc9a01 import GC9A01, HEIGHT, WIDTH, image_to_rgb565
 from lcd_notifier import LcdNotifier
 from adsb_client import AdsbClient, AdsbError, Aircraft, extrapolated_polar
 from gpu_client import GpuClient, GpuError, format_gpu_lcd_lines
@@ -56,7 +56,14 @@ FY4B_CN_ZOOM_FACTOR = 1.5
 FY4B_CN_MIN_WIN = 96  # 最小裁切窗口（放大上限，越小越糊）
 # FY-4B 全圆盘 GEOS 地球静止投影参数（星下点经度 105E）
 FY4B_SUB_LON = 105.0
-FY4B_DISK_KEEP_RAW = 30  # 保留的原始圆盘 JPEG 帧数（约 6h 动画，每帧约 16MB）
+FY4B_DISK_KEEP_RAW = 48  # 保留的原始圆盘 JPEG 帧数（约 6h 动画，每帧约 16MB）
+DEFAULT_FRAME_CACHE_MEMORY_MAX_MB = 512
+DEFAULT_PREFETCH_ANIM_FRAMES = True
+DEFAULT_PREFETCH_NEIGHBOR_LAYERS = True
+DEFAULT_PREFETCH_FY4B_DISK_RAW = True
+DEFAULT_PREFETCH_GLOBAL = True
+DEFAULT_CACHE_PROGRESS_RING = True
+RGB565_FRAME_BYTES = WIDTH * HEIGHT * 2
 AMAP_TILE = (
     "https://webrd0{sub}.is.autonavi.com/appmaptile"
     "?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
@@ -200,6 +207,15 @@ def load_config() -> dict:
         "anim_window_hours": DEFAULT_ANIM_WINDOW_HOURS,
         "adsb_ttl_sec": 8,
         "adsb_default_range_km": 100,
+        "prefetch_anim_frames": DEFAULT_PREFETCH_ANIM_FRAMES,
+        "prefetch_neighbor_layers": DEFAULT_PREFETCH_NEIGHBOR_LAYERS,
+        "prefetch_fy4b_disk_raw": DEFAULT_PREFETCH_FY4B_DISK_RAW,
+        "fy4b_disk_keep_raw": FY4B_DISK_KEEP_RAW,
+        "frame_cache_memory_max_mb": DEFAULT_FRAME_CACHE_MEMORY_MAX_MB,
+        "cache_progress_ring": DEFAULT_CACHE_PROGRESS_RING,
+        "prefetch_global": DEFAULT_PREFETCH_GLOBAL,
+        "prefetch_zoom_min": ZOOM_MIN,
+        "prefetch_zoom_max": ZOOM_MAX,
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -803,6 +819,47 @@ def apply_circle_mask(img: Image.Image) -> Image.Image:
     return out
 
 
+CACHE_RING_RADIUS = 115
+CACHE_RING_COLOR = (80, 200, 255)
+CACHE_RING_WIDTH = 4
+
+
+def draw_cache_progress_ring(img: Image.Image, fraction: float) -> Image.Image:
+    """在圆屏内缘绘制顺时针缓存进度弧（不修改原缓存帧）。"""
+    if fraction <= 0:
+        return img
+    fraction = min(1.0, fraction)
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    inset = HALF - CACHE_RING_RADIUS
+    bbox = [inset, inset, WIDTH - inset - 1, HEIGHT - inset - 1]
+    sweep = 360.0 * fraction
+    start = 90.0 - sweep
+    draw.arc(bbox, start=start, end=90.0, fill=CACHE_RING_COLOR, width=CACHE_RING_WIDTH)
+    return out
+
+
+@dataclass
+class CacheProgressSnapshot:
+    done: int
+    total: int
+
+    @property
+    def fraction(self) -> float:
+        if self.total <= 0:
+            return 1.0
+        return min(1.0, self.done / self.total)
+
+    @property
+    def active(self) -> bool:
+        """未完成时为 True；圆环仅在此为 True 时显示，消失即代表缓存完成。"""
+        return self.total > 0 and self.done < self.total
+
+    @property
+    def complete(self) -> bool:
+        return self.total > 0 and self.done >= self.total
+
+
 def draw_overlay(
     img: Image.Image,
     city: str,
@@ -991,6 +1048,24 @@ class FY4BDiskLayer(LayerProvider):
 
     def _raw_path(self, frame: WeatherFrame) -> Path:
         return FY4B_DISK_RAW_DIR / f"{frame_token_slug(frame.token)}.jpg"
+
+    def prefetch_raw(self, frame: WeatherFrame) -> bool:
+        """后台仅下载原始 JPEG，不渲染。"""
+        path = self._raw_path(frame)
+        if path.exists():
+            return True
+        try:
+            resp = SESSION.get(
+                frame.payload["url"], timeout=60, headers={"Referer": NSMC_REFERER},
+            )
+            resp.raise_for_status()
+            FY4B_DISK_RAW_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(resp.content)
+            self._prune_raw()
+            return True
+        except Exception as exc:
+            print(f"  预下载 FY4B 圆盘原始图失败: {exc}")
+            return False
 
     def _raw_bytes(self, frame: WeatherFrame) -> bytes:
         path = self._raw_path(frame)
@@ -1903,11 +1978,14 @@ def make_frame_meta(
 
 
 class FrameCache:
-    """预渲染成品图：内存 + 磁盘 cache/frames/{layer}/{token}/zNN.png。"""
+    """预渲染成品图：内存 LRU + 磁盘 cache/frames/{layer}/{token}/zNN.png。"""
 
-    def __init__(self) -> None:
-        self._mem: dict[tuple[str, str, int], Image.Image] = {}
+    def __init__(self, memory_max_mb: int = DEFAULT_FRAME_CACHE_MEMORY_MAX_MB) -> None:
+        self._mem: OrderedDict[tuple[str, str, int], Image.Image] = OrderedDict()
+        self._rgb565: OrderedDict[tuple[str, str, int], bytes] = OrderedDict()
         self._lock = threading.Lock()
+        self._memory_max_bytes = max(16, memory_max_mb) * 1024 * 1024
+        self._mem_bytes = 0
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
     def _frame_dir(self, layer_id: str, frame_token: str) -> Path:
@@ -1916,11 +1994,51 @@ class FrameCache:
     def _zoom_path(self, layer_id: str, frame_token: str, zoom: int) -> Path:
         return self._frame_dir(layer_id, frame_token) / f"z{zoom:02d}.png"
 
+    def _estimate_bytes(self, img: Image.Image) -> int:
+        return img.width * img.height * 3
+
+    def _touch(self, key: tuple[str, str, int]) -> None:
+        if key in self._mem:
+            self._mem.move_to_end(key)
+        if key in self._rgb565:
+            self._rgb565.move_to_end(key)
+
+    def _evict_lru(self) -> None:
+        while self._mem_bytes > self._memory_max_bytes and self._mem:
+            key, img = self._mem.popitem(last=False)
+            self._mem_bytes -= self._estimate_bytes(img)
+            self._rgb565.pop(key, None)
+
+    def _store_memory(
+        self,
+        key: tuple[str, str, int],
+        img: Image.Image,
+        rgb565: bytes | None = None,
+    ) -> None:
+        if key in self._mem:
+            self._mem_bytes -= self._estimate_bytes(self._mem[key])
+        stored = img.copy()
+        self._mem[key] = stored
+        self._mem_bytes += self._estimate_bytes(stored)
+        self._touch(key)
+        if rgb565 is None:
+            rgb565 = image_to_rgb565(stored)
+        self._rgb565[key] = rgb565
+        self._evict_lru()
+
+    def has(self, layer_id: str, frame_token: str, zoom: int) -> bool:
+        key = (layer_id, frame_token, zoom)
+        with self._lock:
+            if key in self._mem:
+                return True
+        return self._zoom_path(layer_id, frame_token, zoom).exists()
+
     def get(self, layer_id: str, frame_token: str, zoom: int) -> Image.Image | None:
         key = (layer_id, frame_token, zoom)
         with self._lock:
             cached = self._mem.get(key)
             if cached is not None:
+                self._touch(key)
                 return cached.copy()
         path = self._zoom_path(layer_id, frame_token, zoom)
         if not path.exists():
@@ -1930,8 +2048,42 @@ class FrameCache:
         except Exception:
             return None
         with self._lock:
-            self._mem[key] = img
+            self._store_memory(key, img)
         return img.copy()
+
+    def get_for_display(
+        self, layer_id: str, frame_token: str, zoom: int,
+    ) -> Image.Image | None:
+        """返回共享引用，仅供显示（勿修改）。"""
+        key = (layer_id, frame_token, zoom)
+        with self._lock:
+            cached = self._mem.get(key)
+            if cached is not None:
+                self._touch(key)
+                return cached
+        path = self._zoom_path(layer_id, frame_token, zoom)
+        if not path.exists():
+            return None
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            return None
+        with self._lock:
+            self._store_memory(key, img)
+            return self._mem.get(key)
+
+    def get_rgb565(self, layer_id: str, frame_token: str, zoom: int) -> bytes | None:
+        key = (layer_id, frame_token, zoom)
+        with self._lock:
+            buf = self._rgb565.get(key)
+            if buf is not None:
+                self._touch(key)
+                return buf
+        img = self.get_for_display(layer_id, frame_token, zoom)
+        if img is None:
+            return None
+        with self._lock:
+            return self._rgb565.get(key)
 
     def put(
         self,
@@ -1947,19 +2099,43 @@ class FrameCache:
         if not meta_path.exists():
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False)
+        rgb565 = image_to_rgb565(img)
         img.save(self._zoom_path(layer_id, frame_token, zoom), optimize=True)
         key = (layer_id, frame_token, zoom)
         with self._lock:
-            self._mem[key] = img.copy()
+            self._store_memory(key, img, rgb565)
+
+    def put_fast(
+        self,
+        layer_id: str,
+        frame_token: str,
+        zoom: int,
+        img: Image.Image,
+        meta: dict | None = None,
+    ) -> None:
+        """仅写内存，不落盘（后台预取用）。"""
+        key = (layer_id, frame_token, zoom)
+        with self._lock:
+            if key in self._mem:
+                return
+            self._store_memory(key, img)
 
     def clear_memory(self) -> None:
         with self._lock:
             self._mem.clear()
+            self._rgb565.clear()
+            self._mem_bytes = 0
 
     def invalidate_layer(self, layer_id: str) -> None:
         """清空某图层的全部内存与磁盘成品缓存（中心坐标改变时用）。"""
         with self._lock:
-            self._mem = {k: v for k, v in self._mem.items() if k[0] != layer_id}
+            self._mem = OrderedDict(
+                (k, v) for k, v in self._mem.items() if k[0] != layer_id
+            )
+            self._rgb565 = OrderedDict(
+                (k, v) for k, v in self._rgb565.items() if k[0] != layer_id
+            )
+            self._mem_bytes = sum(self._estimate_bytes(v) for v in self._mem.values())
         layer_dir = FRAMES_DIR / layer_id
         if layer_dir.exists():
             shutil.rmtree(layer_dir, ignore_errors=True)
@@ -1982,80 +2158,532 @@ class FrameCache:
             if d.name not in keep_names:
                 shutil.rmtree(d, ignore_errors=True)
         with self._lock:
-            self._mem = {
-                k: v for k, v in self._mem.items()
+            self._mem = OrderedDict(
+                (k, v) for k, v in self._mem.items()
                 if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
-            }
+            )
+            self._rgb565 = OrderedDict(
+                (k, v) for k, v in self._rgb565.items()
+                if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
+            )
+            self._mem_bytes = sum(self._estimate_bytes(v) for v in self._mem.values())
 
 
-class PrefetchWorker(threading.Thread):
+@dataclass
+class FocusContext:
+    layer_id: str
+    zoom: int
+    lat: float
+    lon: float
+    city: str
+    latest_tokens: dict[str, str]
+
+
+class CacheWorker(threading.Thread):
+    """后台预取：全局待办（全图层 × 全 zoom × 动画帧）或局部回退模式。"""
+
     def __init__(
         self,
         frame_cache: FrameCache,
-        state: AppState,
+        state: "AppState",
         use_basemap: bool,
         outline_geometries: list | None,
+        anim_hours: float = DEFAULT_ANIM_WINDOW_HOURS,
+        prefetch_anim: bool = DEFAULT_PREFETCH_ANIM_FRAMES,
+        prefetch_neighbor: bool = DEFAULT_PREFETCH_NEIGHBOR_LAYERS,
+        prefetch_fy4b_raw: bool = DEFAULT_PREFETCH_FY4B_DISK_RAW,
+        show_progress_ring: bool = DEFAULT_CACHE_PROGRESS_RING,
+        prefetch_global: bool = DEFAULT_PREFETCH_GLOBAL,
+        zoom_min: int = ZOOM_MIN,
+        zoom_max: int = ZOOM_MAX,
     ) -> None:
         super().__init__(daemon=True)
         self.frame_cache = frame_cache
         self.state = state
         self.use_basemap = use_basemap
         self.outline_geometries = outline_geometries
+        self.anim_hours = anim_hours
+        self.prefetch_anim = prefetch_anim
+        self.prefetch_neighbor = prefetch_neighbor
+        self.prefetch_fy4b_raw = prefetch_fy4b_raw
+        self.show_progress_ring = show_progress_ring
+        self.prefetch_global = prefetch_global
+        self._zoom_min = max(ZOOM_MIN, min(ZOOM_MAX, zoom_min))
+        self._zoom_max = max(self._zoom_min, min(ZOOM_MAX, zoom_max))
+        self._layers_by_id = {ly.layer_id: ly for ly in state.layers}
         self._lock = threading.Lock()
         self._wake = threading.Event()
+        self._render_generation = 0
         self._generation = 0
-        self._job: tuple | None = None
+        self._context: tuple | None = None
+        self._priority_layer_id: str | None = None
+        self._urgent_layer: LayerProvider | None = None
+        self._urgent_frames: list[WeatherFrame] | None = None
+        self._urgent_lat = 0.0
+        self._urgent_lon = 0.0
+        self._urgent_city = ""
+        self._urgent_zoom = 7
+        self._pause_low_priority = False
+        self._all_tasks: set[tuple] = set()
+        self._done_tasks: set[tuple] = set()
+        self._pending: list[tuple] = []
+        self._focus = FocusContext("", 7, 0.0, 0.0, "", {})
 
-    def schedule(
+    def get_progress(self) -> CacheProgressSnapshot:
+        with self._lock:
+            return CacheProgressSnapshot(len(self._done_tasks), len(self._all_tasks))
+
+    def is_prefetch_active(self) -> bool:
+        """全局缓存未完成（圆环应显示）。与后台是否暂停低优先级无关。"""
+        if not self.show_progress_ring:
+            return False
+        return self.get_progress().active
+
+    def _weather_layers(self) -> list[LayerProvider]:
+        return [
+            ly for ly in self.state.layers
+            if getattr(ly, "channel", "weather") == "weather"
+            and ly.cacheable()
+            and ly.supports_zoom()
+        ]
+
+    def _is_task_satisfied(self, task: tuple) -> bool:
+        kind = task[0]
+        if kind == "fy4b_raw":
+            token = task[2]
+            path = FY4B_DISK_RAW_DIR / f"{frame_token_slug(token)}.jpg"
+            return path.exists()
+        _kind, layer_id, token, cache_z = task
+        return self.frame_cache.has(layer_id, token, cache_z)
+
+    def _mark_task_done(self, task: tuple) -> None:
+        with self._lock:
+            if task not in self._all_tasks or task in self._done_tasks:
+                return
+            self._done_tasks.add(task)
+            self._rebuild_pending_locked()
+
+    def _task_priority_score(self, task: tuple) -> tuple:
+        kind = task[0]
+        if kind == "fy4b_raw":
+            return (40, task[1], task[2])
+        _kind, layer_id, token, zoom = task
+        focus = self._focus
+        if layer_id == focus.layer_id and zoom == focus.zoom:
+            latest = focus.latest_tokens.get(layer_id, "")
+            if token == latest:
+                return (0, token)
+            return (1, token)
+        if layer_id == focus.layer_id:
+            try:
+                z_rank = zoom_priority_order(focus.zoom).index(zoom)
+            except ValueError:
+                z_rank = abs(zoom - focus.zoom)
+            return (2, z_rank, token)
+        if layer_id == self._priority_layer_id:
+            return (3, zoom, token)
+        return (4, layer_id, zoom, token)
+
+    def _rebuild_pending_locked(self) -> None:
+        pending = self._all_tasks - self._done_tasks
+        self._pending = sorted(pending, key=self._task_priority_score)
+
+    def _collect_latest_tokens(self) -> dict[str, str]:
+        latest: dict[str, str] = {}
+        for layer in self._weather_layers():
+            try:
+                frames = layer.frames(self.anim_hours)
+            except Exception:
+                continue
+            if frames:
+                latest[layer.layer_id] = frames[-1].token
+        return latest
+
+    def merge_global_plan(
         self,
-        layer: LayerProvider,
-        frame: WeatherFrame,
         lat: float,
         lon: float,
         city: str,
-        center_zoom: int,
+        focus_layer_id: str,
+        focus_zoom: int,
     ) -> None:
+        if not self.prefetch_global:
+            return
+        new_tasks: set[tuple] = set()
+        for layer in self._weather_layers():
+            try:
+                frames = layer.frames(self.anim_hours)
+            except Exception:
+                continue
+            if not frames:
+                continue
+            for z in range(self._zoom_min, self._zoom_max + 1):
+                for frame in frames:
+                    new_tasks.add(("frame", layer.layer_id, frame.token, z))
+            if isinstance(layer, FY4BDiskLayer) and self.prefetch_fy4b_raw:
+                for frame in frames:
+                    new_tasks.add(("fy4b_raw", layer.layer_id, frame.token))
+        latest_tokens = self._collect_latest_tokens()
+        with self._lock:
+            prev_done = self._done_tasks
+            self._focus = FocusContext(
+                focus_layer_id, focus_zoom, lat, lon, city, latest_tokens,
+            )
+            self._all_tasks = new_tasks
+            self._done_tasks = {
+                t for t in new_tasks
+                if t in prev_done or self._is_task_satisfied(t)
+            }
+            self._rebuild_pending_locked()
+
+    def invalidate_layer_tasks(self, layer_id: str) -> None:
+        def affects(task: tuple) -> bool:
+            if task[0] == "fy4b_raw":
+                return task[1] == layer_id
+            return task[1] == layer_id
+
+        with self._lock:
+            self._all_tasks = {t for t in self._all_tasks if not affects(t)}
+            self._done_tasks = {t for t in self._done_tasks if not affects(t)}
+            self._rebuild_pending_locked()
+            self._render_generation += 1
+        self._wake.set()
+
+    def invalidate_all_tasks(self) -> None:
+        with self._lock:
+            self._all_tasks.clear()
+            self._done_tasks.clear()
+            self._pending.clear()
+            self._render_generation += 1
+        self._wake.set()
+
+    def _find_frame(self, layer: LayerProvider, token: str) -> WeatherFrame | None:
+        try:
+            frames = layer.frames(self.anim_hours)
+        except Exception:
+            return None
+        for frame in frames:
+            if frame.token == token:
+                return frame
+        return None
+
+    def _render_cancelled(self, gen: int) -> bool:
+        with self._lock:
+            return self._render_generation != gen
+
+    def _execute_task(self, task: tuple) -> None:
+        with self._lock:
+            gen = self._render_generation
+        if self._is_task_satisfied(task):
+            self._mark_task_done(task)
+            return
+        kind = task[0]
+        if kind == "fy4b_raw":
+            layer_id, token = task[1], task[2]
+            disk = self._layers_by_id.get(layer_id)
+            if not isinstance(disk, FY4BDiskLayer):
+                return
+            frame = self._find_frame(disk, token)
+            if frame is None:
+                self._mark_task_done(task)
+                return
+            if disk.prefetch_raw(frame):
+                print(f"  预下载 FY4B 圆盘 {frame.token[-12:]}")
+                self._mark_task_done(task)
+            return
+        _kind, layer_id, token, render_zoom = task
+        layer = self._layers_by_id.get(layer_id)
+        if layer is None or not layer.cacheable():
+            return
+        frame = self._find_frame(layer, token)
+        if frame is None:
+            self._mark_task_done(task)
+            return
+        if self._render_cancelled(gen):
+            return
+        focus = self._focus
+        r_lat, r_lon = self.state.get_render_center(layer_id, focus.lat, focus.lon)
+        cache_z = cache_zoom_for_layer(layer, render_zoom)
+        if self.frame_cache.has(layer_id, token, cache_z):
+            self._mark_task_done(task)
+            return
+        try:
+            img = layer.render(
+                frame, r_lat, r_lon, focus.city, render_zoom,
+                self.use_basemap, self.outline_geometries,
+            )
+            self.frame_cache.put_fast(layer_id, token, cache_z, img)
+            print(f"  预取 {layer.display_name} {token[-12:]} z{cache_z}")
+            if not self._render_cancelled(gen):
+                self._mark_task_done(task)
+        except Exception as exc:
+            print(f"  预取 {layer.display_name} 失败: {exc}")
+
+    def _pop_next_task(self) -> tuple | None:
+        with self._lock:
+            pause_low = self._pause_low_priority
+            for i, task in enumerate(self._pending):
+                if pause_low and self._task_priority_score(task)[0] > 1:
+                    continue
+                return self._pending.pop(i)
+        return None
+
+    def pause_low_priority(self) -> None:
+        with self._lock:
+            self._pause_low_priority = True
+
+    def resume_low_priority(self) -> None:
+        with self._lock:
+            self._pause_low_priority = False
+
+    def bump_priority(self, layer_id: str) -> None:
+        with self._lock:
+            self._priority_layer_id = layer_id
+            self._rebuild_pending_locked()
+        self._wake.set()
+
+    def schedule_context(
+        self,
+        layer: LayerProvider,
+        frame: WeatherFrame,
+        anim_frames: list[WeatherFrame],
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        channel_layers: list[LayerProvider],
+    ) -> None:
+        if self.prefetch_global:
+            self.merge_global_plan(lat, lon, city, layer.layer_id, zoom)
+            self._wake.set()
+            return
         with self._lock:
             self._generation += 1
-            self._job = (
-                self._generation,
+            gen = self._generation
+            self._context = (
+                gen,
                 layer,
                 frame,
+                anim_frames,
                 lat,
                 lon,
                 city,
-                center_zoom,
+                zoom,
+                channel_layers,
             )
+        self._init_progress_legacy(
+            gen, layer, frame, anim_frames, lat, lon, city, zoom, channel_layers,
+        )
         self._wake.set()
+
+    def urgent_anim_prefetch(
+        self,
+        layer: LayerProvider,
+        anim_frames: list[WeatherFrame],
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+    ) -> None:
+        if not layer.cacheable() or len(anim_frames) < 2:
+            return
+        with self._lock:
+            self._urgent_layer = layer
+            self._urgent_frames = anim_frames
+            self._urgent_lat = lat
+            self._urgent_lon = lon
+            self._urgent_city = city
+            self._urgent_zoom = zoom
+        self._wake.set()
+
+    def _init_progress_legacy(
+        self,
+        gen: int,
+        layer: LayerProvider,
+        frame: WeatherFrame,
+        anim_frames: list[WeatherFrame],
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        channel_layers: list[LayerProvider],
+    ) -> None:
+        tasks = self._build_plan_legacy(
+            layer, frame, anim_frames, lat, lon, city, zoom, channel_layers,
+        )
+        done = {t for t in tasks if self._is_task_satisfied(t)}
+        with self._lock:
+            self._all_tasks = tasks
+            self._done_tasks = done
+            self._rebuild_pending_locked()
+
+    def _build_plan_legacy(
+        self,
+        layer: LayerProvider,
+        frame: WeatherFrame,
+        anim_frames: list[WeatherFrame],
+        lat: float,
+        lon: float,
+        city: str,
+        zoom: int,
+        channel_layers: list[LayerProvider],
+    ) -> set[tuple]:
+        tasks: set[tuple] = set()
+        if layer.supports_zoom():
+            for z in zoom_priority_order(zoom):
+                tasks.add(("frame", layer.layer_id, frame.token, z))
+        if self.prefetch_anim and layer.cacheable() and len(anim_frames) > 1:
+            cache_z = cache_zoom_for_layer(layer, zoom)
+            for af in anim_frames:
+                tasks.add(("frame", layer.layer_id, af.token, cache_z))
+        if self.prefetch_neighbor:
+            for nl in self._neighbor_order(channel_layers, layer):
+                if not nl.cacheable():
+                    continue
+                try:
+                    nf_list = nl.frames(self.anim_hours)
+                except Exception:
+                    continue
+                if not nf_list:
+                    continue
+                nf = nf_list[-1]
+                cache_z = cache_zoom_for_layer(nl, zoom)
+                tasks.add(("frame", nl.layer_id, nf.token, cache_z))
+        for disk_layer, disk_frames in self._collect_fy4b_raw_jobs_legacy(
+            layer, anim_frames, channel_layers,
+        ):
+            for df in disk_frames:
+                tasks.add(("fy4b_raw", disk_layer.layer_id, df.token))
+        return tasks
+
+    def _collect_fy4b_raw_jobs_legacy(
+        self,
+        layer: LayerProvider,
+        anim_frames: list[WeatherFrame],
+        channel_layers: list[LayerProvider],
+    ) -> list[tuple[FY4BDiskLayer, list[WeatherFrame]]]:
+        jobs: list[tuple[FY4BDiskLayer, list[WeatherFrame]]] = []
+        if isinstance(layer, FY4BDiskLayer):
+            jobs.append((layer, anim_frames))
+        elif self.prefetch_fy4b_raw:
+            for ly in channel_layers:
+                if isinstance(ly, FY4BDiskLayer):
+                    try:
+                        disk_frames = ly.frames(self.anim_hours)
+                    except Exception:
+                        disk_frames = []
+                    if disk_frames:
+                        jobs.append((ly, disk_frames))
+                    break
+        return jobs
+
+    def _stale(self, gen: int) -> bool:
+        with self._lock:
+            return self._generation != gen
+
+    def _run_urgent(self) -> None:
+        with self._lock:
+            layer = self._urgent_layer
+            frames = self._urgent_frames
+            lat = self._urgent_lat
+            lon = self._urgent_lon
+            city = self._urgent_city
+            zoom = self._urgent_zoom
+            self._urgent_layer = None
+            self._urgent_frames = None
+        if layer is None or not frames:
+            return
+        self.merge_global_plan(lat, lon, city, layer.layer_id, zoom)
+        for frame in frames[-5:]:
+            cache_z = cache_zoom_for_layer(layer, zoom)
+            task = ("frame", layer.layer_id, frame.token, cache_z)
+            self._execute_task(task)
+
+    def _neighbor_order(
+        self, channel_layers: list[LayerProvider], current: LayerProvider,
+    ) -> list[LayerProvider]:
+        with self._lock:
+            priority = self._priority_layer_id
+        others = [ly for ly in channel_layers if ly.layer_id != current.layer_id]
+        if priority:
+            others.sort(key=lambda ly: 0 if ly.layer_id == priority else 1)
+        return others
+
+    def _run_legacy_context(self) -> None:
+        with self._lock:
+            ctx = self._context
+            pause_low = self._pause_low_priority
+            gen = self._generation if ctx else 0
+        if ctx is None:
+            return
+        (
+            gen,
+            layer,
+            frame,
+            anim_frames,
+            lat,
+            lon,
+            city,
+            zoom,
+            channel_layers,
+        ) = ctx
+        if layer.supports_zoom():
+            for z in zoom_priority_order(zoom):
+                if self._stale(gen):
+                    break
+                task = ("frame", layer.layer_id, frame.token, z)
+                self._execute_task(task)
+        if self._stale(gen) or pause_low:
+            return
+        if self.prefetch_anim and layer.cacheable() and len(anim_frames) > 1:
+            cache_z = cache_zoom_for_layer(layer, zoom)
+            for af in anim_frames:
+                if self._stale(gen):
+                    break
+                self._execute_task(("frame", layer.layer_id, af.token, cache_z))
+        if self._stale(gen) or pause_low:
+            return
+        if self.prefetch_neighbor:
+            global_lat, global_lon = lat, lon
+            for nl in self._neighbor_order(channel_layers, layer):
+                if self._stale(gen):
+                    break
+                if not nl.cacheable():
+                    continue
+                try:
+                    nf_list = nl.frames(self.anim_hours)
+                except Exception:
+                    continue
+                if not nf_list:
+                    continue
+                nf = nf_list[-1]
+                r_lat, r_lon = self.state.get_render_center(
+                    nl.layer_id, global_lat, global_lon,
+                )
+                self._focus = FocusContext(
+                    layer.layer_id, zoom, global_lat, global_lon, city,
+                    {layer.layer_id: frame.token},
+                )
+                cache_z = cache_zoom_for_layer(nl, zoom)
+                self._execute_task(("frame", nl.layer_id, nf.token, cache_z))
 
     def run(self) -> None:
         while True:
-            self._wake.wait()
+            self._wake.wait(timeout=0.5)
             self._wake.clear()
-            with self._lock:
-                job = self._job
-                self._job = None
-            if job is None:
-                continue
-            gen, layer, frame, lat, lon, city, center_zoom = job
-            if not layer.supports_zoom():
-                continue
-            meta = make_frame_meta(layer.layer_id, frame, lat, lon, city)
-            for z in zoom_priority_order(center_zoom):
-                with self._lock:
-                    if self._generation != gen:
+            self._run_urgent()
+            if self.prefetch_global:
+                while True:
+                    task = self._pop_next_task()
+                    if task is None:
                         break
-                if self.frame_cache.get(layer.layer_id, frame.token, z) is not None:
-                    continue
-                try:
-                    img = layer.render(
-                        frame, lat, lon, city, z,
-                        self.use_basemap, self.outline_geometries,
-                    )
-                    self.frame_cache.put(layer.layer_id, frame.token, z, img, meta)
-                    print(f"  预取 {layer.display_name} z{z}")
-                except Exception as exc:
-                    print(f"  预取 {layer.display_name} z{z} 失败: {exc}")
+                    self._execute_task(task)
+            else:
+                self._run_legacy_context()
+
+
+# 兼容旧名称
+PrefetchWorker = CacheWorker
 
 
 class AppState:
@@ -2115,6 +2743,13 @@ class AppState:
             range_idx = ADSB_DEFAULT_RANGE_INDEX
         self._adsb_range_index = range_idx
         self._adsb_default_range_index = range_idx
+        self.cache_worker: CacheWorker | None = None
+
+    def get_channel_layers(self) -> list[LayerProvider]:
+        with self._lock:
+            ch = self._current_channel()
+            indices = self._channel_indices.get(ch, [self.layer_index])
+            return [self.layers[i] for i in indices]
 
     def _current_channel(self) -> str:
         return getattr(self.layers[self.layer_index], "channel", "weather")
@@ -2168,6 +2803,8 @@ class AppState:
             ch_label = CHANNEL_LCD_LABELS.get(channel_id, channel_id)
         print(f"通道: -> {ch_label} ({layer.display_name})")
         self._lcd_notify("Channel", f"{ch_label} {layer_lcd_label(layer)}")
+        if self.cache_worker is not None:
+            self.cache_worker.bump_priority(layer.layer_id)
         self.wake.set()
 
     def _lcd_notify(self, line1: str, line2: str = "") -> None:
@@ -2265,6 +2902,8 @@ class AppState:
             name = layer.display_name
         print(f"图层: -> {name}")
         self._lcd_notify("Layer", layer_lcd_label(layer))
+        if self.cache_worker is not None:
+            self.cache_worker.bump_priority(layer.layer_id)
         self.wake.set()
 
     def start_anim(self) -> None:
@@ -2290,6 +2929,10 @@ class AppState:
         with self._lock:
             self._current_lat = lat
             self._current_lon = lon
+
+    def get_current_location(self) -> tuple[float, float]:
+        with self._lock:
+            return self._current_lat, self._current_lon
 
     def get_location_override(self) -> tuple[float, float] | None:
         with self._lock:
@@ -2684,6 +3327,8 @@ class LayerKeyController(threading.Thread):
         gpu_client: GpuClient | None = None,
         gpu_live_interval_sec: float = 2.0,
         anim_enabled: bool = True,
+        cache_worker: CacheWorker | None = None,
+        anim_hours: float = DEFAULT_ANIM_WINDOW_HOURS,
     ) -> None:
         super().__init__(daemon=True)
         self.state = state
@@ -2692,6 +3337,8 @@ class LayerKeyController(threading.Thread):
         self.gpu_client = gpu_client
         self._gpu_live_interval_sec = max(0.5, float(gpu_live_interval_sec))
         self.anim_enabled = anim_enabled
+        self.cache_worker = cache_worker
+        self.anim_hours = anim_hours
         self._gpu_live = False
         self._gpu_live_stop = threading.Event()
         self._gpu_live_wake = threading.Event()
@@ -2848,6 +3495,24 @@ class LayerKeyController(threading.Thread):
                             self._held = True
                             self._cancel_timer()
                             if self.anim_enabled and not self._space_in_gpu_context():
+                                layer = self.state.get_layer()
+                                if self.cache_worker is not None and layer.cacheable():
+                                    try:
+                                        cur_lat, cur_lon = self.state.get_current_location()
+                                        r_lat, r_lon = self.state.get_render_center(
+                                            layer.layer_id, cur_lat, cur_lon,
+                                        )
+                                        anim_frames = layer.frames(self.anim_hours)
+                                        self.cache_worker.urgent_anim_prefetch(
+                                            layer,
+                                            anim_frames,
+                                            r_lat,
+                                            r_lon,
+                                            "",
+                                            self.state.get_zoom(),
+                                        )
+                                    except Exception:
+                                        pass
                                 self._timer = threading.Timer(
                                     self.state.long_press_ms / 1000.0,
                                     self._on_long_press,
@@ -2911,7 +3576,7 @@ def render_layer_frame(
         )
         return img, False
     cache_z = cache_zoom_for_layer(layer, zoom)
-    cached = frame_cache.get(layer.layer_id, frame.token, cache_z)
+    cached = frame_cache.get_for_display(layer.layer_id, frame.token, cache_z)
     if cached is not None:
         return cached, True
     img = layer.render(
@@ -2920,6 +3585,30 @@ def render_layer_frame(
     meta = make_frame_meta(layer.layer_id, frame, lat, lon, city)
     frame_cache.put(layer.layer_id, frame.token, cache_z, img, meta)
     return img, False
+
+
+def show_layer_frame(
+    lcd: GC9A01 | None,
+    frame_cache: FrameCache,
+    layer: LayerProvider,
+    frame: WeatherFrame,
+    zoom: int,
+    img: Image.Image,
+    progress: CacheProgressSnapshot | None = None,
+    show_progress_ring: bool = True,
+) -> None:
+    if lcd is None:
+        return
+    if show_progress_ring and progress is not None and progress.active:
+        lcd.display(draw_cache_progress_ring(img.copy(), progress.fraction))
+        return
+    if layer.cacheable():
+        cache_z = cache_zoom_for_layer(layer, zoom)
+        buf = frame_cache.get_rgb565(layer.layer_id, frame.token, cache_z)
+        if buf is not None:
+            lcd.display_rgb565(buf)
+            return
+    lcd.display(img)
 
 
 def play_animation(
@@ -2933,39 +3622,69 @@ def play_animation(
     outline_geometries: list | None,
     frame_cache: FrameCache,
     state: AppState,
-    show: Callable[[Image.Image], None],
+    lcd: GC9A01 | None,
     fps: int,
+    cache_worker: CacheWorker | None = None,
+    get_cache_progress: Callable[[], CacheProgressSnapshot | None] | None = None,
+    show_progress_ring: bool = True,
 ) -> None:
     if len(frames) < 2:
         print("动画: 可用帧不足，跳过")
         return
+    if cache_worker is not None:
+        cache_worker.pause_low_priority()
     interval = 1.0 / max(1, fps)
     print(f"动画: {layer.display_name} {len(frames)} 帧 @ {fps}fps")
     label = layer_lcd_label(layer)
-    while state.is_anim_active():
-        for frame in frames:
-            if not state.is_anim_active():
-                break
+    cache_z = cache_zoom_for_layer(layer, zoom)
+    skip_remaining = 0
+    try:
+        while state.is_anim_active():
+            for frame in frames:
+                if not state.is_anim_active():
+                    break
+                if state.wake.is_set():
+                    break
+                if skip_remaining > 0:
+                    if layer.cacheable() and not frame_cache.has(
+                        layer.layer_id, frame.token, cache_z,
+                    ):
+                        continue
+                    skip_remaining -= 1
+                frame_start = time.time()
+                try:
+                    img, _ = render_layer_frame(
+                        layer, frame, lat, lon, city, zoom,
+                        use_basemap, outline_geometries, frame_cache,
+                    )
+                    show_layer_frame(
+                        lcd, frame_cache, layer, frame, zoom, img,
+                        progress=get_cache_progress() if get_cache_progress else None,
+                        show_progress_ring=show_progress_ring,
+                    )
+                    time_str = frame_lcd_time(frame)
+                    if time_str is not None:
+                        state.notify_lcd(label, time_str)
+                except Exception as exc:
+                    print(f"  动画帧失败: {exc}")
+                elapsed = time.time() - frame_start
+                sleep_time = interval - elapsed
+                if sleep_time < 0:
+                    skip_remaining = min(
+                        len(frames),
+                        skip_remaining + int(-sleep_time / interval) + 1,
+                    )
+                    sleep_time = 0
+                deadline = time.time() + sleep_time
+                while time.time() < deadline:
+                    if not state.is_anim_active() or state.wake.is_set():
+                        break
+                    time.sleep(0.02)
             if state.wake.is_set():
                 break
-            try:
-                img, _ = render_layer_frame(
-                    layer, frame, lat, lon, city, zoom,
-                    use_basemap, outline_geometries, frame_cache,
-                )
-                show(img)
-                time_str = frame_lcd_time(frame)
-                if time_str is not None:
-                    state.notify_lcd(label, time_str)
-            except Exception as exc:
-                print(f"  动画帧失败: {exc}")
-            deadline = time.time() + interval
-            while time.time() < deadline:
-                if not state.is_anim_active() or state.wake.is_set():
-                    break
-                time.sleep(0.02)
-        if state.wake.is_set():
-            break
+    finally:
+        if cache_worker is not None:
+            cache_worker.resume_low_priority()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2992,17 +3711,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global FY4B_DISK_KEEP_RAW
     args = parse_args()
     if args.detect_keys:
         run_detect_keys()
         return
 
     cfg = load_config()
+    FY4B_DISK_KEEP_RAW = int(cfg.get("fy4b_disk_keep_raw", FY4B_DISK_KEEP_RAW))
     use_basemap = not args.no_basemap
     anim_fps = int(cfg.get("anim_fps", DEFAULT_ANIM_FPS))
     anim_hours = float(cfg.get("anim_window_hours", DEFAULT_ANIM_WINDOW_HOURS))
     long_press_ms = int(cfg.get("long_press_ms", DEFAULT_LONG_PRESS_MS))
     default_range_km = int(cfg.get("adsb_default_range_km", 100))
+    frame_cache_mb = int(cfg.get("frame_cache_memory_max_mb", DEFAULT_FRAME_CACHE_MEMORY_MAX_MB))
+    prefetch_anim = bool(cfg.get("prefetch_anim_frames", DEFAULT_PREFETCH_ANIM_FRAMES))
+    prefetch_neighbor = bool(cfg.get("prefetch_neighbor_layers", DEFAULT_PREFETCH_NEIGHBOR_LAYERS))
+    prefetch_fy4b_raw = bool(cfg.get("prefetch_fy4b_disk_raw", DEFAULT_PREFETCH_FY4B_DISK_RAW))
+    cache_progress_ring = bool(cfg.get("cache_progress_ring", DEFAULT_CACHE_PROGRESS_RING))
+    prefetch_global = bool(cfg.get("prefetch_global", DEFAULT_PREFETCH_GLOBAL))
+    prefetch_zoom_min = int(cfg.get("prefetch_zoom_min", ZOOM_MIN))
+    prefetch_zoom_max = int(cfg.get("prefetch_zoom_max", ZOOM_MAX))
     channel_combos = parse_channel_keys(cfg)
     action_combos = parse_action_keys(cfg)
     ssh_gpu_cfg = cfg.get("ssh_gpu") or {}
@@ -3063,11 +3792,25 @@ def main() -> None:
         if notifier.enabled:
             state.notifier = notifier
             notifier.notify("Weather Radar", layer_lcd_label(state.get_layer()))
-    frame_cache = FrameCache()
-    prefetch: PrefetchWorker | None = None
+    frame_cache = FrameCache(memory_max_mb=frame_cache_mb)
+    cache_worker: CacheWorker | None = None
     if not args.once:
-        prefetch = PrefetchWorker(frame_cache, state, use_basemap, outline_geometries)
-        prefetch.start()
+        cache_worker = CacheWorker(
+            frame_cache,
+            state,
+            use_basemap,
+            outline_geometries,
+            anim_hours=anim_hours,
+            prefetch_anim=prefetch_anim,
+            prefetch_neighbor=prefetch_neighbor,
+            prefetch_fy4b_raw=prefetch_fy4b_raw,
+            show_progress_ring=cache_progress_ring,
+            prefetch_global=prefetch_global,
+            zoom_min=prefetch_zoom_min,
+            zoom_max=prefetch_zoom_max,
+        )
+        cache_worker.start()
+        state.cache_worker = cache_worker
 
     if not args.no_knob and not args.once:
         KnobController(state).start()
@@ -3079,6 +3822,8 @@ def main() -> None:
             gpu_client=gpu_client,
             gpu_live_interval_sec=gpu_live_interval_sec,
             anim_enabled=not args.no_anim,
+            cache_worker=cache_worker,
+            anim_hours=anim_hours,
         ).start()
 
     lcd = None
@@ -3095,6 +3840,16 @@ def main() -> None:
     last_lon: float | None = None
     last_tokens: dict[str, str] = {}
     last_render_centers: dict[str, tuple[float, float]] = {}
+    last_layer_id: str | None = None
+    last_show: tuple[LayerProvider, WeatherFrame, Image.Image, int] | None = None
+
+    def prefetch_progress() -> CacheProgressSnapshot | None:
+        if cache_worker is None or not cache_progress_ring:
+            return None
+        progress = cache_worker.get_progress()
+        if not progress.active:
+            return None
+        return progress
 
     try:
         while True:
@@ -3118,6 +3873,8 @@ def main() -> None:
                 ):
                     print("位置变化，清空内存热缓存")
                     frame_cache.clear_memory()
+                    if cache_worker is not None:
+                        cache_worker.invalidate_all_tasks()
                 last_lat, last_lon = lat, lon
 
                 if state.is_settings_mode():
@@ -3139,6 +3896,8 @@ def main() -> None:
                 ):
                     print(f"{layer.display_name} 中心变化，清空该图层缓存")
                     frame_cache.invalidate_layer(layer.layer_id)
+                    if cache_worker is not None:
+                        cache_worker.invalidate_layer_tasks(layer.layer_id)
                 last_render_centers[layer.layer_id] = (r_lat, r_lon)
 
                 display_city = city
@@ -3155,9 +3914,12 @@ def main() -> None:
                     play_animation(
                         layer, anim_frames, r_lat, r_lon, display_city, zoom,
                         use_basemap, outline_geometries, frame_cache,
-                        state, show, anim_fps,
+                        state, lcd, anim_fps, cache_worker,
+                        get_cache_progress=prefetch_progress,
+                        show_progress_ring=cache_progress_ring,
                     )
                     state.wake.clear()
+                    last_layer_id = layer.layer_id
                     continue
 
                 frames = layer.frames(anim_hours)
@@ -3171,6 +3933,18 @@ def main() -> None:
                         state.wake.clear()
                     continue
                 frame = frames[-1]
+
+                if layer.layer_id != last_layer_id and layer.cacheable():
+                    cache_z = cache_zoom_for_layer(layer, zoom)
+                    quick = frame_cache.get_for_display(
+                        layer.layer_id, frame.token, cache_z,
+                    )
+                    if quick is not None:
+                        show_layer_frame(
+                            lcd, frame_cache, layer, frame, zoom, quick,
+                            progress=prefetch_progress(),
+                            show_progress_ring=cache_progress_ring,
+                        )
 
                 if last_tokens.get(layer.layer_id) != frame.token:
                     frame_cache.invalidate_old(layer.layer_id, frame.token)
@@ -3211,7 +3985,13 @@ def main() -> None:
                 ):
                     continue
 
-                show(img)
+                show_layer_frame(
+                    lcd, frame_cache, layer, frame, zoom, img,
+                    progress=prefetch_progress(),
+                    show_progress_ring=cache_progress_ring,
+                )
+                last_layer_id = layer.layer_id
+                last_show = (layer, frame, img, zoom)
                 elapsed_ms = (time.time() - t0) * 1000
                 if not quiet:
                     if from_cache:
@@ -3219,8 +3999,17 @@ def main() -> None:
                     else:
                         print(f"已更新 ({elapsed_ms:.0f}ms)")
 
-                if prefetch is not None and layer.supports_zoom():
-                    prefetch.schedule(layer, frame, r_lat, r_lon, display_city, state.get_zoom())
+                if cache_worker is not None:
+                    cache_worker.schedule_context(
+                        layer,
+                        frame,
+                        frames,
+                        r_lat,
+                        r_lon,
+                        display_city,
+                        state.get_zoom(),
+                        state.get_channel_layers(),
+                    )
             except Exception as exc:
                 print(f"刷新失败: {exc}")
                 show(make_error_image("离线\n重试中..."))
@@ -3229,12 +4018,30 @@ def main() -> None:
                 break
 
             refresh_sec = layer.live_refresh_sec()
-            wait_timeout = refresh_sec if refresh_sec is not None else args.interval
-            if not (refresh_sec is not None and refresh_sec < 1.0):
+            high_freq = refresh_sec is not None and refresh_sec < 1.0
+            prefetching = (
+                not high_freq
+                and cache_worker is not None
+                and cache_worker.is_prefetch_active()
+            )
+            if prefetching:
+                wait_timeout = 0.25
+            else:
+                wait_timeout = refresh_sec if refresh_sec is not None else args.interval
+            if not high_freq and not prefetching:
                 print(f"等待 {wait_timeout:.1f} 秒（旋钮/空格可打断）...")
-            if state.wake.wait(timeout=wait_timeout):
+            woke = state.wake.wait(timeout=wait_timeout)
+            if woke:
                 time.sleep(KNOB_DEBOUNCE)
                 state.wake.clear()
+            elif prefetching and last_show is not None:
+                ly, fr, im, z = last_show
+                show_layer_frame(
+                    lcd, frame_cache, ly, fr, z, im,
+                    progress=prefetch_progress(),
+                    show_progress_ring=cache_progress_ring,
+                )
+                continue
     except KeyboardInterrupt:
         print("\n退出")
     finally:

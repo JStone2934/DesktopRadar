@@ -136,20 +136,14 @@ class GC9A01:
         for _ in range(HEIGHT):
             lgpio.spi_write(self._spi, line)
 
-    def display(self, image):
-        """把一张 240x240 的 PIL 图像刷到屏上。"""
-        import numpy as np
-
-        image = image.convert("RGB")
-        if image.size != (WIDTH, HEIGHT):
-            image = image.resize((WIDTH, HEIGHT))
-        arr = np.asarray(image, dtype=np.uint16)
-        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        # RGB565 大端字节序
-        buf = rgb565.astype(">u2").tobytes()
+    def display_rgb565(self, buf: bytes) -> None:
+        """直接刷预转换的 RGB565 缓冲（240×240×2 字节）。"""
         self.set_window(0, 0, WIDTH - 1, HEIGHT - 1)
         self._data(buf)
+
+    def display(self, image):
+        """把一张 240x240 的 PIL 图像刷到屏上。"""
+        self.display_rgb565(image_to_rgb565(image))
 
     def close(self):
         try:
@@ -160,6 +154,22 @@ class GC9A01:
             lgpio.gpiochip_close(self._chip)
         except Exception:
             pass
+
+
+def image_to_rgb565(image) -> bytes:
+    """PIL 图像 -> RGB565 大端字节序缓冲。"""
+    import numpy as np
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("image must be a PIL Image")
+    image = image.convert("RGB")
+    if image.size != (WIDTH, HEIGHT):
+        image = image.resize((WIDTH, HEIGHT))
+    arr = np.asarray(image, dtype=np.uint16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    return rgb565.astype(">u2").tobytes()
 
 
 # 常用 RGB565 颜色
