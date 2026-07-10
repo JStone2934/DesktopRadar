@@ -25,7 +25,7 @@
 | **飞机** | ADSB 雷达四种风格 | `ctrl+v`（可配置） |
 
 - **空格短按**：在当前通道内循环切换图层
-- **空格长按**（≥500ms）：播放当前图层近 6 小时历史动画（松手停止）
+- **空格长按**（≥500ms）：播放当前图层近 6 小时历史动画（松手停止；卫星图层按真实帧时间步进，不跳帧）
 - **旋钮**：天气通道缩放；短临图层改预报时间；飞机通道改雷达量程
 
 ---
@@ -301,20 +301,37 @@ ssh -o BatchMode=yes js@10.7.162.172 \
 
 长按旋钮进入设置界面：高德地图 + 十字准星，旋转调整度/分/秒，短按切换字段，再长按保存。
 
-- **全局坐标**：写入 `manual_lat` / `manual_lon` / `manual_location`
-- **FY-4B 独立中心**：在 `satellite_fy4b` / `satellite_fy4b_disk` 图层下长按，分别写入 `fy4b_cn_*` / `fy4b_disk_*`
+**进入设置时**，始终从当前**全局坐标**（`manual_lat` / `manual_lon`）起算，不会跳到 FY-4B 等图层的旧独立中心。
+
+| 当前图层 | 保存目标 | 写入字段 |
+|----------|----------|----------|
+| 雷达、短临等 | **全局坐标** | `manual_lat` / `manual_lon` / `manual_location`，并**同步** `fy4b_cn_*` / `fy4b_disk_*` |
+| `satellite_fy4b` | FY-4B 中国区独立中心 | 仅 `fy4b_cn_lat` / `fy4b_cn_lon` |
+| `satellite_fy4b_disk` | FY-4B 圆盘独立中心 | 仅 `fy4b_disk_lat` / `fy4b_disk_lon` |
+
+> 在雷达图层保存广州坐标后，切到风云4B盘也会显示广州附近，不会再误跳到广西等旧坐标。启动时若独立中心与全局偏差超过 1°，会自动同步。
 
 ---
 
-## 预渲染磁盘缓存
+## 预渲染缓存与后台预取
 
-后台预渲染各图层、各帧、各 zoom 为 240×240 PNG，存于 `cache/frames/{图层ID}/{帧ID}/zNN.png`：
+后台 `CacheWorker` 线程预渲染各图层、各帧、各 zoom（默认 **z3–z12**）为 240×240 PNG，存于 `cache/frames/{图层ID}/{帧ID}/zNN.png`：
 
-- 旋钮缩放优先读内存/磁盘缓存，目标 **<50ms**
+| 机制 | 说明 |
+|------|------|
+| **全局预取** | `prefetch_global: true` 时，后台按优先级预取全部天气图层 × 全部 zoom × 动画帧 |
+| **蓝色进度圆环** | 预取进行中时在圆屏内缘显示顺时针进度弧（`cache_progress_ring`）；消失即表示当前批次完成 |
+| **动画帧常驻内存** | 当前图层的 6 小时动画序列（全部 zoom）会 pin 在内存 LRU 中，避免播放时反复读盘；约 **60MB/图层** |
+| **FY-4B 原始图** | 圆盘图层原始 JPEG 预下载至 `cache/disk_raw/`（每帧 ~16MB） |
+
+日常使用：
+
+- 旋钮缩放优先读内存/磁盘缓存，目标 **<50ms**（内存命中时）
 - 每图层保留约 40 个帧目录（覆盖 6 小时动画）
 - 瓦片 LRU 内存缓存（上限 2000）
+- 长按动画前会同步预热；未落盘的帧仍需现场渲染，播放会自动降速但不跳时间
 
----
+相关配置见下表 `prefetch_*` / `frame_cache_memory_max_mb` / `cache_progress_ring`。
 
 ## 命令行参数
 
@@ -346,10 +363,10 @@ ssh -o BatchMode=yes js@10.7.162.172 \
   "manual_location": true,
   "manual_lat": 22.866111,
   "manual_lon": 113.513611,
-  "fy4b_disk_lat": 11.904167,
-  "fy4b_disk_lon": 108.724167,
-  "fy4b_cn_lat": 22.618611,
-  "fy4b_cn_lon": 113.59,
+  "fy4b_disk_lat": 22.866111,
+  "fy4b_disk_lon": 113.513611,
+  "fy4b_cn_lat": 22.866111,
+  "fy4b_cn_lon": 113.513611,
   "layers": ["radar", "satellite_fy4b", "satellite_fy4b_disk", "nowcast"],
   "aircraft_layers": ["adsb_radar", "adsb_map", "adsb_outline", "adsb_sweep"],
   "channel_keys": {
@@ -370,12 +387,36 @@ ssh -o BatchMode=yes js@10.7.162.172 \
   "long_press_ms": 500,
   "anim_fps": 5,
   "anim_window_hours": 6,
+  "prefetch_global": true,
+  "prefetch_anim_frames": true,
+  "prefetch_neighbor_layers": true,
+  "prefetch_fy4b_disk_raw": true,
+  "prefetch_zoom_min": 3,
+  "prefetch_zoom_max": 12,
+  "fy4b_disk_keep_raw": 48,
+  "frame_cache_memory_max_mb": 512,
+  "cache_progress_ring": true,
   "lcd_backlight_seconds": 5,
   "nmc_cache_ttl_sec": 300,
   "adsb_ttl_sec": 8,
   "adsb_default_range_km": 100
 }
 ```
+
+### 预取与缓存配置说明
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `prefetch_global` | `true` | 后台全局预取（全图层 × 全 zoom × 动画帧） |
+| `prefetch_zoom_min` / `prefetch_zoom_max` | 3 / 12 | 预取与动画常驻内存的 zoom 范围 |
+| `prefetch_anim_frames` | `true` | 预取当前图层动画序列 |
+| `prefetch_neighbor_layers` | `true` | 预取同通道相邻图层最新帧 |
+| `prefetch_fy4b_disk_raw` | `true` | 预下载 FY-4B 圆盘原始 JPEG |
+| `frame_cache_memory_max_mb` | 512 | 预渲染成品图内存 LRU 上限（MB） |
+| `cache_progress_ring` | `true` | 预取时在圆屏显示蓝色进度圆环 |
+| `anim_fps` | 5 | 长按动画播放帧率 |
+| `anim_window_hours` | 6 | 动画/预取历史窗口（小时） |
+| `fy4b_disk_keep_raw` | 48 | 保留的圆盘原始 JPEG 帧数 |
 
 ---
 
@@ -408,5 +449,8 @@ LayerKeyController         │      (RainViewer/NMC/   1602 LCD
   · 空格/通道键            │       ADSB/高德)
   · 0 → GpuClient ──SSH──► │      nvidia-smi
                            ▼
-                    PrefetchWorker → cache/frames/
+                    CacheWorker → cache/frames/
+                         │              cache/disk_raw/
+                         ▼
+                  动画帧 pin（z3–z12）
 ```
