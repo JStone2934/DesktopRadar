@@ -1983,6 +1983,11 @@ class FrameCache:
     def __init__(self, memory_max_mb: int = DEFAULT_FRAME_CACHE_MEMORY_MAX_MB) -> None:
         self._mem: OrderedDict[tuple[str, str, int], Image.Image] = OrderedDict()
         self._rgb565: OrderedDict[tuple[str, str, int], bytes] = OrderedDict()
+        self._pinned: set[tuple[str, str, int]] = set()
+        self._anim_pin_keys: set[tuple[str, str, int]] = set()
+        self._anim_retain: str | None = None
+        self._retain_lock = threading.Lock()
+        self._retain_running = False
         self._lock = threading.Lock()
         self._memory_max_bytes = max(16, memory_max_mb) * 1024 * 1024
         self._mem_bytes = 0
@@ -2005,9 +2010,124 @@ class FrameCache:
 
     def _evict_lru(self) -> None:
         while self._mem_bytes > self._memory_max_bytes and self._mem:
-            key, img = self._mem.popitem(last=False)
-            self._mem_bytes -= self._estimate_bytes(img)
-            self._rgb565.pop(key, None)
+            evicted = False
+            for key in list(self._mem.keys()):
+                if key in self._pinned:
+                    continue
+                img = self._mem.pop(key)
+                self._rgb565.pop(key, None)
+                self._mem_bytes -= self._estimate_bytes(img)
+                evicted = True
+                break
+            if not evicted:
+                break
+
+    def _unpin_anim_keys_locked(self) -> None:
+        self._pinned -= self._anim_pin_keys
+        self._anim_pin_keys.clear()
+        self._anim_retain = None
+
+    def _load_into_memory_locked(self, key: tuple[str, str, int]) -> bool:
+        if key in self._mem:
+            self._touch(key)
+            return True
+        layer_id, frame_token, zoom = key
+        path = self._zoom_path(layer_id, frame_token, zoom)
+        if not path.exists():
+            return False
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            return False
+        self._store_memory(key, img)
+        return key in self._mem
+
+    def _anim_pin_targets(
+        self,
+        layer_id: str,
+        frames: list["WeatherFrame"],
+        zoom_min: int,
+        zoom_max: int,
+    ) -> set[tuple[str, str, int]]:
+        return {
+            (layer_id, frame.token, z)
+            for frame in frames
+            for z in range(zoom_min, zoom_max + 1)
+        }
+
+    def anim_frames_in_memory(
+        self,
+        layer_id: str,
+        frames: list["WeatherFrame"],
+        zoom_min: int,
+        zoom_max: int,
+    ) -> tuple[int, int]:
+        """返回 (已在内存中的动画帧数, 动画帧总数)。含全部 zoom。"""
+        targets = self._anim_pin_targets(layer_id, frames, zoom_min, zoom_max)
+        with self._lock:
+            loaded = sum(1 for key in targets if key in self._mem)
+        return loaded, len(targets)
+
+    def retain_anim_frames(
+        self,
+        layer_id: str,
+        frames: list["WeatherFrame"],
+        zoom_min: int,
+        zoom_max: int,
+    ) -> tuple[int, int]:
+        """将动画序列（全部 zoom）载入内存并 pin。返回 (已载入, 总数)。"""
+        if not frames:
+            return 0, 0
+        new_pins = self._anim_pin_targets(layer_id, frames, zoom_min, zoom_max)
+        with self._lock:
+            if self._anim_retain != layer_id:
+                self._unpin_anim_keys_locked()
+            self._anim_retain = layer_id
+            self._anim_pin_keys = new_pins
+            self._pinned |= new_pins
+            loaded = 0
+            for key in new_pins:
+                if self._load_into_memory_locked(key):
+                    loaded += 1
+        return loaded, len(new_pins)
+
+    def retain_anim_frames_async(
+        self,
+        layer_id: str,
+        frames: list["WeatherFrame"],
+        zoom_min: int,
+        zoom_max: int,
+    ) -> None:
+        """后台将动画序列（全部 zoom）常驻内存。"""
+        if len(frames) < 2:
+            return
+        with self._retain_lock:
+            loaded, total = self.anim_frames_in_memory(
+                layer_id, frames, zoom_min, zoom_max,
+            )
+            if loaded == total:
+                return
+            if self._retain_running:
+                return
+            self._retain_running = True
+
+        def _worker() -> None:
+            try:
+                loaded, total = self.retain_anim_frames(
+                    layer_id, frames, zoom_min, zoom_max,
+                )
+                if loaded > 0:
+                    print(
+                        f"  动画常驻内存: {layer_id} "
+                        f"z{zoom_min}-z{zoom_max} {loaded}/{total} 帧",
+                    )
+            finally:
+                with self._retain_lock:
+                    self._retain_running = False
+
+        threading.Thread(
+            target=_worker, daemon=True, name="anim-retain",
+        ).start()
 
     def _store_memory(
         self,
@@ -2124,6 +2244,9 @@ class FrameCache:
         with self._lock:
             self._mem.clear()
             self._rgb565.clear()
+            self._pinned.clear()
+            self._anim_pin_keys.clear()
+            self._anim_retain = None
             self._mem_bytes = 0
 
     def invalidate_layer(self, layer_id: str) -> None:
@@ -2135,6 +2258,12 @@ class FrameCache:
             self._rgb565 = OrderedDict(
                 (k, v) for k, v in self._rgb565.items() if k[0] != layer_id
             )
+            self._pinned = {k for k in self._pinned if k[0] != layer_id}
+            self._anim_pin_keys = {
+                k for k in self._anim_pin_keys if k[0] != layer_id
+            }
+            if self._anim_retain == layer_id:
+                self._anim_retain = None
             self._mem_bytes = sum(self._estimate_bytes(v) for v in self._mem.values())
         layer_dir = FRAMES_DIR / layer_id
         if layer_dir.exists():
@@ -2166,6 +2295,16 @@ class FrameCache:
                 (k, v) for k, v in self._rgb565.items()
                 if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
             )
+            self._pinned = {
+                k for k in self._pinned
+                if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
+            }
+            self._anim_pin_keys = {
+                k for k in self._anim_pin_keys
+                if k[0] != layer_id or frame_token_slug(k[1]) in keep_names
+            }
+            if self._anim_retain == layer_id and not self._anim_pin_keys:
+                self._anim_retain = None
             self._mem_bytes = sum(self._estimate_bytes(v) for v in self._mem.values())
 
 
@@ -3584,6 +3723,24 @@ def cache_zoom_for_layer(layer: LayerProvider, zoom: int) -> int:
     return 0 if not layer.supports_zoom() else zoom
 
 
+def schedule_anim_retain(
+    frame_cache: FrameCache,
+    layer: LayerProvider,
+    frames: list[WeatherFrame],
+    zoom_min: int,
+    zoom_max: int,
+) -> None:
+    """后台把当前图层全部 zoom 的动画帧 pin 在内存里。"""
+    if not layer.cacheable() or len(frames) < 2:
+        return
+    if layer.supports_zoom():
+        z_lo = max(ZOOM_MIN, min(ZOOM_MAX, zoom_min))
+        z_hi = max(z_lo, min(ZOOM_MAX, zoom_max))
+    else:
+        z_lo = z_hi = 0
+    frame_cache.retain_anim_frames_async(layer.layer_id, frames, z_lo, z_hi)
+
+
 def render_layer_frame(
     layer: LayerProvider,
     frame: WeatherFrame,
@@ -3649,6 +3806,8 @@ def play_animation(
     state: AppState,
     lcd: GC9A01 | None,
     fps: int,
+    zoom_min: int = ZOOM_MIN,
+    zoom_max: int = ZOOM_MAX,
     cache_worker: CacheWorker | None = None,
     get_cache_progress: Callable[[], CacheProgressSnapshot | None] | None = None,
     show_progress_ring: bool = True,
@@ -3661,6 +3820,19 @@ def play_animation(
     interval = 1.0 / max(1, fps)
     print(f"动画: {layer.display_name} {len(frames)} 帧 @ {fps}fps")
     label = layer_lcd_label(layer)
+    if layer.supports_zoom():
+        z_lo = max(ZOOM_MIN, min(ZOOM_MAX, zoom_min))
+        z_hi = max(z_lo, min(ZOOM_MAX, zoom_max))
+    else:
+        z_lo = z_hi = 0
+    loaded, total = frame_cache.retain_anim_frames(
+        layer.layer_id, frames, z_lo, z_hi,
+    )
+    if loaded < total:
+        print(
+            f"动画: 内存预热 {loaded}/{total} 帧 "
+            f"(z{z_lo}-z{z_hi}，未缓存帧将现场渲染)",
+        )
     try:
         while state.is_anim_active():
             for frame in frames:
@@ -3926,7 +4098,9 @@ def main() -> None:
                     play_animation(
                         layer, anim_frames, r_lat, r_lon, display_city, zoom,
                         use_basemap, outline_geometries, frame_cache,
-                        state, lcd, anim_fps, cache_worker,
+                        state, lcd, anim_fps,
+                        prefetch_zoom_min, prefetch_zoom_max,
+                        cache_worker,
                         get_cache_progress=prefetch_progress,
                         show_progress_ring=cache_progress_ring,
                     )
@@ -4022,6 +4196,10 @@ def main() -> None:
                         state.get_zoom(),
                         state.get_channel_layers(),
                     )
+                schedule_anim_retain(
+                    frame_cache, layer, frames,
+                    prefetch_zoom_min, prefetch_zoom_max,
+                )
             except Exception as exc:
                 print(f"刷新失败: {exc}")
                 show(make_error_image("离线\n重试中..."))
@@ -4053,6 +4231,12 @@ def main() -> None:
                             progress=prefetch_progress(),
                             show_progress_ring=cache_progress_ring,
                         )
+                        if ly.cacheable():
+                            anim_frames = ly.frames(anim_hours)
+                            schedule_anim_retain(
+                                frame_cache, ly, anim_frames,
+                                prefetch_zoom_min, prefetch_zoom_max,
+                            )
                 continue
             else:
                 wait_timeout = refresh_sec if refresh_sec is not None else args.interval
