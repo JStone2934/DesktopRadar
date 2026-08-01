@@ -1,6 +1,7 @@
 #include "wifi_sta.h"
 
 #include <WiFi.h>
+#include <string.h>
 
 #include "config.h"
 
@@ -20,25 +21,68 @@ void wifiDisconnectClean() {
   delay(100);
 }
 
-static bool wifiConnectPsk(const AppConfig& cfg) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("esp32-radar");
-  WiFi.begin(cfg.ssid, cfg.pass);
-  Serial.printf("WiFi PSK connecting to %s ...\n", cfg.ssid);
-
+static bool waitConnected(uint32_t timeoutMs) {
   const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
-      Serial.println("WiFi PSK connect timeout");
+    if (millis() - start > timeoutMs) {
       return false;
     }
     delay(250);
     Serial.print('.');
   }
   Serial.println();
-  Serial.printf("WiFi OK, IP=%s RSSI=%d\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
+}
+
+static bool wifiConnectPsk(AppConfig* cfg) {
+  if (!cfg) {
+    return false;
+  }
+
+  wifiDisconnectClean();
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setHostname("esp32-radar");
+  delay(100);
+
+  const size_t passLen = strnlen(cfg->pass, sizeof(cfg->pass));
+  Serial.printf("WiFi PSK connecting to %s (passLen=%u) ...\n", cfg->ssid,
+                (unsigned)passLen);
+  if (passLen == 0) {
+    Serial.println("WiFi PSK: password empty — check portal save / NVS");
+  }
+  WiFi.begin(cfg->ssid, cfg->pass);
+
+  if (waitConnected(WIFI_CONNECT_TIMEOUT_MS)) {
+    Serial.printf("WiFi OK, IP=%s RSSI=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+  }
+
+  Serial.printf("WiFi PSK connect timeout status=%d\n", (int)WiFi.status());
+
+  // NVS 密码错误但 SSID 仍是默认热点：回退 config.h 并写回 NVS
+  if (strcmp(cfg->ssid, WIFI_SSID) == 0 && strcmp(cfg->pass, WIFI_PASS) != 0) {
+    Serial.println("WiFi: retry with config.h WIFI_PASS and repair NVS");
+    wifiDisconnectClean();
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    if (!waitConnected(WIFI_CONNECT_TIMEOUT_MS)) {
+      Serial.printf("WiFi retry timeout status=%d\n", (int)WiFi.status());
+      return false;
+    }
+    strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
+    cfg->pass[sizeof(cfg->pass) - 1] = '\0';
+    if (appConfigSave(cfg)) {
+      Serial.println("WiFi: NVS password repaired");
+    }
+    Serial.printf("WiFi OK, IP=%s RSSI=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+  }
+  return false;
 }
 
 static bool wifiConnectPeap(const AppConfig& cfg) {
@@ -73,29 +117,23 @@ static bool wifiConnectPeap(const AppConfig& cfg) {
   Serial.printf("WiFi PEAP connecting to %s id=%s ...\n", cfg.ssid,
                 cfg.identity);
 
-  const uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
-      Serial.println("WiFi PEAP connect timeout");
-      return false;
-    }
-    delay(250);
-    Serial.print('.');
+  if (!waitConnected(WIFI_CONNECT_TIMEOUT_MS)) {
+    Serial.println("WiFi PEAP connect timeout");
+    return false;
   }
-  Serial.println();
   Serial.printf("WiFi OK (PEAP), IP=%s RSSI=%d\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
 #endif
 }
 
-bool wifiConnect(const AppConfig& cfg) {
-  if (cfg.ssid[0] == '\0') {
+bool wifiConnect(AppConfig* cfg) {
+  if (!cfg || cfg->ssid[0] == '\0') {
     Serial.println("WiFi: empty SSID");
     return false;
   }
-  if (cfg.wifi_mode == APP_WIFI_PEAP) {
-    return wifiConnectPeap(cfg);
+  if (cfg->wifi_mode == APP_WIFI_PEAP) {
+    return wifiConnectPeap(*cfg);
   }
   return wifiConnectPsk(cfg);
 }

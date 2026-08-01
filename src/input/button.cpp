@@ -7,6 +7,7 @@
 static volatile bool s_armed = true;
 static volatile uint32_t s_downAt = 0;
 static volatile uint8_t s_latched = 0;  // ButtonEvent
+static uint32_t s_ignoreUntil = 0;
 static constexpr uint32_t kDebounceMs = 30;
 
 static void IRAM_ATTR bootIsr() {
@@ -47,6 +48,10 @@ void buttonBegin() {
     s_armed = false;
   }
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_BOOT), bootIsr, CHANGE);
+  // USB 复位/上电边沿噪声：短暂忽略，避免门户被“假短按”跳过
+  s_ignoreUntil = millis() + 800;
+  s_latched = 0;
+  s_downAt = 0;
 }
 
 ButtonEvent buttonPoll() {
@@ -55,6 +60,14 @@ ButtonEvent buttonPoll() {
       s_armed = true;
       s_downAt = 0;
     }
+    return ButtonEvent::None;
+  }
+
+  if (millis() < s_ignoreUntil) {
+    noInterrupts();
+    s_latched = 0;
+    s_downAt = 0;
+    interrupts();
     return ButtonEvent::None;
   }
 

@@ -18,6 +18,23 @@
 
 #include <lgfx/utility/lgfx_pngle.h>
 
+static ComposeProgressFn s_progressFn = nullptr;
+
+void composeSetProgressFn(ComposeProgressFn fn) { s_progressFn = fn; }
+
+static void reportComposeProgress(int zoom, float local01) {
+  if (!s_progressFn) {
+    return;
+  }
+  if (local01 < 0.0f) {
+    local01 = 0.0f;
+  }
+  if (local01 > 1.0f) {
+    local01 = 1.0f;
+  }
+  s_progressFn(zoom, local01);
+}
+
 static void pollButtonDuringCompose() { inputServiceDuringBlock(); }
 
 static void logHeap(const char* tag) {
@@ -421,6 +438,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     lcd->setFont(&fonts::Font2);
     lcd->drawString("Downloading...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
   }
+  reportComposeProgress(zoom, 0.02f);
 
   RainviewerFrame meta;
   const bool haveRadarMeta = rainviewerFetchLatest(&meta);
@@ -428,6 +446,22 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     return false;
   }
   logHeap("after-meta");
+  reportComposeProgress(zoom, 0.06f);
+
+  const int baseTiles =
+      (vp.tx1 - vp.tx0 + 1) * (vp.ty1 - vp.ty0 + 1);
+  const int radarTiles =
+      haveRadarMeta ? (rtx1 - rtx0 + 1) * (rty1 - rty0 + 1) : 0;
+  const int dlTotal = baseTiles + radarTiles;
+  int dlDone = 0;
+
+  auto afterTile = [&]() {
+    ++dlDone;
+    // 下载占该档进度的 ~75%
+    const float frac =
+        dlTotal > 0 ? (float)dlDone / (float)dlTotal : 1.0f;
+    reportComposeProgress(zoom, 0.06f + 0.69f * frac);
+  };
 
   int baseOk = 0;
   int radarOk = 0;
@@ -442,6 +476,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                         AMAP_REFERER, 800, "basemap")) {
         ++baseOk;
       }
+      afterTile();
     }
   }
   Serial.printf("Basemap dl ok=%d\n", baseOk);
@@ -458,6 +493,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                           200, "radar")) {
           ++radarOk;
         }
+        afterTile();
       }
     }
   }
@@ -488,6 +524,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     lcd->setFont(&fonts::Font2);
     lcd->drawString("Baking...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
   }
+  reportComposeProgress(zoom, 0.78f);
   logHeap("before-bake");
   // 只清其它档残留，保留当前档刚下载的 PNG
   frameCacheScrubOrphansExcept(zoom);
@@ -521,6 +558,13 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   };
 
   int decoded = 0;
+  const int bakeTiles = baseTiles + (radarOk > 0 ? radarTiles : 0);
+  auto afterBakeStep = [&](int step) {
+    const float frac =
+        bakeTiles > 0 ? (float)step / (float)(bakeTiles * 2) : 1.0f;
+    reportComposeProgress(zoom, 0.78f + 0.20f * frac);
+  };
+
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
     for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
       pollButtonDuringCompose();
@@ -530,6 +574,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       if (decodeOne(false, tx, ty, false)) {
         ++decoded;
       }
+      afterBakeStep(decoded);
     }
   }
   if (radarOk > 0) {
@@ -542,6 +587,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         if (decodeOne(true, tx, ty, true)) {
           ++decoded;
         }
+        afterBakeStep(decoded);
       }
     }
   }
@@ -550,6 +596,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     return false;
   }
 
+  reportComposeProgress(zoom, 0.90f);
   logHeap("malloc-frame");
   uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
   if (!frame) {
@@ -598,6 +645,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       if (stampOne(false, tx, ty, 1, false)) {
         ++stamped;
       }
+      afterBakeStep(decoded + stamped);
     }
   }
   if (radarOk > 0) {
@@ -611,6 +659,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         if (stampOne(true, tx, ty, scale, true)) {
           ++stamped;
         }
+        afterBakeStep(decoded + stamped);
       }
     }
   }
@@ -623,6 +672,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     return false;
   }
 
+  reportComposeProgress(zoom, 0.97f);
   frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
   frameCacheDrawOverlayBuf(frame, haveRadarMeta ? meta.time : 0);
 
@@ -651,6 +701,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     return false;
   }
 
+  reportComposeProgress(zoom, 1.0f);
   logHeap("compose-done");
   Serial.printf("compose done z=%d ok=1\n", zoom);
   return true;

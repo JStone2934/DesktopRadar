@@ -14,6 +14,12 @@ bool frameCacheBegin();
 /** 成品 RGB565 已就绪（ready + 长度校验）。 */
 bool frameCacheHas(int zoom);
 
+/** z3–z12 中已就绪的档位数。 */
+int frameCacheCountReady();
+
+/** 可缓存的总档位数（ZOOM_MAX - ZOOM_MIN + 1）。 */
+int frameCacheZoomSlots();
+
 /** 行刷 RGB565 到 LCD（秒切）。 */
 bool frameCacheBlit(LGFX* lcd, int zoom);
 

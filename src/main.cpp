@@ -15,6 +15,7 @@
 #include "config.h"
 #include "config_portal.h"
 #include "frame_cache.h"
+#include "progress_ring.h"
 #include "wifi_sta.h"
 #include "zoom_ctrl.h"
 
@@ -26,6 +27,36 @@ static uint32_t s_labelUntil = 0;
 static uint32_t s_lastRefresh = 0;
 static bool s_busyCompose = false;
 static bool s_wifiOk = false;
+static bool s_statusScreen = false;  // Fetching/Baking 黑底，圆环不 blit 地图
+static int s_bakeZoom = -1;
+static float s_bakeLocal = 0.0f;
+
+static float globalCacheDone01() {
+  const int slots = frameCacheZoomSlots();
+  if (slots <= 0) {
+    return 1.0f;
+  }
+  float ready = (float)frameCacheCountReady();
+  if (s_bakeZoom >= ZOOM_MIN && s_bakeZoom <= ZOOM_MAX &&
+      !frameCacheHas(s_bakeZoom)) {
+    ready += s_bakeLocal;
+  }
+  if (ready > (float)slots) {
+    ready = (float)slots;
+  }
+  return ready / (float)slots;
+}
+
+static void refreshProgressRing() {
+  const int under = s_statusScreen ? -1 : s_displayedZoom;
+  progressRingUpdate(&lcd, globalCacheDone01(), under);
+}
+
+static void onComposeProgress(int zoom, float local01) {
+  s_bakeZoom = zoom;
+  s_bakeLocal = local01;
+  refreshProgressRing();
+}
 
 static void showStatus(const char* line1, const char* line2 = nullptr) {
   lcd.fillScreen(TFT_BLACK);
@@ -72,6 +103,7 @@ static void clearLabelIfDue() {
   s_labelUntil = 0;
   if (s_displayedZoom >= 0 && frameCacheHas(s_displayedZoom)) {
     frameCacheBlit(&lcd, s_displayedZoom);
+    refreshProgressRing();
   }
 }
 
@@ -82,9 +114,11 @@ static bool showCached(int zoom, bool withLabel) {
   }
   Serial.printf("blit z%d %lums\n", zoom, (unsigned long)(millis() - t0));
   s_displayedZoom = zoom;
+  s_statusScreen = false;
   if (withLabel) {
     overlayZoomLabel(zoom);
   }
+  refreshProgressRing();
   return true;
 }
 
@@ -95,6 +129,7 @@ static void onPendingZoomFeedback(int zoom) {
     return;
   }
   overlayZoomLabel(zoom, "...");
+  refreshProgressRing();
 }
 
 static bool buildAndCache(int zoom, bool pushToDisplay) {
@@ -103,11 +138,15 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   }
   s_busyCompose = true;
   composeClearAbort();
+  s_bakeZoom = zoom;
+  s_bakeLocal = 0.0f;
 
   if (pushToDisplay) {
     char line2[20];
     snprintf(line2, sizeof(line2), "zoom %d", zoom);
+    s_statusScreen = true;
     showStatus("Fetching...", line2);
+    refreshProgressRing();
   } else {
     Serial.printf("prefetch bake z%d (no display)\n", zoom);
   }
@@ -115,6 +154,8 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   const bool ok =
       composeRadarFrame(&lcd, s_cfg.lat, s_cfg.lon, zoom, pushToDisplay);
   s_busyCompose = false;
+  s_bakeZoom = -1;
+  s_bakeLocal = 0.0f;
 
   if (!ok) {
     if (composeAbortRequested()) {
@@ -122,13 +163,18 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     } else {
       Serial.printf("build z%d fail\n", zoom);
     }
+    s_statusScreen = false;
+    refreshProgressRing();
     return false;
   }
 
   if (pushToDisplay) {
     s_displayedZoom = zoom;
+    s_statusScreen = false;
+    // compose 已 pushImage；叠档位标签后再画剩余圆环
     overlayZoomLabel(zoom);
   }
+  refreshProgressRing();
   return true;
 }
 
@@ -196,7 +242,7 @@ static bool tryWifiAndRadar() {
   Serial.printf("apply cfg: mode=%u ssid=%s lat=%.5f lon=%.5f\n",
                 (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon);
   showStatus("Connecting...", s_cfg.ssid);
-  s_wifiOk = wifiConnect(s_cfg);
+  s_wifiOk = wifiConnect(&s_cfg);
   if (!s_wifiOk) {
     showStatus("WiFi fail", s_cfg.ssid);
     Serial.println("hold BOOT 10s to re-open setup");
@@ -221,6 +267,7 @@ static void runPortalAndApply() {
   composeRequestAbort();
   zoomPrefetchClear();
   s_busyCompose = false;
+  progressRingHide(&lcd, s_displayedZoom);
 
   const float oldLat = s_cfg.lat;
   const float oldLon = s_cfg.lon;
@@ -252,6 +299,7 @@ void setup() {
   buttonBegin();
   zoomSetCurrent(MAP_ZOOM);
   zoomSetPendingFeedback(onPendingZoomFeedback);
+  composeSetProgressFn(onComposeProgress);
 
   showStatus("LittleFS...", "");
   if (!frameCacheBegin()) {
@@ -287,7 +335,7 @@ void loop() {
   clearLabelIfDue();
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (wifiConnect(s_cfg)) {
+    if (wifiConnect(&s_cfg)) {
       ensureZoomVisible(zoomCurrent(), true);
       s_lastRefresh = millis();
     }
@@ -323,11 +371,12 @@ void loop() {
 
   if (millis() - lastBeat >= 5000) {
     lastBeat = millis();
-    Serial.printf("[%lu] heap=%u max=%u wifi=%d z=%d cached=%d fs=%u/%u\n",
-                  millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
-                  WiFi.RSSI(), zoomCurrent(), (int)frameCacheHas(zoomCurrent()),
-                  (unsigned)LittleFS.usedBytes(),
-                  (unsigned)LittleFS.totalBytes());
+    Serial.printf(
+        "[%lu] heap=%u max=%u wifi=%d z=%d cached=%d ring=%d/%d fs=%u/%u\n",
+        millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(),
+        zoomCurrent(), (int)frameCacheHas(zoomCurrent()),
+        frameCacheCountReady(), frameCacheZoomSlots(),
+        (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
   }
 
   delay(10);

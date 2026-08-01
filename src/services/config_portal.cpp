@@ -2,6 +2,7 @@
 
 #include <WebServer.h>
 #include <WiFi.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,14 +96,17 @@ static void handleRoot() {
     Serial.println("portal: setup page opened, timeout disabled");
   }
 
+  // 输入框只填绝对值；正负由北纬/南纬、东经/西经决定
   char latBuf[24];
   char lonBuf[24];
-  floatToBuf(s_seedCfg.lat, latBuf, sizeof(latBuf));
-  floatToBuf(s_seedCfg.lon, lonBuf, sizeof(lonBuf));
+  floatToBuf(fabsf(s_seedCfg.lat), latBuf, sizeof(latBuf));
+  floatToBuf(fabsf(s_seedCfg.lon), lonBuf, sizeof(lonBuf));
   const bool peap = (s_seedCfg.wifi_mode == APP_WIFI_PEAP);
+  const bool latSouth = s_seedCfg.lat < 0.0f;
+  const bool lonWest = s_seedCfg.lon < 0.0f;
 
   String html;
-  html.reserve(3200);
+  html.reserve(3800);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
@@ -112,13 +116,16 @@ static void handleRoot() {
             "label{display:block;margin:10px 0 4px;font-size:.9rem}"
             "input,select{width:100%;box-sizing:border-box;padding:8px;border-radius:6px;"
             "border:1px solid #444;background:#222;color:#eee}"
+            ".row{display:flex;gap:8px;align-items:stretch}"
+            ".row select{width:7.2em;flex:0 0 auto}"
+            ".row input{flex:1;min-width:0}"
             ".hint{color:#aaa;font-size:.8rem;margin:4px 0 12px}"
             "button{width:100%;padding:12px;margin-top:16px;border:0;border-radius:8px;"
             "background:#2a7;color:#fff;font-size:1rem}"
             ".peap-only{display:none}</style></head><body>"
             "<h1>桌面雷达设置</h1>"
             "<p class=\"hint\">连热点 Radar-Setup 后填写。密码留空=不修改。"
-            "纬度经度用小数点，如 23.1291</p>"
+            "坐标填绝对值，再用北纬/南纬、东经/西经；小数点如 23.1291</p>"
             "<form method=\"POST\" action=\"/save\" accept-charset=\"UTF-8\" "
             "autocomplete=\"off\">"
             "<label>WiFi 类型</label><select name=\"mode\" id=\"mode\" autocomplete=\"off\" "
@@ -138,13 +145,25 @@ static void handleRoot() {
   html += F("\"></div><label>Password（留空不改）</label>"
             "<input name=\"pass\" type=\"password\" maxlength=\"64\" value=\"\" "
             "autocomplete=\"new-password\">"
-            "<label>纬度</label><input name=\"lat\" inputmode=\"decimal\" "
-            "required maxlength=\"16\" autocomplete=\"off\" value=\"");
+            "<label>纬度</label><div class=\"row\">"
+            "<select name=\"lat_hem\" autocomplete=\"off\">");
+  html += latSouth ? F("<option value=\"N\">北纬</option>"
+                       "<option value=\"S\" selected>南纬</option>")
+                   : F("<option value=\"N\" selected>北纬</option>"
+                       "<option value=\"S\">南纬</option>");
+  html += F("</select><input name=\"lat\" inputmode=\"decimal\" required maxlength=\"16\" "
+            "autocomplete=\"off\" placeholder=\"0~90\" value=\"");
   html += latBuf;
-  html += F("\"><label>经度</label><input name=\"lon\" inputmode=\"decimal\" "
-            "required maxlength=\"16\" autocomplete=\"off\" value=\"");
+  html += F("\"></div><label>经度</label><div class=\"row\">"
+            "<select name=\"lon_hem\" autocomplete=\"off\">");
+  html += lonWest ? F("<option value=\"E\">东经</option>"
+                      "<option value=\"W\" selected>西经</option>")
+                  : F("<option value=\"E\" selected>东经</option>"
+                      "<option value=\"W\">西经</option>");
+  html += F("</select><input name=\"lon\" inputmode=\"decimal\" required maxlength=\"16\" "
+            "autocomplete=\"off\" placeholder=\"0~180\" value=\"");
   html += lonBuf;
-  html += F("\"><button type=\"submit\">保存并继续</button></form>"
+  html += F("\"></div><button type=\"submit\">保存并继续</button></form>"
             "<script>function tog(){var p=document.getElementById('mode').value==='1';"
             "document.getElementById('idRow').style.display=p?'block':'none';"
             "document.getElementById('identity').required=p;}tog();</script>"
@@ -230,10 +249,16 @@ static const char* parseForm(AppConfig* cfg) {
     return "密码过长";
   }
   if (pass.length() == 0) {
-    // 留空：保留已有密码
+    // 留空：保留已有密码；若 NVS/默认也空则用 config.h（仅 PSK）
     strncpy(cfg->pass, s_seedCfg.pass, sizeof(cfg->pass) - 1);
+    if (cfg->wifi_mode == APP_WIFI_PSK && cfg->pass[0] == '\0') {
+      strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
+    }
   } else {
     strncpy(cfg->pass, pass.c_str(), sizeof(cfg->pass) - 1);
+  }
+  if (cfg->wifi_mode == APP_WIFI_PSK && cfg->pass[0] == '\0') {
+    return "PSK 密码不能为空";
   }
 
   String id = s_server->arg("identity");
@@ -249,20 +274,36 @@ static const char* parseForm(AppConfig* cfg) {
 
   bool latOk = false;
   bool lonOk = false;
-  const float lat = parseCoord(s_server->arg("lat"), &latOk);
-  const float lon = parseCoord(s_server->arg("lon"), &lonOk);
+  float lat = parseCoord(s_server->arg("lat"), &latOk);
+  float lon = parseCoord(s_server->arg("lon"), &lonOk);
   if (!latOk) {
     return "纬度格式错误(用小数点如23.1291)";
   }
   if (!lonOk) {
     return "经度格式错误(用小数点如113.2644)";
   }
-  if (lat < -90.0f || lat > 90.0f) {
-    return "纬度超出范围";
+  // 输入可带符号；最终符号以北纬/南纬、东经/西经为准
+  lat = fabsf(lat);
+  lon = fabsf(lon);
+  if (lat > 90.0f) {
+    return "纬度超出范围(0~90)";
   }
-  if (lon < -180.0f || lon > 180.0f) {
-    return "经度超出范围";
+  if (lon > 180.0f) {
+    return "经度超出范围(0~180)";
   }
+  const String latHem = s_server->arg("lat_hem");
+  const String lonHem = s_server->arg("lon_hem");
+  if (latHem == "S") {
+    lat = -lat;
+  } else if (latHem != "N" && latHem.length() > 0) {
+    return "纬度半球无效";
+  }
+  if (lonHem == "W") {
+    lon = -lon;
+  } else if (lonHem != "E" && lonHem.length() > 0) {
+    return "经度半球无效";
+  }
+  // 缺省按北纬/东经（国内默认）
   cfg->lat = lat;
   cfg->lon = lon;
   return nullptr;

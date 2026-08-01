@@ -212,6 +212,18 @@ bool frameCacheHas(int zoom) {
   return readyMaskGet(zoom);
 }
 
+int frameCacheZoomSlots() { return ZOOM_MAX - ZOOM_MIN + 1; }
+
+int frameCacheCountReady() {
+  int n = 0;
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    if (readyMaskGet(z)) {
+      ++n;
+    }
+  }
+  return n;
+}
+
 bool frameCacheBlit(LGFX* lcd, int zoom) {
   if (!lcd || !frameCacheHas(zoom)) {
     return false;

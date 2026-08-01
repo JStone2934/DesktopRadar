@@ -76,6 +76,12 @@ bool appConfigLoad(AppConfig* cfg) {
     appConfigSetDefaults(cfg);
     return false;
   }
+  // 旧版表单曾把空密码写入 NVS；PSK 空密码时回退 config.h 默认
+  if (cfg->wifi_mode == APP_WIFI_PSK && cfg->pass[0] == '\0') {
+    Serial.println("appConfig: NVS PSK pass empty, fallback WIFI_PASS");
+    strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
+    cfg->pass[sizeof(cfg->pass) - 1] = '\0';
+  }
   return true;
 }
 
