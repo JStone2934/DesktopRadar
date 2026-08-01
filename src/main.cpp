@@ -69,12 +69,13 @@ static void showStatus(const char* line1, const char* line2 = nullptr) {
   }
 }
 
-static void clearAllFrameCaches() {
+static void clearAllFrameCaches(const char* reason) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
     frameCacheRemove(z);
   }
   s_displayedZoom = -1;
-  Serial.println("frame caches cleared (location change)");
+  Serial.printf("frame caches cleared (%s)\n",
+                reason && reason[0] ? reason : "all");
 }
 
 static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
@@ -248,7 +249,7 @@ static void runPortalAndApply() {
 
   if (pr == PortalResult::Saved) {
     if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
-      clearAllFrameCaches();
+      clearAllFrameCaches("location change");
     }
   }
 
@@ -322,12 +323,14 @@ void loop() {
     }
   }
 
+  // 到点后作废全部缩放成品再重建：时间戳烤在 RGB565 里，只刷当前档会导致切档看到旧时间
   if (millis() - s_lastRefresh >= RADAR_REFRESH_MS) {
     s_lastRefresh = millis();
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
-      Serial.printf("scheduled refresh z%d\n", z);
-      frameCacheRemove(z);
+      Serial.printf("scheduled refresh all zooms (focus z%d)\n", z);
+      zoomPrefetchClear();
+      clearAllFrameCaches("radar refresh");
       buildAndCache(z, true);
       handlePendingZoom();
       zoomPrefetchResetAround(zoomCurrent());
