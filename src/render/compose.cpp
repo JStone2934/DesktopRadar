@@ -489,26 +489,27 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     lcd->drawString("Baking...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
   }
   logHeap("before-bake");
+  // 造片前再清一遍其它档残留，降低 LittleFS 峰值
+  frameCacheScrubOrphans();
 
-  // 先全部 PNG→raw（此时不占 112KB 帧），再 malloc 帧一次性贴图
+  // 先占帧缓冲，再逐张 PNG→raw→贴图→立刻删临时文件（避免 raw/alpha 堆积撑爆 FS）
+  logHeap("malloc-frame");
+  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
+  if (!frame) {
+    Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
+    return false;
+  }
+  const uint16_t bg = backdropColor(lcd);
+  for (size_t i = 0; i < (size_t)LCD_WIDTH * LCD_HEIGHT; ++i) {
+    frame[i] = bg;
+  }
+
   char pngPath[48];
   char rawPath[48];
   char alphaPathBuf[48];
-  struct PendingStamp {
-    char raw[48];
-    char alpha[48];
-    int ox;
-    int oy;
-    int scale;
-    bool hasAlpha;
-  };
-  PendingStamp pending[16];
-  int pendingN = 0;
 
-  auto queueRaw = [&](bool isRadar, int tx, int ty, int sc, bool withAlpha) -> bool {
-    if (pendingN >= (int)(sizeof(pending) / sizeof(pending[0]))) {
-      return false;
-    }
+  auto stampOne = [&](bool isRadar, int tx, int ty, int sc,
+                      bool withAlpha) -> bool {
     frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
     if (!LittleFS.exists(pngPath)) {
       return false;
@@ -525,30 +526,32 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     if (!decodePngToRawFile(pngPath, rawPath, ap)) {
       return false;
     }
-    PendingStamp& p = pending[pendingN++];
-    strncpy(p.raw, rawPath, sizeof(p.raw) - 1);
-    p.raw[sizeof(p.raw) - 1] = 0;
+    LittleFS.remove(pngPath);  // 解码后立刻释放 PNG
+
+    const int ox =
+        (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
+    const int oy =
+        (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
+    const bool ok = frameCacheStampRawToBuffer(
+        frame, rawPath, ap, ox, oy, sc, withAlpha);
+    LittleFS.remove(rawPath);
     if (ap) {
-      strncpy(p.alpha, ap, sizeof(p.alpha) - 1);
-      p.alpha[sizeof(p.alpha) - 1] = 0;
-      p.hasAlpha = true;
-    } else {
-      p.alpha[0] = 0;
-      p.hasAlpha = false;
+      LittleFS.remove(ap);
     }
-    p.ox = (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
-    p.oy = (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
-    p.scale = sc;
-    return true;
+    return ok;
   };
 
+  int stamped = 0;
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
     for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
       pollButtonDuringCompose();
       if (composeAbortRequested()) {
+        free(frame);
         return false;
       }
-      queueRaw(false, tx, ty, 1, false);
+      if (stampOne(false, tx, ty, 1, false)) {
+        ++stamped;
+      }
     }
   }
   if (radarOk > 0) {
@@ -556,68 +559,26 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       for (int tx = rtx0; tx <= rtx1; ++tx) {
         pollButtonDuringCompose();
         if (composeAbortRequested()) {
+          free(frame);
           return false;
         }
-        queueRaw(true, tx, ty, scale, true);
-      }
-    }
-  }
-
-  if (pendingN == 0) {
-    Serial.println("Stamped tiles=0");
-    return false;
-  }
-
-  logHeap("malloc-frame");
-  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
-  if (!frame) {
-    Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
-    for (int i = 0; i < pendingN; ++i) {
-      LittleFS.remove(pending[i].raw);
-      if (pending[i].hasAlpha) {
-        LittleFS.remove(pending[i].alpha);
-      }
-    }
-    return false;
-  }
-  const uint16_t bg = backdropColor(lcd);
-  for (size_t i = 0; i < (size_t)LCD_WIDTH * LCD_HEIGHT; ++i) {
-    frame[i] = bg;
-  }
-
-  int stamped = 0;
-  for (int i = 0; i < pendingN; ++i) {
-    pollButtonDuringCompose();
-    if (composeAbortRequested()) {
-      for (int j = i; j < pendingN; ++j) {
-        LittleFS.remove(pending[j].raw);
-        if (pending[j].hasAlpha) {
-          LittleFS.remove(pending[j].alpha);
+        if (stampOne(true, tx, ty, scale, true)) {
+          ++stamped;
         }
       }
-      free(frame);
-      return false;
-    }
-    if (frameCacheStampRawToBuffer(frame, pending[i].raw,
-                                   pending[i].hasAlpha ? pending[i].alpha
-                                                       : nullptr,
-                                   pending[i].ox, pending[i].oy,
-                                   pending[i].scale, pending[i].hasAlpha)) {
-      ++stamped;
-    }
-    LittleFS.remove(pending[i].raw);
-    if (pending[i].hasAlpha) {
-      LittleFS.remove(pending[i].alpha);
     }
   }
 
-  Serial.printf("Stamped tiles=%d\n", stamped);
+  Serial.printf("Stamped tiles=%d fs used=%u/%u\n", stamped,
+                (unsigned)LittleFS.usedBytes(),
+                (unsigned)LittleFS.totalBytes());
   if (stamped == 0) {
     free(frame);
     return false;
   }
 
   frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
+  frameCacheDrawOverlayBuf(frame, haveRadarMeta ? meta.time : 0);
 
   if (pushToDisplay) {
     // 即使不 commit 也先刷一帧，避免接口抖动时黑屏

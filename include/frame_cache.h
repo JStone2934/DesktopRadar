@@ -19,6 +19,9 @@ bool frameCacheBlit(LGFX* lcd, int zoom);
 
 bool frameCacheRemove(int zoom);
 
+/** 清除各档临时瓦片残留，保留已 commit 成品。 */
+void frameCacheScrubOrphans();
+
 /** 造片前：清空该档临时瓦片与旧成品。 */
 bool frameCachePrepare(int zoom);
 
@@ -57,11 +60,17 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
 bool frameCacheStampTile(int zoom, const uint16_t* tile256, int pasteX,
                          int pasteY, int scale, bool alphaKey);
 
-/** 在内存帧上画十字准星。 */
+/** 在内存帧上画十字准星（含中心红点）。 */
 void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color);
 
-/** 在成品文件上画十字准星。 */
+/** 在成品文件上画十字准星（含中心红点）。 */
 bool frameCacheDrawCrosshair(int zoom, uint16_t color);
+
+/**
+ * 在内存帧底部烘焙信息条：北京时间 "WWW HH:MM"（如 WED 14:35）。
+ * frameTs==0 时显示 --- --:--。
+ */
+void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs);
 
 /** 校验长度后写 ready；并删除临时 PNG/meta。 */
 bool frameCacheCommit(int zoom);

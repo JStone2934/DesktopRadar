@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 // bit0 = ZOOM_MIN … 避免每秒 open 缺失 ready 刷屏
 static uint16_t s_readyMask = 0;
@@ -102,6 +103,39 @@ static void scrubTemp(int zoom) {
   LittleFS.rmdir(dir);
 }
 
+/** 只清临时瓦片目录/meta，保留已 commit 的 rgb565 + ready（回收失败造片残留）。 */
+static void scrubTempDirKeepReady(int zoom) {
+  char path[40];
+  metaPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  char dir[32];
+  dirPath(zoom, dir, sizeof(dir));
+  File d = LittleFS.open(dir);
+  if (d && d.isDirectory()) {
+    File f = d.openNextFile();
+    while (f) {
+      char child[64];
+      snprintf(child, sizeof(child), "%s/%s", dir, f.name());
+      f.close();
+      LittleFS.remove(child);
+      f = d.openNextFile();
+    }
+  }
+  if (d) {
+    d.close();
+  }
+  LittleFS.rmdir(dir);
+}
+
+void frameCacheScrubOrphans() {
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    scrubTempDirKeepReady(z);
+  }
+  Serial.printf("LittleFS scrub orphans used=%u total=%u\n",
+                (unsigned)LittleFS.usedBytes(),
+                (unsigned)LittleFS.totalBytes());
+}
+
 bool frameCacheBegin() {
   s_readyMask = 0;
   if (LittleFS.begin(false)) {
@@ -140,6 +174,9 @@ bool frameCacheBegin() {
       gw.close();
     }
   }
+
+  // 回收失败造片残留的 png/raw/alpha，避免 LittleFS 撑满导致无法 commit
+  frameCacheScrubOrphans();
 
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
     char rpath[40];
@@ -398,6 +435,29 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
   return true;
 }
 
+static inline int expand5(int v) { return (v << 3) | (v >> 2); }
+static inline int expand6(int v) { return (v << 2) | (v >> 4); }
+
+static inline uint16_t pack565(int r8, int g8, int b8) {
+  if (r8 < 0) {
+    r8 = 0;
+  } else if (r8 > 255) {
+    r8 = 255;
+  }
+  if (g8 < 0) {
+    g8 = 0;
+  } else if (g8 > 255) {
+    g8 = 255;
+  }
+  if (b8 < 0) {
+    b8 = 0;
+  } else if (b8 > 255) {
+    b8 = 255;
+  }
+  return (uint16_t)(((r8 & 0xF8) << 8) | ((g8 & 0xFC) << 3) | (b8 >> 3));
+}
+
+/** 8-bit 域 alpha 混合，避免 RGB565 绿通道偏多造成发绿。 */
 static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
   if (a == 0) {
     return dst;
@@ -406,12 +466,28 @@ static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
     return src;
   }
   const int inv = 255 - a;
-  const int r =
-      (((src >> 11) & 0x1F) * a + ((dst >> 11) & 0x1F) * inv + 127) / 255;
-  const int g =
-      (((src >> 5) & 0x3F) * a + ((dst >> 5) & 0x3F) * inv + 127) / 255;
-  const int b = ((src & 0x1F) * a + (dst & 0x1F) * inv + 127) / 255;
-  return (uint16_t)((r << 11) | (g << 5) | b);
+  const int r = (expand5((src >> 11) & 0x1F) * a +
+                 expand5((dst >> 11) & 0x1F) * inv + 127) /
+                255;
+  const int g = (expand6((src >> 5) & 0x3F) * a +
+                 expand6((dst >> 5) & 0x3F) * inv + 127) /
+                255;
+  const int b =
+      (expand5(src & 0x1F) * a + expand5(dst & 0x1F) * inv + 127) / 255;
+  return pack565(r, g, b);
+}
+
+/** 对齐 DesktopRadar prepare_basemap_tile：tile×t + backdrop×(1-t)，在 8-bit 计算。 */
+static inline uint16_t darkenBasemap565(uint16_t pix) {
+  const float t = BASEMAP_BLEND;
+  const float u = 1.0f - t;
+  const int r = (int)lroundf(expand5((pix >> 11) & 0x1F) * t +
+                             (float)BASEMAP_BACKDROP_R * u);
+  const int g = (int)lroundf(expand6((pix >> 5) & 0x3F) * t +
+                             (float)BASEMAP_BACKDROP_G * u);
+  const int b =
+      (int)lroundf(expand5(pix & 0x1F) * t + (float)BASEMAP_BACKDROP_B * u);
+  return pack565(r, g, b);
 }
 
 bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
@@ -494,14 +570,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
           }
           dst[x] = pix;
         } else {
-          const float t = BASEMAP_BLEND;
-          const uint16_t bg = dst[x];
-          const int r =
-              (int)lroundf(((pix >> 11) & 0x1F) * t + ((bg >> 11) & 0x1F) * (1 - t));
-          const int g =
-              (int)lroundf(((pix >> 5) & 0x3F) * t + ((bg >> 5) & 0x3F) * (1 - t));
-          const int b = (int)lroundf((pix & 0x1F) * t + (bg & 0x1F) * (1 - t));
-          dst[x] = (uint16_t)((r << 11) | (g << 5) | b);
+          dst[x] = darkenBasemap565(pix);
         }
       }
     }
@@ -755,6 +824,27 @@ bool frameCacheStampTile(int zoom, const uint16_t* tile256, int pasteX,
   return true;
 }
 
+// DesktopRadar draw_overlay 红点 (255, 60, 60)
+static inline uint16_t crosshairRed565() {
+  return (uint16_t)(((255 & 0xF8) << 8) | ((60 & 0xFC) << 3) | (60 >> 3));
+}
+
+static void fillCrosshairDotBuf(uint16_t* frame, int cx, int cy,
+                                uint16_t red) {
+  for (int dy = -3; dy <= 3; ++dy) {
+    for (int dx = -3; dx <= 3; ++dx) {
+      if (dx * dx + dy * dy > 9) {
+        continue;
+      }
+      const int x = cx + dx;
+      const int y = cy + dy;
+      if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
+        frame[y * LCD_WIDTH + x] = red;
+      }
+    }
+  }
+}
+
 void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color) {
   if (!frame) {
     return;
@@ -771,6 +861,7 @@ void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color) {
       frame[y * LCD_WIDTH + cx] = color;
     }
   }
+  fillCrosshairDotBuf(frame, cx, cy, crosshairRed565());
 }
 
 bool frameCacheDrawCrosshair(int zoom, uint16_t color) {
@@ -810,9 +901,64 @@ bool frameCacheDrawCrosshair(int zoom, uint16_t color) {
     f.seek((size_t)y * FRAME_ROW_BYTES + (size_t)cx * 2);
     f.write(reinterpret_cast<uint8_t*>(&color), 2);
   }
+
+  // 中心红点（叠在十字之上）
+  const uint16_t red = crosshairRed565();
+  for (int dy = -3; dy <= 3; ++dy) {
+    for (int dx = -3; dx <= 3; ++dx) {
+      if (dx * dx + dy * dy > 9) {
+        continue;
+      }
+      const int x = cx + dx;
+      const int y = cy + dy;
+      if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) {
+        continue;
+      }
+      if (!f.seek((size_t)y * FRAME_ROW_BYTES + (size_t)x * 2)) {
+        f.close();
+        return false;
+      }
+      if (f.write(reinterpret_cast<const uint8_t*>(&red), 2) != 2) {
+        f.close();
+        return false;
+      }
+    }
+  }
+
   f.flush();
   f.close();
   return true;
+}
+
+void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
+  if (!frame) {
+    return;
+  }
+
+  static const char* kWday[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  char label[16];
+  if (frameTs == 0) {
+    snprintf(label, sizeof(label), "--- --:--");
+  } else {
+    const time_t local = (time_t)frameTs + (time_t)TIMEZONE_OFFSET_SEC;
+    struct tm tm{};
+    gmtime_r(&local, &tm);
+    const char* wday = (tm.tm_wday >= 0 && tm.tm_wday <= 6) ? kWday[tm.tm_wday]
+                                                            : "---";
+    snprintf(label, sizeof(label), "%s %02d:%02d", wday, tm.tm_hour, tm.tm_min);
+  }
+
+  // 复用帧缓冲，避免再堆分配 112KB sprite
+  lgfx::LGFX_Sprite spr;
+  spr.setColorDepth(16);
+  spr.setBuffer(frame, LCD_WIDTH, LCD_HEIGHT, 16);
+
+  const int barH = 24;  // Font2 ≈16 + 8
+  spr.fillRect(0, LCD_HEIGHT - barH, LCD_WIDTH, barH, TFT_BLACK);
+  spr.setFont(&fonts::Font2);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  spr.drawString(label, LCD_WIDTH / 2, LCD_HEIGHT - barH / 2);
 }
 
 bool frameCacheCommit(int zoom) {

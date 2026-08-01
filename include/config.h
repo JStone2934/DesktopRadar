@@ -30,6 +30,8 @@
 #define MAP_LAT 23.1291f
 #define MAP_LON 113.2644f
 #define MAP_ZOOM 7  // 默认档；与 DesktopRadar 默认一致
+// 雷达帧 Unix 时间 → 北京时间（UTC+8）显示
+#define TIMEZONE_OFFSET_SEC (8 * 3600)
 
 // 缩放档位（与 DesktopRadar ZOOM_MIN/MAX、步进 1 对齐）
 #define ZOOM_MIN 3
@@ -69,8 +71,8 @@
 #define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
 
-// 提升以作废「无雷达却已 ready」的旧缓存
-#define FRAME_CACHE_GEN 3
+// 提升以作废旧缓存；7=底图 8-bit 压暗纠偏绿
+#define FRAME_CACHE_GEN 7
 
 // 雷达静帧刷新间隔
 #define RADAR_REFRESH_MS (15UL * 60UL * 1000UL)

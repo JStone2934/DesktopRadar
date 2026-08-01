@@ -3,6 +3,7 @@
  */
 
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <stdio.h>
 
@@ -232,9 +233,11 @@ void loop() {
 
   if (millis() - lastBeat >= 5000) {
     lastBeat = millis();
-    Serial.printf("[%lu] heap=%u max=%u wifi=%d z=%d cached=%d\n",
+    Serial.printf("[%lu] heap=%u max=%u wifi=%d z=%d cached=%d fs=%u/%u\n",
                   millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
-                  WiFi.RSSI(), zoomCurrent(), (int)frameCacheHas(zoomCurrent()));
+                  WiFi.RSSI(), zoomCurrent(), (int)frameCacheHas(zoomCurrent()),
+                  (unsigned)LittleFS.usedBytes(),
+                  (unsigned)LittleFS.totalBytes());
   }
 
   delay(10);
