@@ -53,7 +53,6 @@
 #define BTN_SHORT_MS 800
 #define BTN_MED_MS 1500
 #define BTN_LONG_MS 10000
-#define ZOOM_LABEL_MS 1000
 
 // ---- 数据源 ----
 #define RAINVIEWER_API "https://api.rainviewer.com/public/weather-maps.json"

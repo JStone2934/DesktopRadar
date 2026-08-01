@@ -23,7 +23,6 @@ static LGFX lcd;
 static AppConfig s_cfg;
 
 static int s_displayedZoom = -1;
-static uint32_t s_labelUntil = 0;
 static uint32_t s_lastRefresh = 0;
 static bool s_busyCompose = false;
 static bool s_wifiOk = false;
@@ -82,32 +81,7 @@ static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
   return fabsf(aLat - bLat) < 1e-5f && fabsf(aLon - bLon) < 1e-5f;
 }
 
-static void overlayZoomLabel(int zoom, const char* note = nullptr) {
-  char buf[24];
-  if (note && note[0]) {
-    snprintf(buf, sizeof(buf), "z%d %s", zoom, note);
-  } else {
-    snprintf(buf, sizeof(buf), "z%d", zoom);
-  }
-  lcd.setTextDatum(TC_DATUM);
-  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setFont(&fonts::Font4);
-  lcd.drawString(buf, LCD_WIDTH / 2, 18);
-  s_labelUntil = millis() + ZOOM_LABEL_MS;
-}
-
-static void clearLabelIfDue() {
-  if (s_labelUntil == 0 || millis() < s_labelUntil) {
-    return;
-  }
-  s_labelUntil = 0;
-  if (s_displayedZoom >= 0 && frameCacheHas(s_displayedZoom)) {
-    frameCacheBlit(&lcd, s_displayedZoom);
-    refreshProgressRing();
-  }
-}
-
-static bool showCached(int zoom, bool withLabel) {
+static bool showCached(int zoom) {
   const uint32_t t0 = millis();
   if (!frameCacheBlit(&lcd, zoom)) {
     return false;
@@ -115,20 +89,17 @@ static bool showCached(int zoom, bool withLabel) {
   Serial.printf("blit z%d %lums\n", zoom, (unsigned long)(millis() - t0));
   s_displayedZoom = zoom;
   s_statusScreen = false;
-  if (withLabel) {
-    overlayZoomLabel(zoom);
-  }
   refreshProgressRing();
   return true;
 }
 
-/** 造片阻塞中短按：已缓存则立刻秒切，否则先打档位标签，避免“按了没反应”。 */
+/** 造片阻塞中短按：已缓存则立刻秒切。 */
 static void onPendingZoomFeedback(int zoom) {
   if (frameCacheHas(zoom)) {
-    showCached(zoom, true);
+    showCached(zoom);
     return;
   }
-  overlayZoomLabel(zoom, "...");
+  // 未缓存：保持当前画面，仅靠进度环反映全局缓存
   refreshProgressRing();
 }
 
@@ -171,8 +142,6 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   if (pushToDisplay) {
     s_displayedZoom = zoom;
     s_statusScreen = false;
-    // compose 已 pushImage；叠档位标签后再画剩余圆环
-    overlayZoomLabel(zoom);
   }
   refreshProgressRing();
   return true;
@@ -182,7 +151,7 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
   zoomSetCurrent(zoom);
 
   if (frameCacheHas(zoom)) {
-    showCached(zoom, userInitiated);
+    showCached(zoom);
     zoomPrefetchResetAround(zoom);
     return;
   }
@@ -331,8 +300,6 @@ void loop() {
     delay(50);
     return;
   }
-
-  clearLabelIfDue();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiConnect(&s_cfg)) {
