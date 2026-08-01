@@ -3,8 +3,8 @@
 #include "LGFX_GC9A01.hpp"
 
 /**
- * 下载底图+雷达：直绘 LCD（pushToDisplay）和/或写入瓦片 PNG 缓存。
- * 不占用 112KB 帧缓冲，避免挤爆 PNG/TLS 堆。
+ * 两阶段造片：HTTPS 瓦片落盘 → 烘焙 RGB565 成品。
+ * pushToDisplay 时烘焙后行刷上屏。
  */
 bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                        bool pushToDisplay);

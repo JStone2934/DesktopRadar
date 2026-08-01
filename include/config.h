@@ -34,7 +34,7 @@
 // 缩放档位（与 DesktopRadar ZOOM_MIN/MAX、步进 1 对齐）
 #define ZOOM_MIN 3
 #define ZOOM_MAX 12
-// RainViewer 免费档原生雷达瓦片上限；更高档上采样后置
+// RainViewer 免费档原生雷达瓦片上限；更高档对 z7 瓦片上采样绘制
 #define RAINVIEWER_MAX_ZOOM 7
 
 #define TILE_SIZE 256
@@ -42,8 +42,9 @@
 
 // ---- BOOT 按键（GPIO9）----
 #define PIN_BTN_BOOT 9
-#define BTN_SHORT_MS 400
-#define BTN_MED_MS 800
+// 短按：按下时长小于此值（放宽，避免轻按无响应）
+#define BTN_SHORT_MS 800
+#define BTN_MED_MS 1500
 #define BTN_LONG_MS 10000
 #define ZOOM_LABEL_MS 1000
 
@@ -63,7 +64,13 @@
 #define HTTP_TIMEOUT_MS 15000
 #define TILE_TIMEOUT_MS 10000
 #define HTTP_MAX_JSON_BYTES (32 * 1024)
-#define HTTP_MAX_TILE_BYTES (40 * 1024)
+#define HTTP_MAX_TILE_BYTES (96 * 1024)
+
+#define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
+#define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
+
+// 提升以作废「无雷达却已 ready」的旧缓存
+#define FRAME_CACHE_GEN 2
 
 // 雷达静帧刷新间隔
 #define RADAR_REFRESH_MS (15UL * 60UL * 1000UL)

@@ -3,31 +3,68 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <FS.h>
+
 #include "LGFX_GC9A01.hpp"
 #include "config.h"
 #include "mercator.h"
 
-/** 挂载 LittleFS；失败时 format 后再挂。 */
 bool frameCacheBegin();
 
-/** 该 zoom 是否有完整瓦片缓存（ready 标记）。 */
+/** 成品 RGB565 已就绪（ready + 长度校验）。 */
 bool frameCacheHas(int zoom);
 
-/** 从瓦片 PNG 缓存重绘到 lcd（无 HTTPS）。 */
-bool frameCacheDraw(LGFX* lcd, int zoom);
+/** 行刷 RGB565 到 LCD（秒切）。 */
+bool frameCacheBlit(LGFX* lcd, int zoom);
 
-/** 删除该档缓存。 */
 bool frameCacheRemove(int zoom);
 
-/** 造片前：清空并准备 /frames/zNN/ */
+/** 造片前：清空该档临时瓦片与旧成品。 */
 bool frameCachePrepare(int zoom);
 
-/** 保存单张瓦片 PNG。 */
 bool frameCacheSaveTile(int zoom, bool isRadar, int tx, int ty,
                         const uint8_t* data, size_t len);
 
-/** 写入视口元数据。 */
-bool frameCacheWriteMeta(int zoom, const Viewport& vp, bool haveRadar);
+/** 流式下载目标路径。 */
+void frameCacheTilePath(int zoom, bool isRadar, int tx, int ty, char* out,
+                        size_t outLen);
 
-/** 写入 ready 标记，使 frameCacheHas 为真。 */
+bool frameCacheWriteMeta(int zoom, const Viewport& vp, bool haveRadar,
+                         int overlayZoom, int scale, int rtx0, int rty0,
+                         int rtx1, int rty1);
+
+bool frameCacheReadMeta(int zoom, Viewport* vp, bool* haveRadar,
+                        int* overlayZoom, int* scale, int* rtx0, int* rty0,
+                        int* rtx1, int* rty1);
+
+/** 创建 backdrop 填充的 rgb565 成品文件（尚未 ready）。 */
+bool frameCacheCreateRgb565(int zoom, uint16_t backdropColor);
+
+/** 将内存中的 240×240 RGB565 写入成品文件。 */
+bool frameCacheWriteRgb565(int zoom, const uint16_t* frame);
+
+/**
+ * 从 256×256 RGB565 raw 文件贴入内存帧（scale=1 拷贝；scale>1 双线性）。
+ * paste 为瓦片左上角相对 LCD 的像素坐标（可为负）。
+ */
+bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX,
+                                int pasteY, int scale, bool alphaKey);
+
+/**
+ * 将 256×256 RGB565 瓦片写入成品文件（慢，仅兼容保留）。
+ */
+bool frameCacheStampTile(int zoom, const uint16_t* tile256, int pasteX,
+                         int pasteY, int scale, bool alphaKey);
+
+/** 在内存帧上画十字准星。 */
+void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color);
+
+/** 在成品文件上画十字准星。 */
+bool frameCacheDrawCrosshair(int zoom, uint16_t color);
+
+/** 校验长度后写 ready；并删除临时 PNG/meta。 */
 bool frameCacheCommit(int zoom);
+
+/** 打开临时瓦片供下载写入。 */
+bool frameCacheOpenTileWrite(int zoom, bool isRadar, int tx, int ty,
+                             fs::File* out);

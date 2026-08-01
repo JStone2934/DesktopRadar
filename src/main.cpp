@@ -1,5 +1,5 @@
 /**
- * ESP32-C3 桌面气象雷达 — 静帧多档缩放 + 瓦片 PNG 缓存
+ * ESP32-C3 桌面气象雷达 — RGB565 全档缓存 + 秒切
  */
 
 #include <Arduino.h>
@@ -53,14 +53,16 @@ static void clearLabelIfDue() {
   }
   s_labelUntil = 0;
   if (s_displayedZoom >= 0 && frameCacheHas(s_displayedZoom)) {
-    frameCacheDraw(&lcd, s_displayedZoom);
+    frameCacheBlit(&lcd, s_displayedZoom);
   }
 }
 
 static bool showCached(int zoom, bool withLabel) {
-  if (!frameCacheDraw(&lcd, zoom)) {
+  const uint32_t t0 = millis();
+  if (!frameCacheBlit(&lcd, zoom)) {
     return false;
   }
+  Serial.printf("blit z%d %lums\n", zoom, (unsigned long)(millis() - t0));
   s_displayedZoom = zoom;
   if (withLabel) {
     overlayZoomLabel(zoom);
@@ -80,7 +82,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     snprintf(line2, sizeof(line2), "zoom %d", zoom);
     showStatus("Fetching...", line2);
   } else {
-    Serial.printf("prefetch tiles z%d (no display)\n", zoom);
+    Serial.printf("prefetch bake z%d (no display)\n", zoom);
   }
 
   const bool ok = composeRadarFrame(&lcd, MAP_LAT, MAP_LON, zoom, pushToDisplay);
@@ -108,15 +110,6 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
   if (frameCacheHas(zoom)) {
     showCached(zoom, userInitiated);
     zoomPrefetchResetAround(zoom);
-    return;
-  }
-
-  if (!zoomCanCompose(zoom)) {
-    if (s_displayedZoom >= 0 && frameCacheHas(s_displayedZoom)) {
-      showCached(s_displayedZoom, false);
-    }
-    overlayZoomLabel(zoom, "soon");
-    Serial.printf("z%d upsample deferred\n", zoom);
     return;
   }
 
@@ -153,6 +146,10 @@ static void handleShortPress() {
 }
 
 static void pumpPrefetch() {
+  if (zoomHasPending()) {
+    handlePendingZoom();
+    return;
+  }
   if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
     return;
   }
@@ -171,7 +168,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("ESP32-C3 Radar multi-zoom (tile cache)");
+  Serial.println("ESP32-C3 Radar RGB565 instant zoom");
 
   lcd.init();
   lcd.setRotation(0);

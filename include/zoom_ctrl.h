@@ -10,10 +10,10 @@ void zoomSetCurrent(int zoom);
 /** 循环 +1（ZOOM_MIN..ZOOM_MAX）。 */
 int zoomCycleNext();
 
-/** 是否可在本轮造片（z <= RAINVIEWER_MAX_ZOOM）。 */
+/** 是否可造片（z3–12；z>7 雷达上采样）。 */
 bool zoomCanCompose(int zoom);
 
-/** 清空并按距离排队入队全部可造片档（z3–RAINVIEWER_MAX_ZOOM）：当前档优先，再 ±1、±2… */
+/** 清空并按距离排队入队全部档（z3–12）：当前档优先，再 ±1、±2… */
 void zoomPrefetchResetAround(int centerZoom);
 
 /** 取出下一个预取目标；无则返回 false。 */
@@ -31,3 +31,9 @@ bool composeAbortRequested();
 void zoomSetPending(int zoom);
 int zoomTakePending();
 bool zoomHasPending();
+
+/**
+ * 阻塞操作期间调用：轮询 BOOT 短按 → 记 pending 并请求 abort。
+ * HTTP / 造片长循环里应频繁调用。
+ */
+void inputServiceDuringBlock();

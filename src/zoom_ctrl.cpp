@@ -1,11 +1,11 @@
 #include "zoom_ctrl.h"
 
+#include "button.h"
 #include "config.h"
 #include "frame_cache.h"
 
 static int s_zoom = MAP_ZOOM;
-// 可造片档最多 RAINVIEWER_MAX_ZOOM - ZOOM_MIN + 1（当前为 5）
-static int s_prefetchQ[8];
+static int s_prefetchQ[ZOOM_MAX - ZOOM_MIN + 1];
 static int s_prefetchLen = 0;
 static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
@@ -32,7 +32,7 @@ int zoomCycleNext() {
 }
 
 bool zoomCanCompose(int zoom) {
-  return zoom >= ZOOM_MIN && zoom <= RAINVIEWER_MAX_ZOOM;
+  return zoom >= ZOOM_MIN && zoom <= ZOOM_MAX;
 }
 
 void zoomPrefetchClear() { s_prefetchLen = 0; }
@@ -54,9 +54,9 @@ static void enqueueUnique(int zoom) {
 
 void zoomPrefetchResetAround(int centerZoom) {
   s_prefetchLen = 0;
-  // 与 DesktopRadar zoom_priority_order 一致：center, ±1, ±2…
+  // DesktopRadar zoom_priority_order：center, ±1, ±2… 铺满 z3–12
   enqueueUnique(centerZoom);
-  const int maxDelta = RAINVIEWER_MAX_ZOOM - ZOOM_MIN;
+  const int maxDelta = ZOOM_MAX - ZOOM_MIN;
   for (int delta = 1; delta <= maxDelta; ++delta) {
     enqueueUnique(centerZoom - delta);
     enqueueUnique(centerZoom + delta);
@@ -91,3 +91,14 @@ int zoomTakePending() {
 }
 
 bool zoomHasPending() { return s_pendingZoom >= 0; }
+
+void inputServiceDuringBlock() {
+  const ButtonEvent ev = buttonPoll();
+  if (ev != ButtonEvent::ShortPress) {
+    return;
+  }
+  const int next = zoomCycleNext();
+  zoomSetPending(next);
+  composeRequestAbort();
+  Serial.printf("input: short press -> pending z%d (abort)\n", next);
+}

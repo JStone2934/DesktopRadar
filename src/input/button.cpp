@@ -39,17 +39,15 @@ ButtonEvent buttonPoll() {
   if (!pressed && s_down) {
     s_down = false;
     const uint32_t held = now - s_downAt;
-    if (held < BTN_SHORT_MS) {
+    // 小于长按阈值一律当短按切档（避免 0.4–0.8s 死区无响应）
+    if (held < BTN_LONG_MS) {
+      if (held >= BTN_MED_MS) {
+        // 仍回报 ShortPress，保证切档；Med 骨架暂不单独占用
+        return ButtonEvent::ShortPress;
+      }
       return ButtonEvent::ShortPress;
     }
-    if (held >= BTN_LONG_MS) {
-      return ButtonEvent::LongPress;
-    }
-    if (held >= BTN_MED_MS) {
-      return ButtonEvent::MedPress;
-    }
-    // 0.4s～0.8s：本轮忽略
-    return ButtonEvent::None;
+    return ButtonEvent::LongPress;
   }
 
   return ButtonEvent::None;

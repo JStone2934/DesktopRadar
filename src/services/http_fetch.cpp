@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "zoom_ctrl.h"
+
 static bool httpSetup(HTTPClient& http, WiFiClientSecure& client, const char* url,
                       const char* referer, uint32_t timeoutMs) {
   client.setInsecure();
@@ -80,6 +82,13 @@ uint8_t* httpFetch(const char* url, const char* referer, size_t maxBytes,
   const uint32_t deadline = millis() + timeoutMs;
   uint8_t tmp[512];
   while (millis() <= deadline) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      free(buf);
+      http.end();
+      client.stop();
+      return nullptr;
+    }
     size_t avail = stream->available();
     if (!avail) {
       if (contentLen > 0 && total >= (size_t)contentLen) {
@@ -188,21 +197,32 @@ bool httpFetchToFile(const char* url, const char* referer, fs::File& out,
 
   size_t total = 0;
   const uint32_t deadline = millis() + timeoutMs;
+  uint32_t lastDataMs = millis();
   uint8_t tmp[512];
   while (millis() <= deadline) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      http.end();
+      client.stop();
+      return false;
+    }
     size_t avail = stream->available();
     if (!avail) {
       if (contentLen > 0 && total >= (size_t)contentLen) {
         break;
       }
-      if (!http.connected()) {
-        delay(10);
-        if (!stream->available()) {
+      // 无 Content-Length 时：断开且静默一段时间才结束，避免截断 PNG
+      const bool quiet = (millis() - lastDataMs) > 300;
+      if (!http.connected() && quiet) {
+        break;
+      }
+      if (quiet && contentLen <= 0 && total > 8) {
+        // 仍连接但长时间无数据：视为结束
+        if (!http.connected() || (millis() - lastDataMs) > 800) {
           break;
         }
-        continue;
       }
-      delay(2);
+      delay(5);
       continue;
     }
     if (avail > sizeof(tmp)) {
@@ -210,9 +230,15 @@ bool httpFetchToFile(const char* url, const char* referer, fs::File& out,
     }
     const int n = stream->readBytes(tmp, avail);
     if (n <= 0) {
-      break;
+      if ((millis() - lastDataMs) > 300) {
+        break;
+      }
+      delay(5);
+      continue;
     }
+    lastDataMs = millis();
     if (total + (size_t)n > maxBytes) {
+      Serial.printf("HTTP exceed max %u\n", (unsigned)maxBytes);
       http.end();
       client.stop();
       return false;
