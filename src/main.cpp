@@ -1,26 +1,31 @@
 /**
- * ESP32-C3 桌面气象雷达 — RGB565 全档缓存 + 秒切
+ * ESP32-C3 桌面气象雷达 — SoftAP 配网 + RGB565 全档缓存
  */
 
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <math.h>
 #include <stdio.h>
 
 #include "LGFX_GC9A01.hpp"
+#include "app_config.h"
 #include "button.h"
 #include "compose.h"
 #include "config.h"
+#include "config_portal.h"
 #include "frame_cache.h"
 #include "wifi_sta.h"
 #include "zoom_ctrl.h"
 
 static LGFX lcd;
+static AppConfig s_cfg;
 
 static int s_displayedZoom = -1;
 static uint32_t s_labelUntil = 0;
 static uint32_t s_lastRefresh = 0;
 static bool s_busyCompose = false;
+static bool s_wifiOk = false;
 
 static void showStatus(const char* line1, const char* line2 = nullptr) {
   lcd.fillScreen(TFT_BLACK);
@@ -32,6 +37,18 @@ static void showStatus(const char* line1, const char* line2 = nullptr) {
     lcd.setFont(&fonts::Font2);
     lcd.drawString(line2, LCD_WIDTH / 2, LCD_HEIGHT / 2 + 16);
   }
+}
+
+static void clearAllFrameCaches() {
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
+    frameCacheRemove(z);
+  }
+  s_displayedZoom = -1;
+  Serial.println("frame caches cleared (location change)");
+}
+
+static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
+  return fabsf(aLat - bLat) < 1e-5f && fabsf(aLon - bLon) < 1e-5f;
 }
 
 static void overlayZoomLabel(int zoom, const char* note = nullptr) {
@@ -86,7 +103,8 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     Serial.printf("prefetch bake z%d (no display)\n", zoom);
   }
 
-  const bool ok = composeRadarFrame(&lcd, MAP_LAT, MAP_LON, zoom, pushToDisplay);
+  const bool ok =
+      composeRadarFrame(&lcd, s_cfg.lat, s_cfg.lon, zoom, pushToDisplay);
   s_busyCompose = false;
 
   if (!ok) {
@@ -165,11 +183,53 @@ static void pumpPrefetch() {
   handlePendingZoom();
 }
 
+static bool tryWifiAndRadar() {
+  showStatus("Connecting...", s_cfg.ssid);
+  s_wifiOk = wifiConnect(s_cfg);
+  if (!s_wifiOk) {
+    showStatus("WiFi fail", s_cfg.ssid);
+    Serial.println("hold BOOT 10s to re-open setup");
+    return false;
+  }
+
+  char ipBuf[24];
+  snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
+  showStatus("WiFi OK", ipBuf);
+  delay(600);
+
+  ensureZoomVisible(zoomCurrent(), true);
+  s_lastRefresh = millis();
+  return true;
+}
+
+/** 跑门户；按结果更新 s_cfg，必要时清缓存并重连。 */
+static void runPortalAndApply() {
+  composeRequestAbort();
+  zoomPrefetchClear();
+  s_busyCompose = false;
+
+  const float oldLat = s_cfg.lat;
+  const float oldLon = s_cfg.lon;
+
+  const PortalResult pr =
+      configPortalRun(&lcd, CONFIG_PORTAL_TIMEOUT_MS, &s_cfg);
+
+  Serial.printf("portal result=%u ssid=%s\n", (unsigned)pr, s_cfg.ssid);
+
+  if (pr == PortalResult::Saved) {
+    if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
+      clearAllFrameCaches();
+    }
+  }
+
+  tryWifiAndRadar();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("ESP32-C3 Radar RGB565 instant zoom");
+  Serial.println("ESP32-C3 Radar SoftAP config + RGB565 zoom");
 
   lcd.init();
   lcd.setRotation(0);
@@ -183,33 +243,36 @@ void setup() {
     showStatus("FS fail", "no cache");
   }
 
-  showStatus("Connecting...", WIFI_SSID);
-  if (!wifiConnect()) {
-    showStatus("WiFi fail", WIFI_SSID);
-    return;
-  }
-
-  char ipBuf[24];
-  snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
-  showStatus("WiFi OK", ipBuf);
-  delay(600);
-
-  ensureZoomVisible(zoomCurrent(), true);
-  s_lastRefresh = millis();
+  // 上电 / RST：先进配置门户
+  runPortalAndApply();
 }
 
 void loop() {
   static uint32_t lastBeat = 0;
 
   const ButtonEvent ev = buttonPoll();
+  if (ev == ButtonEvent::LongPress) {
+    Serial.println("long press -> config portal");
+    showStatus("Setup...", "hold release ok");
+    delay(200);
+    runPortalAndApply();
+    return;
+  }
   if (ev == ButtonEvent::ShortPress) {
-    handleShortPress();
+    if (s_wifiOk) {
+      handleShortPress();
+    }
+  }
+
+  if (!s_wifiOk) {
+    delay(50);
+    return;
   }
 
   clearLabelIfDue();
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (wifiConnect()) {
+    if (wifiConnect(s_cfg)) {
       ensureZoomVisible(zoomCurrent(), true);
       s_lastRefresh = millis();
     }

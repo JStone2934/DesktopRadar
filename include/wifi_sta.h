@@ -1,6 +1,9 @@
 #pragma once
 
-#include <Arduino.h>
+#include "app_config.h"
 
-/** 使用 config.h 中的 WIFI_SSID/WIFI_PASS 连接 STA。成功返回 true。 */
-bool wifiConnect();
+/** 按 AppConfig 连接 STA（PSK 或 PEAP）。成功返回 true。 */
+bool wifiConnect(const AppConfig& cfg);
+
+/** 断开 STA / 企业认证状态，便于再进 SoftAP。 */
+void wifiDisconnectClean();

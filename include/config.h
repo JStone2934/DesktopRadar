@@ -21,10 +21,15 @@
 // 杜邦线/飞线先用较低速率；稳定后再提到 40M
 #define SPI_FREQ_WRITE 20000000
 
-// ---- WiFi（本阶段硬编码；Web 配网后置）----
+// ---- WiFi 默认（NVS 未保存时回退；Web 配网写入 Preferences）----
 #define WIFI_SSID "GL-AXT1800-c11"
 #define WIFI_PASS "T3Y8NHYDK9"
 #define WIFI_CONNECT_TIMEOUT_MS 30000
+
+// SoftAP 配置门户
+#define SOFTAP_SSID "Radar-Setup"
+#define CONFIG_PORTAL_URL "http://192.168.4.1"
+#define CONFIG_PORTAL_TIMEOUT_MS 60000
 
 // ---- 地图中心：广州市区 ----
 #define MAP_LAT 23.1291f

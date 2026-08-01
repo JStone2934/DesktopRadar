@@ -5,3 +5,5 @@
 .vscode/ipch
 *.pyc
 __pycache__/
+serial_*.txt
+serial_btn.txt
