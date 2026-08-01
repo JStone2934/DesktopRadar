@@ -29,10 +29,23 @@
 // ---- 地图中心：广州市区 ----
 #define MAP_LAT 23.1291f
 #define MAP_LON 113.2644f
-#define MAP_ZOOM 7
+#define MAP_ZOOM 7  // 默认档；与 DesktopRadar 默认一致
+
+// 缩放档位（与 DesktopRadar ZOOM_MIN/MAX、步进 1 对齐）
+#define ZOOM_MIN 3
+#define ZOOM_MAX 12
+// RainViewer 免费档原生雷达瓦片上限；更高档上采样后置
+#define RAINVIEWER_MAX_ZOOM 7
 
 #define TILE_SIZE 256
 #define VIEW_HALF (LCD_WIDTH / 2)
+
+// ---- BOOT 按键（GPIO9）----
+#define PIN_BTN_BOOT 9
+#define BTN_SHORT_MS 400
+#define BTN_MED_MS 800
+#define BTN_LONG_MS 10000
+#define ZOOM_LABEL_MS 1000
 
 // ---- 数据源 ----
 #define RAINVIEWER_API "https://api.rainviewer.com/public/weather-maps.json"
