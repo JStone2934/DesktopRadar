@@ -70,7 +70,7 @@
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
 
 // 提升以作废「无雷达却已 ready」的旧缓存
-#define FRAME_CACHE_GEN 2
+#define FRAME_CACHE_GEN 3
 
 // 雷达静帧刷新间隔
 #define RADAR_REFRESH_MS (15UL * 60UL * 1000UL)

@@ -44,11 +44,12 @@ bool frameCacheCreateRgb565(int zoom, uint16_t backdropColor);
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame);
 
 /**
- * 从 256×256 RGB565 raw 文件贴入内存帧（scale=1 拷贝；scale>1 双线性）。
- * paste 为瓦片左上角相对 LCD 的像素坐标（可为负）。
+ * 从 256×256 RGB565 raw（及可选 alpha）贴入内存帧。
+ * alphaPath 非空时按 0–255 alpha 与底图混合（消除雷达黑边）；否则 alphaKey 仅跳过 0。
  */
-bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX,
-                                int pasteY, int scale, bool alphaKey);
+bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
+                                const char* alphaPath, int pasteX, int pasteY,
+                                int scale, bool alphaKey);
 
 /**
  * 将 256×256 RGB565 瓦片写入成品文件（慢，仅兼容保留）。

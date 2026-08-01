@@ -398,8 +398,25 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
   return true;
 }
 
-bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX,
-                                int pasteY, int scale, bool alphaKey) {
+static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
+  if (a == 0) {
+    return dst;
+  }
+  if (a == 255) {
+    return src;
+  }
+  const int inv = 255 - a;
+  const int r =
+      (((src >> 11) & 0x1F) * a + ((dst >> 11) & 0x1F) * inv + 127) / 255;
+  const int g =
+      (((src >> 5) & 0x3F) * a + ((dst >> 5) & 0x3F) * inv + 127) / 255;
+  const int b = ((src & 0x1F) * a + (dst & 0x1F) * inv + 127) / 255;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
+                                const char* alphaPath, int pasteX, int pasteY,
+                                int scale, bool alphaKey) {
   if (!frame || !rawPath || scale < 1) {
     return false;
   }
@@ -410,11 +427,25 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
     }
     return false;
   }
+  File alpha;
+  const bool useAlpha = alphaPath && alphaPath[0];
+  if (useAlpha) {
+    alpha = LittleFS.open(alphaPath, "r");
+    if (!alpha || alpha.size() != (size_t)TILE_SIZE * TILE_SIZE) {
+      if (alpha) {
+        alpha.close();
+      }
+      raw.close();
+      return false;
+    }
+  }
 
   const int outW = TILE_SIZE * scale;
   const int outH = TILE_SIZE * scale;
   uint16_t row0[TILE_SIZE];
   uint16_t row1[TILE_SIZE];
+  uint8_t a0[TILE_SIZE];
+  uint8_t a1[TILE_SIZE];
 
   if (scale == 1) {
     for (int dy = 0; dy < TILE_SIZE; ++dy) {
@@ -422,6 +453,14 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
       if (y < 0 || y >= LCD_HEIGHT) {
         if (!raw.seek((size_t)(dy + 1) * TILE_SIZE * 2)) {
           raw.close();
+          if (useAlpha) {
+            alpha.close();
+          }
+          return false;
+        }
+        if (useAlpha && !alpha.seek((size_t)(dy + 1) * TILE_SIZE)) {
+          raw.close();
+          alpha.close();
           return false;
         }
         continue;
@@ -429,6 +468,15 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
       if (raw.read(reinterpret_cast<uint8_t*>(row0), TILE_SIZE * 2) !=
           (int)(TILE_SIZE * 2)) {
         raw.close();
+        if (useAlpha) {
+          alpha.close();
+        }
+        return false;
+      }
+      if (useAlpha &&
+          alpha.read(a0, TILE_SIZE) != (int)TILE_SIZE) {
+        raw.close();
+        alpha.close();
         return false;
       }
       uint16_t* dst = frame + y * LCD_WIDTH;
@@ -438,13 +486,14 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
           continue;
         }
         const uint16_t pix = row0[dx];
-        if (alphaKey) {
+        if (useAlpha) {
+          dst[x] = blend565(pix, dst[x], a0[dx]);
+        } else if (alphaKey) {
           if (pix == 0) {
             continue;
           }
           dst[x] = pix;
         } else {
-          // 底图压暗：tile * blend + 已有 backdrop * (1-blend)
           const float t = BASEMAP_BLEND;
           const uint16_t bg = dst[x];
           const int r =
@@ -457,9 +506,13 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
       }
     }
     raw.close();
+    if (useAlpha) {
+      alpha.close();
+    }
     return true;
   }
 
+  // scale>=2：预乘 alpha 双线性，避免透明邻域拉出黑边
   int cachedY0 = -2;
   int cachedY1 = -2;
   for (int dy = 0; dy < outH; ++dy) {
@@ -481,16 +534,39 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
       if (raw.read(reinterpret_cast<uint8_t*>(row0), TILE_SIZE * 2) !=
           (int)(TILE_SIZE * 2)) {
         raw.close();
+        if (useAlpha) {
+          alpha.close();
+        }
         return false;
       }
       if (y1 != y0) {
         if (raw.read(reinterpret_cast<uint8_t*>(row1), TILE_SIZE * 2) !=
             (int)(TILE_SIZE * 2)) {
           raw.close();
+          if (useAlpha) {
+            alpha.close();
+          }
           return false;
         }
       } else {
         memcpy(row1, row0, sizeof(row0));
+      }
+      if (useAlpha) {
+        alpha.seek((size_t)y0 * TILE_SIZE);
+        if (alpha.read(a0, TILE_SIZE) != (int)TILE_SIZE) {
+          raw.close();
+          alpha.close();
+          return false;
+        }
+        if (y1 != y0) {
+          if (alpha.read(a1, TILE_SIZE) != (int)TILE_SIZE) {
+            raw.close();
+            alpha.close();
+            return false;
+          }
+        } else {
+          memcpy(a1, a0, sizeof(a0));
+        }
       }
       cachedY0 = y0;
       cachedY1 = y1;
@@ -512,29 +588,65 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath, int pasteX
       const int x0 = (int)floorf(sxc);
       const int x1 = x0 < TILE_SIZE - 1 ? x0 + 1 : x0;
       const float fx = sxc - x0;
-      auto lerpChan = [](int a, int b, float t) {
-        return (int)lroundf(a + (b - a) * t);
+
+      auto chan = [](uint16_t c, int shift, int mask) {
+        return (c >> shift) & mask;
       };
-      const uint16_t c00 = row0[x0];
-      const uint16_t c10 = row0[x1];
-      const uint16_t c01 = row1[x0];
-      const uint16_t c11 = row1[x1];
-      const int r = lerpChan((c00 >> 11) & 0x1F, (c10 >> 11) & 0x1F, fx);
-      const int g = lerpChan((c00 >> 5) & 0x3F, (c10 >> 5) & 0x3F, fx);
-      const int b = lerpChan(c00 & 0x1F, c10 & 0x1F, fx);
-      const int r2 = lerpChan((c01 >> 11) & 0x1F, (c11 >> 11) & 0x1F, fx);
-      const int g2 = lerpChan((c01 >> 5) & 0x3F, (c11 >> 5) & 0x3F, fx);
-      const int b2 = lerpChan(c01 & 0x1F, c11 & 0x1F, fx);
-      const uint16_t pix = (uint16_t)((lerpChan(r, r2, fy) << 11) |
-                                      (lerpChan(g, g2, fy) << 5) |
-                                      lerpChan(b, b2, fy));
-      if (alphaKey && pix == 0) {
-        continue;
+      auto lerpI = [](int a, int b, float t) {
+        return a + (int)lroundf((b - a) * t);
+      };
+
+      if (useAlpha) {
+        const int aa00 = a0[x0], aa10 = a0[x1], aa01 = a1[x0], aa11 = a1[x1];
+        // 预乘后再插值
+        const int r00 = chan(row0[x0], 11, 0x1F) * aa00;
+        const int r10 = chan(row0[x1], 11, 0x1F) * aa10;
+        const int r01 = chan(row1[x0], 11, 0x1F) * aa01;
+        const int r11 = chan(row1[x1], 11, 0x1F) * aa11;
+        const int g00 = chan(row0[x0], 5, 0x3F) * aa00;
+        const int g10 = chan(row0[x1], 5, 0x3F) * aa10;
+        const int g01 = chan(row1[x0], 5, 0x3F) * aa01;
+        const int g11 = chan(row1[x1], 5, 0x3F) * aa11;
+        const int b00 = chan(row0[x0], 0, 0x1F) * aa00;
+        const int b10 = chan(row0[x1], 0, 0x1F) * aa10;
+        const int b01 = chan(row1[x0], 0, 0x1F) * aa01;
+        const int b11 = chan(row1[x1], 0, 0x1F) * aa11;
+
+        const int ra = lerpI(lerpI(r00, r10, fx), lerpI(r01, r11, fx), fy);
+        const int ga = lerpI(lerpI(g00, g10, fx), lerpI(g01, g11, fx), fy);
+        const int ba = lerpI(lerpI(b00, b10, fx), lerpI(b01, b11, fx), fy);
+        const int aa = lerpI(lerpI(aa00, aa10, fx), lerpI(aa01, aa11, fx), fy);
+        if (aa <= 0) {
+          continue;
+        }
+        const uint16_t pix = (uint16_t)(((ra / aa) << 11) | ((ga / aa) << 5) | (ba / aa));
+        dst[x] = blend565(pix, dst[x], (uint8_t)(aa > 255 ? 255 : aa));
+      } else {
+        const uint16_t c00 = row0[x0];
+        const uint16_t c10 = row0[x1];
+        const uint16_t c01 = row1[x0];
+        const uint16_t c11 = row1[x1];
+        const int r = lerpI(lerpI(chan(c00, 11, 0x1F), chan(c10, 11, 0x1F), fx),
+                            lerpI(chan(c01, 11, 0x1F), chan(c11, 11, 0x1F), fx),
+                            fy);
+        const int g = lerpI(lerpI(chan(c00, 5, 0x3F), chan(c10, 5, 0x3F), fx),
+                            lerpI(chan(c01, 5, 0x3F), chan(c11, 5, 0x3F), fx),
+                            fy);
+        const int b = lerpI(lerpI(chan(c00, 0, 0x1F), chan(c10, 0, 0x1F), fx),
+                            lerpI(chan(c01, 0, 0x1F), chan(c11, 0, 0x1F), fx),
+                            fy);
+        const uint16_t pix = (uint16_t)((r << 11) | (g << 5) | b);
+        if (alphaKey && pix == 0) {
+          continue;
+        }
+        dst[x] = pix;
       }
-      dst[x] = pix;
     }
   }
   raw.close();
+  if (useAlpha) {
+    alpha.close();
+  }
   return true;
 }
 

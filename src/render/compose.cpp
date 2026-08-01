@@ -112,7 +112,9 @@ struct PngDecodeCtx {
   size_t len;
   size_t pos;
   File* rawOut;
+  File* alphaOut;  // 非空时同步写每像素 alpha
   uint16_t row[TILE_SIZE];
+  uint8_t alpha[TILE_SIZE];
   uint32_t lastY;
   bool rowDirty;
   bool started;
@@ -124,7 +126,6 @@ static uint32_t pngReadCb(void* user, uint8_t* buf, uint32_t len) {
   if (!ctx || !ctx->data) {
     return 0;
   }
-  // 与 LovyanGFX image_decoder_t::read_data 一致：skip 时仍返回请求长度
   if (!buf) {
     ctx->pos += len;
     return len;
@@ -141,11 +142,27 @@ static uint32_t pngReadCb(void* user, uint8_t* buf, uint32_t len) {
   return n;
 }
 
+static void pngWritePadRows(PngDecodeCtx* ctx, uint32_t count) {
+  uint16_t zrow[TILE_SIZE];
+  uint8_t za[TILE_SIZE];
+  memset(zrow, 0, sizeof(zrow));
+  memset(za, 0, sizeof(za));
+  for (uint32_t i = 0; i < count; ++i) {
+    ctx->rawOut->write(reinterpret_cast<uint8_t*>(zrow), TILE_SIZE * 2);
+    if (ctx->alphaOut) {
+      ctx->alphaOut->write(za, TILE_SIZE);
+    }
+  }
+}
+
 static void pngFlushRow(PngDecodeCtx* ctx) {
   if (!ctx->rowDirty || !ctx->rawOut) {
     return;
   }
   ctx->rawOut->write(reinterpret_cast<uint8_t*>(ctx->row), TILE_SIZE * 2);
+  if (ctx->alphaOut) {
+    ctx->alphaOut->write(ctx->alpha, TILE_SIZE);
+  }
   ctx->rowDirty = false;
 }
 
@@ -160,18 +177,23 @@ static void pngDrawCb(void* user, uint32_t x, uint32_t y, uint_fast8_t div_x,
     ctx->started = true;
     ctx->lastY = 0;
     memset(ctx->row, 0, sizeof(ctx->row));
-    // 若首行 y>0，先写空行
-    while (ctx->lastY < y && ctx->lastY < (uint32_t)TILE_SIZE) {
-      ctx->rawOut->write(reinterpret_cast<uint8_t*>(ctx->row), TILE_SIZE * 2);
-      ctx->lastY++;
+    memset(ctx->alpha, 0, sizeof(ctx->alpha));
+    if (y > 0) {
+      const uint32_t pad = y < (uint32_t)TILE_SIZE ? y : (uint32_t)TILE_SIZE;
+      pngWritePadRows(ctx, pad);
+      ctx->lastY = pad;
     }
   }
   if (y != ctx->lastY) {
     pngFlushRow(ctx);
     memset(ctx->row, 0, sizeof(ctx->row));
-    while (ctx->lastY + 1 < y && ctx->lastY + 1 < (uint32_t)TILE_SIZE) {
-      ctx->rawOut->write(reinterpret_cast<uint8_t*>(ctx->row), TILE_SIZE * 2);
-      ctx->lastY++;
+    memset(ctx->alpha, 0, sizeof(ctx->alpha));
+    if (y > ctx->lastY + 1) {
+      uint32_t gap = y - ctx->lastY - 1;
+      if (ctx->lastY + 1 + gap > (uint32_t)TILE_SIZE) {
+        gap = (uint32_t)TILE_SIZE - (ctx->lastY + 1);
+      }
+      pngWritePadRows(ctx, gap);
     }
     ctx->lastY = y;
   }
@@ -182,6 +204,7 @@ static void pngDrawCb(void* user, uint32_t x, uint32_t y, uint_fast8_t div_x,
     }
     const uint8_t* p = argb + i * 4;
     const uint8_t a = p[0];
+    ctx->alpha[px] = a;
     if (a == 0) {
       ctx->row[px] = 0;
     } else {
@@ -199,7 +222,9 @@ static void pngDrawCb(void* user, uint32_t x, uint32_t y, uint_fast8_t div_x,
   }
 }
 
-static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
+/** alphaPath 非空时额外写出 256×256 alpha（雷达半透明边缘）。 */
+static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
+                               const char* alphaPath) {
   File in = LittleFS.open(pngPath, "r");
   if (!in || in.size() < 33 || !pngPathLooksComplete(pngPath)) {
     Serial.printf("  png incomplete/missing %s sz=%u\n", pngPath,
@@ -209,7 +234,6 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
     }
     return false;
   }
-  // 重新打开（校验已关闭原 handle）
   if (in) {
     in.close();
   }
@@ -232,13 +256,28 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
     in.close();
     return false;
   }
-  in.close();  // 避免与 raw 写入并发占用 LittleFS
+  in.close();
 
   LittleFS.remove(rawPath);
+  if (alphaPath) {
+    LittleFS.remove(alphaPath);
+  }
   File raw = LittleFS.open(rawPath, "w");
   if (!raw) {
     free(pngData);
     return false;
+  }
+  File alphaFile;
+  File* alphaPtr = nullptr;
+  if (alphaPath) {
+    alphaFile = LittleFS.open(alphaPath, "w");
+    if (!alphaFile) {
+      free(pngData);
+      raw.close();
+      LittleFS.remove(rawPath);
+      return false;
+    }
+    alphaPtr = &alphaFile;
   }
 
   logHeap("pngle-before");
@@ -247,6 +286,10 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
     Serial.printf("  pngle_new fail max=%u\n", ESP.getMaxAllocHeap());
     free(pngData);
     raw.close();
+    if (alphaPtr) {
+      alphaPtr->close();
+      LittleFS.remove(alphaPath);
+    }
     return false;
   }
 
@@ -255,11 +298,13 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
   ctx.len = pngLen;
   ctx.pos = 0;
   ctx.rawOut = &raw;
+  ctx.alphaOut = alphaPtr;
   ctx.lastY = 0;
   ctx.rowDirty = false;
   ctx.started = false;
   ctx.pixels = 0;
   memset(ctx.row, 0, sizeof(ctx.row));
+  memset(ctx.alpha, 0, sizeof(ctx.alpha));
 
   if (lgfx_pngle_prepare(pngle, pngReadCb, &ctx) < 0) {
     Serial.println("  pngle_prepare fail");
@@ -267,6 +312,10 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
     free(pngData);
     raw.close();
     LittleFS.remove(rawPath);
+    if (alphaPtr) {
+      alphaPtr->close();
+      LittleFS.remove(alphaPath);
+    }
     return false;
   }
 
@@ -278,16 +327,18 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
     free(pngData);
     raw.close();
     LittleFS.remove(rawPath);
+    if (alphaPtr) {
+      alphaPtr->close();
+      LittleFS.remove(alphaPath);
+    }
     return false;
   }
 
   const int rc = lgfx_pngle_decomp(pngle, pngDrawCb);
   pngFlushRow(&ctx);
-  memset(ctx.row, 0, sizeof(ctx.row));
   uint32_t rowsWritten = ctx.started ? (ctx.lastY + 1) : 0;
-  while (rowsWritten < (uint32_t)TILE_SIZE) {
-    raw.write(reinterpret_cast<uint8_t*>(ctx.row), TILE_SIZE * 2);
-    rowsWritten++;
+  if (rowsWritten < (uint32_t)TILE_SIZE) {
+    pngWritePadRows(&ctx, (uint32_t)TILE_SIZE - rowsWritten);
   }
 
   lgfx_pngle_destroy(pngle);
@@ -295,29 +346,28 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath) {
   raw.flush();
   const size_t sz = raw.size();
   raw.close();
-
-  if (rc < 0 || sz != (size_t)TILE_SIZE * TILE_SIZE * 2 || ctx.pixels == 0) {
-    Serial.printf("  png decomp fail rc=%d sz=%u w=%d h=%d pix=%u\n", rc,
-                  (unsigned)sz, w, h, (unsigned)ctx.pixels);
-    LittleFS.remove(rawPath);
-    return false;
+  size_t asz = 0;
+  if (alphaPtr) {
+    alphaPtr->flush();
+    asz = alphaPtr->size();
+    alphaPtr->close();
   }
-  Serial.printf("  png ok %dx%d pix=%u\n", w, h, (unsigned)ctx.pixels);
-  return true;
-}
 
-static bool loadRawTile(const char* rawPath, uint16_t* tileBuf) {
-  File f = LittleFS.open(rawPath, "r");
-  if (!f || f.size() != (size_t)TILE_SIZE * TILE_SIZE * 2) {
-    if (f) {
-      f.close();
+  const bool alphaOk =
+      !alphaPath || asz == (size_t)TILE_SIZE * TILE_SIZE;
+  if (rc < 0 || sz != (size_t)TILE_SIZE * TILE_SIZE * 2 || ctx.pixels == 0 ||
+      !alphaOk) {
+    Serial.printf("  png decomp fail rc=%d sz=%u asz=%u w=%d h=%d pix=%u\n", rc,
+                  (unsigned)sz, (unsigned)asz, w, h, (unsigned)ctx.pixels);
+    LittleFS.remove(rawPath);
+    if (alphaPath) {
+      LittleFS.remove(alphaPath);
     }
     return false;
   }
-  const size_t got =
-      f.read(reinterpret_cast<uint8_t*>(tileBuf), TILE_SIZE * TILE_SIZE * 2);
-  f.close();
-  return got == (size_t)TILE_SIZE * TILE_SIZE * 2;
+  Serial.printf("  png ok %dx%d pix=%u alpha=%d\n", w, h, (unsigned)ctx.pixels,
+                alphaPath ? 1 : 0);
+  return true;
 }
 
 static uint16_t backdropColor(LGFX* lcd) {
@@ -443,17 +493,19 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   // 先全部 PNG→raw（此时不占 112KB 帧），再 malloc 帧一次性贴图
   char pngPath[48];
   char rawPath[48];
+  char alphaPathBuf[48];
   struct PendingStamp {
     char raw[48];
+    char alpha[48];
     int ox;
     int oy;
     int scale;
-    bool alpha;
+    bool hasAlpha;
   };
   PendingStamp pending[16];
   int pendingN = 0;
 
-  auto queueRaw = [&](bool isRadar, int tx, int ty, int sc, bool alpha) -> bool {
+  auto queueRaw = [&](bool isRadar, int tx, int ty, int sc, bool withAlpha) -> bool {
     if (pendingN >= (int)(sizeof(pending) / sizeof(pending[0]))) {
       return false;
     }
@@ -463,17 +515,30 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     }
     snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
              isRadar ? 'r' : 'b', tx, ty);
+    const char* ap = nullptr;
+    if (withAlpha) {
+      snprintf(alphaPathBuf, sizeof(alphaPathBuf), "/frames/z%02d/%c_%d_%d.a",
+               zoom, isRadar ? 'r' : 'b', tx, ty);
+      ap = alphaPathBuf;
+    }
     logHeap(isRadar ? "decode-radar" : "decode-base");
-    if (!decodePngToRawFile(pngPath, rawPath)) {
+    if (!decodePngToRawFile(pngPath, rawPath, ap)) {
       return false;
     }
     PendingStamp& p = pending[pendingN++];
     strncpy(p.raw, rawPath, sizeof(p.raw) - 1);
     p.raw[sizeof(p.raw) - 1] = 0;
+    if (ap) {
+      strncpy(p.alpha, ap, sizeof(p.alpha) - 1);
+      p.alpha[sizeof(p.alpha) - 1] = 0;
+      p.hasAlpha = true;
+    } else {
+      p.alpha[0] = 0;
+      p.hasAlpha = false;
+    }
     p.ox = (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
     p.oy = (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
     p.scale = sc;
-    p.alpha = alpha;
     return true;
   };
 
@@ -509,6 +574,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
     for (int i = 0; i < pendingN; ++i) {
       LittleFS.remove(pending[i].raw);
+      if (pending[i].hasAlpha) {
+        LittleFS.remove(pending[i].alpha);
+      }
     }
     return false;
   }
@@ -523,16 +591,24 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     if (composeAbortRequested()) {
       for (int j = i; j < pendingN; ++j) {
         LittleFS.remove(pending[j].raw);
+        if (pending[j].hasAlpha) {
+          LittleFS.remove(pending[j].alpha);
+        }
       }
       free(frame);
       return false;
     }
-    if (frameCacheStampRawToBuffer(frame, pending[i].raw, pending[i].ox,
-                                   pending[i].oy, pending[i].scale,
-                                   pending[i].alpha)) {
+    if (frameCacheStampRawToBuffer(frame, pending[i].raw,
+                                   pending[i].hasAlpha ? pending[i].alpha
+                                                       : nullptr,
+                                   pending[i].ox, pending[i].oy,
+                                   pending[i].scale, pending[i].hasAlpha)) {
       ++stamped;
     }
     LittleFS.remove(pending[i].raw);
+    if (pending[i].hasAlpha) {
+      LittleFS.remove(pending[i].alpha);
+    }
   }
 
   Serial.printf("Stamped tiles=%d\n", stamped);
