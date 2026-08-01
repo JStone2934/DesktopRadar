@@ -4,51 +4,63 @@
 
 #include "config.h"
 
-static bool s_down = false;
-static uint32_t s_downAt = 0;
-static bool s_armed = true;
+static volatile bool s_armed = true;
+static volatile uint32_t s_downAt = 0;
+static volatile uint8_t s_latched = 0;  // ButtonEvent
+static constexpr uint32_t kDebounceMs = 30;
+
+static void IRAM_ATTR bootIsr() {
+  if (!s_armed) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (digitalRead(PIN_BTN_BOOT) == LOW) {
+    // 按下：只记首次边沿，忽略抖动
+    if (s_downAt == 0) {
+      s_downAt = now == 0 ? 1 : now;
+    }
+    return;
+  }
+  // 松开
+  if (s_downAt == 0) {
+    return;
+  }
+  const uint32_t held = now - s_downAt;
+  s_downAt = 0;
+  if (held < kDebounceMs) {
+    return;
+  }
+  if (held < BTN_LONG_MS) {
+    s_latched = static_cast<uint8_t>(ButtonEvent::ShortPress);
+  } else {
+    s_latched = static_cast<uint8_t>(ButtonEvent::LongPress);
+  }
+}
 
 void buttonBegin() {
   pinMode(PIN_BTN_BOOT, INPUT_PULLUP);
-  s_down = false;
   s_downAt = 0;
+  s_latched = 0;
   s_armed = true;
   // 上电时 BOOT 可能仍被按住（烧录），等释放后再武装
   if (digitalRead(PIN_BTN_BOOT) == LOW) {
     s_armed = false;
   }
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_BOOT), bootIsr, CHANGE);
 }
 
 ButtonEvent buttonPoll() {
-  const bool pressed = digitalRead(PIN_BTN_BOOT) == LOW;
-  const uint32_t now = millis();
-
   if (!s_armed) {
-    if (!pressed) {
+    if (digitalRead(PIN_BTN_BOOT) != LOW) {
       s_armed = true;
+      s_downAt = 0;
     }
     return ButtonEvent::None;
   }
 
-  if (pressed && !s_down) {
-    s_down = true;
-    s_downAt = now;
-    return ButtonEvent::None;
-  }
-
-  if (!pressed && s_down) {
-    s_down = false;
-    const uint32_t held = now - s_downAt;
-    // 小于长按阈值一律当短按切档（避免 0.4–0.8s 死区无响应）
-    if (held < BTN_LONG_MS) {
-      if (held >= BTN_MED_MS) {
-        // 仍回报 ShortPress，保证切档；Med 骨架暂不单独占用
-        return ButtonEvent::ShortPress;
-      }
-      return ButtonEvent::ShortPress;
-    }
-    return ButtonEvent::LongPress;
-  }
-
-  return ButtonEvent::None;
+  noInterrupts();
+  const uint8_t ev = s_latched;
+  s_latched = 0;
+  interrupts();
+  return static_cast<ButtonEvent>(ev);
 }

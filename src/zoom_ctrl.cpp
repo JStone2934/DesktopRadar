@@ -9,6 +9,7 @@ static int s_prefetchQ[ZOOM_MAX - ZOOM_MIN + 1];
 static int s_prefetchLen = 0;
 static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
+static ZoomPendingFeedbackFn s_pendingFeedback = nullptr;
 
 int zoomCurrent() { return s_zoom; }
 
@@ -92,6 +93,10 @@ int zoomTakePending() {
 
 bool zoomHasPending() { return s_pendingZoom >= 0; }
 
+void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn) {
+  s_pendingFeedback = fn;
+}
+
 void inputServiceDuringBlock() {
   const ButtonEvent ev = buttonPoll();
   if (ev != ButtonEvent::ShortPress) {
@@ -101,4 +106,7 @@ void inputServiceDuringBlock() {
   zoomSetPending(next);
   composeRequestAbort();
   Serial.printf("input: short press -> pending z%d (abort)\n", next);
+  if (s_pendingFeedback) {
+    s_pendingFeedback(next);
+  }
 }

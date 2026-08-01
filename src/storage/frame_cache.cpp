@@ -128,10 +128,17 @@ static void scrubTempDirKeepReady(int zoom) {
 }
 
 void frameCacheScrubOrphans() {
+  frameCacheScrubOrphansExcept(-1);
+}
+
+void frameCacheScrubOrphansExcept(int keepZoom) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    if (z == keepZoom) {
+      continue;
+    }
     scrubTempDirKeepReady(z);
   }
-  Serial.printf("LittleFS scrub orphans used=%u total=%u\n",
+  Serial.printf("LittleFS scrub orphans keep=z%d used=%u total=%u\n", keepZoom,
                 (unsigned)LittleFS.usedBytes(),
                 (unsigned)LittleFS.totalBytes());
 }

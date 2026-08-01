@@ -11,5 +11,7 @@ enum class ButtonEvent : uint8_t {
 
 void buttonBegin();
 
-/** 非阻塞轮询；在松手时根据按住时长产生一次事件。 */
+/** 非阻塞取事件；松手时根据按住时长产生一次。
+ *  边沿由 GPIO 中断锁存，避免 http.GET 等长时间阻塞丢短按。
+ */
 ButtonEvent buttonPoll();

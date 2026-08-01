@@ -33,6 +33,13 @@ int zoomTakePending();
 bool zoomHasPending();
 
 /**
+ * 阻塞操作期间短按切档时的即时回调（可在造片中 blit 已缓存档）。
+ * 传入 nullptr 清除。
+ */
+typedef void (*ZoomPendingFeedbackFn)(int zoom);
+void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn);
+
+/**
  * 阻塞操作期间调用：轮询 BOOT 短按 → 记 pending 并请求 abort。
  * HTTP / 造片长循环里应频繁调用。
  */

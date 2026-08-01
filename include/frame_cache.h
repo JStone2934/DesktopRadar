@@ -22,6 +22,9 @@ bool frameCacheRemove(int zoom);
 /** 清除各档临时瓦片残留，保留已 commit 成品。 */
 void frameCacheScrubOrphans();
 
+/** 同上，但跳过 keepZoom（造片中的当前档，避免刚下好的 PNG 被清掉）。keepZoom<0 等于全清。 */
+void frameCacheScrubOrphansExcept(int keepZoom);
+
 /** 造片前：清空该档临时瓦片与旧成品。 */
 bool frameCachePrepare(int zoom);
 

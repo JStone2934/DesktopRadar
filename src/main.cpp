@@ -88,6 +88,15 @@ static bool showCached(int zoom, bool withLabel) {
   return true;
 }
 
+/** 造片阻塞中短按：已缓存则立刻秒切，否则先打档位标签，避免“按了没反应”。 */
+static void onPendingZoomFeedback(int zoom) {
+  if (frameCacheHas(zoom)) {
+    showCached(zoom, true);
+    return;
+  }
+  overlayZoomLabel(zoom, "...");
+}
+
 static bool buildAndCache(int zoom, bool pushToDisplay) {
   if (!zoomCanCompose(zoom)) {
     return false;
@@ -184,6 +193,8 @@ static void pumpPrefetch() {
 }
 
 static bool tryWifiAndRadar() {
+  Serial.printf("apply cfg: mode=%u ssid=%s lat=%.5f lon=%.5f\n",
+                (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon);
   showStatus("Connecting...", s_cfg.ssid);
   s_wifiOk = wifiConnect(s_cfg);
   if (!s_wifiOk) {
@@ -198,6 +209,9 @@ static bool tryWifiAndRadar() {
   delay(600);
 
   ensureZoomVisible(zoomCurrent(), true);
+  if (!frameCacheHas(zoomCurrent())) {
+    Serial.printf("compose miss z%d — will retry in loop\n", zoomCurrent());
+  }
   s_lastRefresh = millis();
   return true;
 }
@@ -237,6 +251,7 @@ void setup() {
 
   buttonBegin();
   zoomSetCurrent(MAP_ZOOM);
+  zoomSetPendingFeedback(onPendingZoomFeedback);
 
   showStatus("LittleFS...", "");
   if (!frameCacheBegin()) {
@@ -278,6 +293,18 @@ void loop() {
     }
     delay(2000);
     return;
+  }
+
+  // 当前档无成品时定期重试（避免首次造片失败后干等 15 分钟刷新）
+  if (!s_busyCompose && !frameCacheHas(zoomCurrent()) &&
+      zoomCanCompose(zoomCurrent())) {
+    static uint32_t lastUncachedRetry = 0;
+    if (millis() - lastUncachedRetry >= 15000) {
+      lastUncachedRetry = millis();
+      Serial.printf("retry uncached z%d\n", zoomCurrent());
+      ensureZoomVisible(zoomCurrent(), true);
+      s_lastRefresh = millis();
+    }
   }
 
   if (millis() - s_lastRefresh >= RADAR_REFRESH_MS) {

@@ -489,29 +489,19 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     lcd->drawString("Baking...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
   }
   logHeap("before-bake");
-  // 造片前再清一遍其它档残留，降低 LittleFS 峰值
-  frameCacheScrubOrphans();
-
-  // 先占帧缓冲，再逐张 PNG→raw→贴图→立刻删临时文件（避免 raw/alpha 堆积撑爆 FS）
-  logHeap("malloc-frame");
-  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
-  if (!frame) {
-    Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
-    return false;
-  }
-  const uint16_t bg = backdropColor(lcd);
-  for (size_t i = 0; i < (size_t)LCD_WIDTH * LCD_HEIGHT; ++i) {
-    frame[i] = bg;
-  }
+  // 只清其它档残留，保留当前档刚下载的 PNG
+  frameCacheScrubOrphansExcept(zoom);
 
   char pngPath[48];
   char rawPath[48];
   char alphaPathBuf[48];
 
-  auto stampOne = [&](bool isRadar, int tx, int ty, int sc,
-                      bool withAlpha) -> bool {
+  // 关键：先 PNG→raw（需要 pngle≈45KB），此时不要占 112KB 帧缓冲，
+  // 否则 maxAlloc 碎掉导致 pngle_new 失败（秒切成品帧仍写 Flash，逻辑不变）。
+  auto decodeOne = [&](bool isRadar, int tx, int ty, bool withAlpha) -> bool {
     frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
     if (!LittleFS.exists(pngPath)) {
+      Serial.printf("  missing png %s\n", pngPath);
       return false;
     }
     snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
@@ -526,14 +516,70 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     if (!decodePngToRawFile(pngPath, rawPath, ap)) {
       return false;
     }
-    LittleFS.remove(pngPath);  // 解码后立刻释放 PNG
+    LittleFS.remove(pngPath);
+    return true;
+  };
 
+  int decoded = 0;
+  for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
+    for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
+      pollButtonDuringCompose();
+      if (composeAbortRequested()) {
+        return false;
+      }
+      if (decodeOne(false, tx, ty, false)) {
+        ++decoded;
+      }
+    }
+  }
+  if (radarOk > 0) {
+    for (int ty = rty0; ty <= rty1; ++ty) {
+      for (int tx = rtx0; tx <= rtx1; ++tx) {
+        pollButtonDuringCompose();
+        if (composeAbortRequested()) {
+          return false;
+        }
+        if (decodeOne(true, tx, ty, true)) {
+          ++decoded;
+        }
+      }
+    }
+  }
+  Serial.printf("Decoded tiles=%d\n", decoded);
+  if (decoded == 0) {
+    return false;
+  }
+
+  logHeap("malloc-frame");
+  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
+  if (!frame) {
+    Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
+    return false;
+  }
+  const uint16_t bg = backdropColor(lcd);
+  for (size_t i = 0; i < (size_t)LCD_WIDTH * LCD_HEIGHT; ++i) {
+    frame[i] = bg;
+  }
+
+  auto stampOne = [&](bool isRadar, int tx, int ty, int sc,
+                      bool withAlpha) -> bool {
+    snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
+             isRadar ? 'r' : 'b', tx, ty);
+    if (!LittleFS.exists(rawPath)) {
+      return false;
+    }
+    const char* ap = nullptr;
+    if (withAlpha) {
+      snprintf(alphaPathBuf, sizeof(alphaPathBuf), "/frames/z%02d/%c_%d_%d.a",
+               zoom, isRadar ? 'r' : 'b', tx, ty);
+      ap = alphaPathBuf;
+    }
     const int ox =
         (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
     const int oy =
         (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
-    const bool ok = frameCacheStampRawToBuffer(
-        frame, rawPath, ap, ox, oy, sc, withAlpha);
+    const bool ok = frameCacheStampRawToBuffer(frame, rawPath, ap, ox, oy, sc,
+                                               withAlpha);
     LittleFS.remove(rawPath);
     if (ap) {
       LittleFS.remove(ap);
