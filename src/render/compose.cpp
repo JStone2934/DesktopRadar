@@ -596,7 +596,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   }
 
   auto stampOne = [&](bool isRadar, int tx, int ty, int sc,
-                      bool withAlpha) -> bool {
+                      bool withAlpha, RadarCenterSample* centerOut) -> bool {
     snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
              isRadar ? 'r' : 'b', tx, ty);
     if (!LittleFS.exists(rawPath)) {
@@ -613,13 +613,16 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     const int oy =
         (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
     const bool ok = frameCacheStampRawToBuffer(frame, rawPath, ap, ox, oy, sc,
-                                               withAlpha);
+                                               withAlpha, centerOut);
     LittleFS.remove(rawPath);
     if (ap) {
       LittleFS.remove(ap);
     }
     return ok;
   };
+
+  RadarCenterSample centerSample;
+  radarCenterSampleReset(&centerSample);
 
   int stamped = 0;
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
@@ -629,7 +632,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         free(frame);
         return false;
       }
-      if (stampOne(false, tx, ty, 1, false)) {
+      if (stampOne(false, tx, ty, 1, false, nullptr)) {
         ++stamped;
       }
       afterBakeStep(decoded + stamped);
@@ -643,7 +646,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
           free(frame);
           return false;
         }
-        if (stampOne(true, tx, ty, scale, true)) {
+        if (stampOne(true, tx, ty, scale, true, &centerSample)) {
           ++stamped;
         }
         afterBakeStep(decoded + stamped);
@@ -658,6 +661,13 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     free(frame);
     return false;
   }
+
+  bool hasCloud = false;
+  uint16_t alertColor = 0;
+  radarCenterSampleFinalize(&centerSample, &hasCloud, &alertColor);
+  frameCacheWriteAlert(zoom, hasCloud, alertColor);
+  Serial.printf("center alert hasCloud=%d color=%04x maxA=%u\n", (int)hasCloud,
+                (unsigned)alertColor, (unsigned)centerSample.maxAlpha);
 
   reportComposeProgress(zoom, 0.97f);
   frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));

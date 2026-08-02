@@ -52,6 +52,11 @@ static void rgbNewPath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.rgb565.new", zoom);
 }
 
+static void alertPath(int zoom, char* out, size_t n) {
+  // 与 rgb565 / ready 同级，commit 清 zXX/ 临时目录后仍保留
+  snprintf(out, n, "/frames/z%02d.alert", zoom);
+}
+
 /** 打开并校验成品长度；成功时返回已打开的 File（调用方关闭）。 */
 static bool openRgb565IfValid(int zoom, File* out) {
   if (!out) {
@@ -298,6 +303,8 @@ bool frameCacheRemove(int zoom) {
   rgbNewPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
   readyPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  alertPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
   readyMaskSet(zoom, false);
   return true;
@@ -600,9 +607,112 @@ static inline uint16_t darkenBasemap565(uint16_t pix) {
   return pack565(r, g, b);
 }
 
+void radarCenterSampleReset(RadarCenterSample* s) {
+  if (!s) {
+    return;
+  }
+  s->sumR = 0;
+  s->sumG = 0;
+  s->sumB = 0;
+  s->sumA = 0;
+  s->maxAlpha = 0;
+}
+
+bool radarCenterSampleFinalize(const RadarCenterSample* s, bool* hasCloud,
+                               uint16_t* color565) {
+  if (!s || !hasCloud || !color565) {
+    return false;
+  }
+  *hasCloud = s->maxAlpha >= 40;
+  if (!*hasCloud || s->sumA == 0) {
+    *color565 = 0;
+    return true;
+  }
+  const int r = (int)(s->sumR / s->sumA);
+  const int g = (int)(s->sumG / s->sumA);
+  const int b = (int)(s->sumB / s->sumA);
+  *color565 = pack565(r, g, b);
+  return true;
+}
+
+bool frameCacheWriteAlert(int zoom, bool hasCloud, uint16_t color565) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  if (!LittleFS.exists("/frames")) {
+    LittleFS.mkdir("/frames");
+  }
+  char path[40];
+  alertPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "w");
+  if (!f) {
+    return false;
+  }
+  const uint8_t has = hasCloud ? 1 : 0;
+  const bool ok = f.write(&has, 1) == 1 &&
+                  f.write(reinterpret_cast<const uint8_t*>(&color565), 2) == 2;
+  f.close();
+  return ok;
+}
+
+bool frameCacheReadAlert(int zoom, bool* hasCloud, uint16_t* color565) {
+  if (!hasCloud || !color565 || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  char path[40];
+  alertPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() < 3) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+  uint8_t has = 0;
+  uint16_t color = 0;
+  if (f.read(&has, 1) != 1 ||
+      f.read(reinterpret_cast<uint8_t*>(&color), 2) != 2) {
+    f.close();
+    return false;
+  }
+  f.close();
+  *hasCloud = has != 0;
+  *color565 = color;
+  return true;
+}
+
+void frameCacheRemoveAlert(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  char path[40];
+  alertPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+}
+
+static inline void accumulateCenterSample(RadarCenterSample* centerOut, int x,
+                                          int y, uint16_t pix, uint8_t a) {
+  if (!centerOut || a == 0) {
+    return;
+  }
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  if (x < cx - 1 || x > cx + 1 || y < cy - 1 || y > cy + 1) {
+    return;
+  }
+  if (a > centerOut->maxAlpha) {
+    centerOut->maxAlpha = a;
+  }
+  centerOut->sumR += (uint32_t)expand5((pix >> 11) & 0x1F) * a;
+  centerOut->sumG += (uint32_t)expand6((pix >> 5) & 0x3F) * a;
+  centerOut->sumB += (uint32_t)expand5(pix & 0x1F) * a;
+  centerOut->sumA += a;
+}
+
 bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
                                 const char* alphaPath, int pasteX, int pasteY,
-                                int scale, bool alphaKey) {
+                                int scale, bool alphaKey,
+                                RadarCenterSample* centerOut) {
   if (!frame || !rawPath || scale < 1) {
     return false;
   }
@@ -673,6 +783,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
         }
         const uint16_t pix = row0[dx];
         if (useAlpha) {
+          accumulateCenterSample(centerOut, x, y, pix, a0[dx]);
           dst[x] = blend565(pix, dst[x], a0[dx]);
         } else if (alphaKey) {
           if (pix == 0) {
@@ -799,7 +910,9 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
           continue;
         }
         const uint16_t pix = (uint16_t)(((ra / aa) << 11) | ((ga / aa) << 5) | (ba / aa));
-        dst[x] = blend565(pix, dst[x], (uint8_t)(aa > 255 ? 255 : aa));
+        const uint8_t a8 = (uint8_t)(aa > 255 ? 255 : aa);
+        accumulateCenterSample(centerOut, x, y, pix, a8);
+        dst[x] = blend565(pix, dst[x], a8);
       } else {
         const uint16_t c00 = row0[x0];
         const uint16_t c10 = row0[x1];

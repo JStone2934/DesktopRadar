@@ -15,7 +15,8 @@ struct AppConfig {
   char identity[64];  // PEAP Identity；PSK 可空
   float lat;
   float lon;
-  bool show_progress;  // 屏缘进度环
+  bool show_progress;   // 屏缘进度环
+  bool show_alert_ring;  // 中心天气预警环
 };
 
 /** 用 config.h 宏填充默认值（PSK + MAP_LAT/LON）。 */

@@ -106,7 +106,7 @@ static void handleRoot() {
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
   String html;
-  html.reserve(5200);
+  html.reserve(5800);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
@@ -176,7 +176,15 @@ static void handleRoot() {
                   "<option value=\"0\">隐藏</option>")
               : F("<option value=\"1\">显示</option>"
                   "<option value=\"0\" selected>隐藏</option>");
-  html += F("</select><button type=\"submit\">保存并继续</button></form>"
+  html += F("</select><label>天气预警环</label><select name=\"show_alert\" "
+            "autocomplete=\"off\">");
+  html += s_seedCfg.show_alert_ring
+              ? F("<option value=\"1\" selected>开启</option>"
+                  "<option value=\"0\">关闭</option>")
+              : F("<option value=\"1\">开启</option>"
+                  "<option value=\"0\" selected>关闭</option>");
+  html += F("</select><p class=\"hint\">开启后：中心有云图时屏缘显示对应颜色圆环</p>"
+            "<button type=\"submit\">保存并继续</button></form>"
             "<script>"
             "function tog(){var p=document.getElementById('mode').value==='1';"
             "document.getElementById('idRow').style.display=p?'block':'none';"
@@ -359,6 +367,7 @@ static const char* parseForm(AppConfig* cfg) {
   cfg->lat = lat;
   cfg->lon = lon;
   cfg->show_progress = (s_server->arg("show_ring") != "0");
+  cfg->show_alert_ring = (s_server->arg("show_alert") == "1");
   return nullptr;
 }
 
@@ -383,9 +392,9 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d\n",
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d\n",
                 (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
-                (int)cfg.show_progress);
+                (int)cfg.show_progress, (int)cfg.show_alert_ring);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();
   s_server->sendHeader("Location", "/done", true);

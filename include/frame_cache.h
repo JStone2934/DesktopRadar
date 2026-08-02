@@ -9,6 +9,15 @@
 #include "config.h"
 #include "mercator.h"
 
+/** 造片时累计屏幕中心 3×3 雷达源色（8-bit×alpha）。 */
+struct RadarCenterSample {
+  uint32_t sumR;
+  uint32_t sumG;
+  uint32_t sumB;
+  uint32_t sumA;
+  uint8_t maxAlpha;
+};
+
 bool frameCacheBegin();
 
 /** 成品 RGB565 已就绪（ready + 长度校验）。 */
@@ -78,16 +87,29 @@ bool frameCachePromoteNewNoReady(int zoom);
 /**
  * 从 256×256 RGB565 raw（及可选 alpha）贴入内存帧。
  * alphaPath 非空时按 0–255 alpha 与底图混合（消除雷达黑边）；否则 alphaKey 仅跳过 0。
+ * centerOut 非空且带 alpha 时，累计落在屏幕中心 3×3 的雷达源色×alpha。
  */
 bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
                                 const char* alphaPath, int pasteX, int pasteY,
-                                int scale, bool alphaKey);
+                                int scale, bool alphaKey,
+                                RadarCenterSample* centerOut = nullptr);
 
 /**
  * 将 256×256 RGB565 瓦片写入成品文件（慢，仅兼容保留）。
  */
 bool frameCacheStampTile(int zoom, const uint16_t* tile256, int pasteX,
                          int pasteY, int scale, bool alphaKey);
+
+/** 中心天气采样：与 .rgb565 同级，commit 清临时目录后仍保留。 */
+bool frameCacheWriteAlert(int zoom, bool hasCloud, uint16_t color565);
+bool frameCacheReadAlert(int zoom, bool* hasCloud, uint16_t* color565);
+void frameCacheRemoveAlert(int zoom);
+
+/** 由 RadarCenterSample 得到 hasCloud + RGB565；无有效样本返回 false。 */
+bool radarCenterSampleFinalize(const RadarCenterSample* s, bool* hasCloud,
+                               uint16_t* color565);
+
+void radarCenterSampleReset(RadarCenterSample* s);
 
 /** 在内存帧上画十字准星（含中心红点）。 */
 void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color);

@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "LGFX_GC9A01.hpp"
+#include "alert_ring.h"
 #include "app_config.h"
 #include "button.h"
 #include "compose.h"
@@ -55,10 +56,34 @@ static void refreshProgressRing() {
   progressRingUpdate(&lcd, globalCacheDone01(), under);
 }
 
+/** 进度环之下、预警环之上；预警可盖住进度环。 */
+static void refreshEdgeRings() {
+  refreshProgressRing();
+  const int under = s_statusScreen ? -1 : s_displayedZoom;
+  if (s_cfg.show_alert_ring) {
+    alertRingRedraw(&lcd, under);
+  }
+}
+
+static void applyAlertForDisplayedZoom() {
+  const int under = s_statusScreen ? -1 : s_displayedZoom;
+  if (!s_cfg.show_alert_ring || s_displayedZoom < ZOOM_MIN) {
+    alertRingClear(&lcd, under);
+    return;
+  }
+  bool hasCloud = false;
+  uint16_t color = 0;
+  if (!frameCacheReadAlert(s_displayedZoom, &hasCloud, &color) || !hasCloud) {
+    alertRingClear(&lcd, under);
+    return;
+  }
+  alertRingSet(color, true);
+}
+
 static void onComposeProgress(int zoom, float local01) {
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
-  refreshProgressRing();
+  refreshEdgeRings();
 }
 
 static void showStatus(const char* line1, const char* line2 = nullptr) {
@@ -105,7 +130,8 @@ static bool showCached(int zoom) {
   Serial.printf("blit z%d %lums\n", zoom, (unsigned long)(millis() - t0));
   s_displayedZoom = zoom;
   s_statusScreen = false;
-  refreshProgressRing();
+  applyAlertForDisplayedZoom();
+  refreshEdgeRings();
   return true;
 }
 
@@ -116,7 +142,7 @@ static void onPendingZoomFeedback(int zoom) {
     return;
   }
   // 未缓存：保持当前画面，仅靠进度环反映全局缓存
-  refreshProgressRing();
+  refreshEdgeRings();
 }
 
 static bool buildAndCache(int zoom, bool pushToDisplay) {
@@ -133,7 +159,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     snprintf(line2, sizeof(line2), "zoom %d", zoom);
     s_statusScreen = true;
     showStatus("Fetching...", line2);
-    refreshProgressRing();
+    refreshEdgeRings();
   } else if (pushToDisplay) {
     Serial.printf("rebuild z%d (keep display)\n", zoom);
   } else {
@@ -154,15 +180,16 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     }
     frameCacheRestoreStale(zoom);
     s_statusScreen = false;
-    refreshProgressRing();
+    refreshEdgeRings();
     return false;
   }
 
   if (pushToDisplay) {
     s_displayedZoom = zoom;
     s_statusScreen = false;
+    applyAlertForDisplayedZoom();
   }
-  refreshProgressRing();
+  refreshEdgeRings();
   return true;
 }
 
@@ -257,6 +284,7 @@ static void runPortalAndApply() {
   zoomPrefetchClear();
   s_busyCompose = false;
   progressRingHide(&lcd, s_displayedZoom);
+  alertRingHide(&lcd, s_displayedZoom);
 
   const float oldLat = s_cfg.lat;
   const float oldLon = s_cfg.lon;
@@ -274,6 +302,9 @@ static void runPortalAndApply() {
 
   if (!s_cfg.show_progress) {
     progressRingHide(&lcd, s_displayedZoom);
+  }
+  if (!s_cfg.show_alert_ring) {
+    alertRingHide(&lcd, s_displayedZoom);
   }
 
   tryWifiAndRadar();
@@ -375,6 +406,12 @@ void loop() {
   }
 
   pumpPrefetch();
+
+  // 预警环淡入：只叠彩环，不每圈强刷进度环
+  if (s_cfg.show_alert_ring && alertRingNeedsTick()) {
+    const int under = s_statusScreen ? -1 : s_displayedZoom;
+    alertRingTick(&lcd, under);
+  }
 
   if (millis() - lastBeat >= 5000) {
     lastBeat = millis();
