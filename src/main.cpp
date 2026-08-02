@@ -39,6 +39,9 @@ static uint32_t s_cachePauseUntil = 0;
 static int s_animPrevZoom = -1;
 static uint32_t s_animPrevLeftAt = 0;
 
+static bool refreshIsDue();
+static bool refreshApproaching();
+
 static void noteUserInteraction() {
   const uint32_t until = millis() + CACHE_PAUSE_AFTER_USER_MS;
   // 连按切档时延长安静窗
@@ -106,6 +109,11 @@ static void applyAlertForDisplayedZoom() {
 static void onComposeProgress(int zoom, float local01) {
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
+  // 邻档预取中若定时刷新已到期：立刻中止，把主循环还给当前档刷新
+  if (zoom != zoomCurrent() && refreshIsDue()) {
+    Serial.printf("abort prefetch z%d — refresh due\n", zoom);
+    composeRequestAbort();
+  }
   // 全档已过：环已隐藏，勿每瓦片刷屏/打盘
   if (s_staticFullPassDone) {
     return;
@@ -221,6 +229,64 @@ static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
   return fabsf(aLat - bLat) < 1e-5f && fabsf(aLon - bLon) < 1e-5f;
 }
 
+/** 定时雷达刷新是否已到期（失败重试或正常 5 分钟）。 */
+static bool refreshIsDue() {
+  if (s_refreshFailAt != 0) {
+    return (millis() - s_refreshFailAt) >= RADAR_REFRESH_RETRY_MS;
+  }
+  return (millis() - s_lastRefresh) >= RADAR_REFRESH_MS;
+}
+
+/** 即将到期（15s 内）：停止新开邻档预取，把时间留给当前档刷新。 */
+static bool refreshApproaching() {
+  const uint32_t cushion = 15UL * 1000UL;
+  if (s_refreshFailAt != 0) {
+    return (millis() - s_refreshFailAt + cushion) >= RADAR_REFRESH_RETRY_MS;
+  }
+  return (millis() - s_lastRefresh + cushion) >= RADAR_REFRESH_MS;
+}
+
+static size_t fsFreeBytes() {
+  const size_t total = LittleFS.totalBytes();
+  const size_t used = LittleFS.usedBytes();
+  return total > used ? (total - used) : 0;
+}
+
+/** 刷新前腾出写 .rgb565.new + 瓦片余量；优先去旧动画，不拆邻档静帧。 */
+static void ensureRefreshSpace(int keepZoom) {
+  const size_t need = 2UL * FRAME_RGB565_BYTES + (48UL * 1024UL);
+  int guard = 0;
+  while (fsFreeBytes() < need && guard++ < 24) {
+    const int n = frameCacheAnimStoredCount(keepZoom);
+    if (n > 2) {
+      if (!frameCacheAnimDropOldest(keepZoom, 1)) {
+        frameCacheAnimClear(keepZoom);
+      }
+      continue;
+    }
+    if (n > 0) {
+      frameCacheAnimClear(keepZoom);
+      continue;
+    }
+    bool clearedOther = false;
+    for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+      if (z == keepZoom || z == ZOOM_SKIP) {
+        continue;
+      }
+      if (frameCacheAnimStoredCount(z) > 0) {
+        frameCacheAnimClear(z);
+        clearedOther = true;
+        break;
+      }
+    }
+    if (!clearedOther) {
+      break;
+    }
+  }
+  Serial.printf("refresh space free=%u need=%u\n", (unsigned)fsFreeBytes(),
+                (unsigned)need);
+}
+
 static bool buildAndCache(int zoom, bool pushToDisplay);
 static void handlePendingZoom();
 static void pumpPrefetch();
@@ -298,13 +364,26 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     return false;
   }
 
+  // display-only（无雷达 commit）不算造片成功，避免刷新时钟被空转推进
+  if (!frameCacheHas(zoom)) {
+    Serial.printf("build z%d not cached (display-only)\n", zoom);
+    frameCacheRestoreStale(zoom);
+    if (pushToDisplay && frameCacheHas(zoom)) {
+      s_displayedZoom = zoom;
+      s_statusScreen = false;
+      showCached(zoom);
+    }
+    refreshEdgeRings();
+    return false;
+  }
+
   if (pushToDisplay) {
     s_displayedZoom = zoom;
     s_statusScreen = false;
     applyAlertForDisplayedZoom();
   }
   // 当前档静帧成功 → 本地积累一帧（邻档预取不进动画队列）
-  if (zoom == zoomCurrent() && frameCacheHas(zoom)) {
+  if (zoom == zoomCurrent()) {
     uint32_t t = 0;
     if (frameCacheReadRadarTime(zoom, &t)) {
       frameCacheAnimAppendFromStatic(zoom, t);
@@ -391,6 +470,10 @@ static void pumpAnimOrPrefetch() {
   if (cachePaused()) {
     return;
   }
+  // 刷新到期/临近：禁止邻档预取，避免 HTTPS 造片堵死主循环
+  if (refreshIsDue() || refreshApproaching()) {
+    return;
+  }
   if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
     return;
   }
@@ -407,9 +490,14 @@ static void pumpAnimOrPrefetch() {
     if (s_busyCompose) {
       return;
     }
+    // 失败后勿立刻 Reset+再造：容易在空间不足时空转占满循环
     if (frameCacheCountReady() == readyBefore) {
-      zoomPrefetchResetAround(z);
-      pumpPrefetch();
+      static uint32_t s_lastPrefetchStallLog = 0;
+      if (millis() - s_lastPrefetchStallLog > 10000) {
+        s_lastPrefetchStallLog = millis();
+        Serial.printf("prefetch stall ready=%d/%d free=%u\n", readyBefore,
+                      frameCacheZoomSlots(), (unsigned)fsFreeBytes());
+      }
     }
   }
 }
@@ -608,8 +696,43 @@ void loop() {
     return;
   }
 
-  // 按住播放（本地积累满 ≥2 帧才可播；不再紧急 past 烘焙）
-  if (!s_busyCompose && buttonIsDown()) {
+  // 定时刷新：不受 cachePaused 影响（安静窗只挡预取，不挡雷达更新）
+  const bool due = refreshIsDue();
+  if (!s_busyCompose && due) {
+    const int z = zoomCurrent();
+    if (zoomCanCompose(z)) {
+      Serial.printf("scheduled refresh focus z%d (%s) free=%u\n", z,
+                    s_refreshFailAt != 0 ? "retry" : "due",
+                    (unsigned)fsFreeBytes());
+      zoomPrefetchClear();
+      ensureRefreshSpace(z);
+      const bool ok = buildAndCache(z, true);
+      if (ok) {
+        s_lastRefresh = millis();
+        s_refreshFailAt = 0;
+        uint32_t t = 0;
+        frameCacheReadRadarTime(z, &t);
+        // 再 blit 一次，确保屏上就是刚落盘的静帧
+        showCached(z);
+        Serial.printf("refresh ok z%d radar_t=%lu anim=%d free=%u\n", z,
+                      (unsigned long)t, frameCacheAnimStoredCount(z),
+                      (unsigned)fsFreeBytes());
+        handlePendingZoom();
+        zoomPrefetchResetAround(zoomCurrent());
+      } else {
+        s_refreshFailAt = millis() == 0 ? 1 : millis();
+        // 失败后不要 Reset 预取队列：避免邻档造片继续占带宽/磁盘
+        zoomPrefetchClear();
+        Serial.printf("refresh fail, retry in %lus free=%u\n",
+                      (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL),
+                      (unsigned)fsFreeBytes());
+        handlePendingZoom();
+      }
+    }
+  }
+
+  // 按住播放（刷新到期时不进播放，避免堵刷新）
+  if (!s_busyCompose && !due && buttonIsDown()) {
     const uint32_t held = buttonHeldMs();
     const int z = zoomCurrent();
     if (held >= BTN_HOLD_PLAY_MS && frameCacheAnimHas(z)) {
@@ -637,34 +760,6 @@ void loop() {
     }
   }
 
-  // 到点或失败短重试：只更当前静帧并追加到本地动画队列
-  bool shouldRefresh = false;
-  if (s_refreshFailAt != 0) {
-    shouldRefresh =
-        (millis() - s_refreshFailAt >= RADAR_REFRESH_RETRY_MS);
-  } else {
-    shouldRefresh = (millis() - s_lastRefresh >= RADAR_REFRESH_MS);
-  }
-  if (!s_busyCompose && shouldRefresh && !cachePaused()) {
-    const int z = zoomCurrent();
-    if (zoomCanCompose(z)) {
-      Serial.printf("scheduled refresh focus z%d (%s) [accumulate]\n", z,
-                    s_refreshFailAt != 0 ? "retry" : "due");
-      zoomPrefetchClear();
-      const bool ok = buildAndCache(z, true);
-      if (ok || frameCacheHas(z)) {
-        s_lastRefresh = millis();
-        s_refreshFailAt = 0;
-      } else {
-        s_refreshFailAt = millis() == 0 ? 1 : millis();
-        Serial.printf("refresh fail, retry in %lus\n",
-                      (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL));
-      }
-      handlePendingZoom();
-      zoomPrefetchResetAround(zoomCurrent());
-    }
-  }
-
   pumpAnimZoomGrace();
   pumpAnimOrPrefetch();
 
@@ -676,14 +771,21 @@ void loop() {
 
   if (millis() - lastBeat >= 5000) {
     lastBeat = millis();
+    uint32_t refreshAge = 0;
+    if (s_refreshFailAt != 0) {
+      refreshAge = (millis() - s_refreshFailAt) / 1000UL;
+    } else {
+      refreshAge = (millis() - s_lastRefresh) / 1000UL;
+    }
     Serial.printf(
         "[%lu] heap=%u max=%u wifi=%d z=%d cached=%d anim=%d ring=%d/%d "
-        "fs=%u/%u\n",
+        "fs=%u/%u refreshAge=%lus pause=%d failRetry=%d due=%d\n",
         millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(),
         zoomCurrent(), (int)frameCacheHas(zoomCurrent()),
         frameCacheAnimCount(zoomCurrent()), frameCacheCountReady(),
         frameCacheZoomSlots(), (unsigned)LittleFS.usedBytes(),
-        (unsigned)LittleFS.totalBytes());
+        (unsigned)LittleFS.totalBytes(), (unsigned long)refreshAge,
+        (int)cachePaused(), (int)(s_refreshFailAt != 0), (int)due);
   }
 
   delay(10);
