@@ -38,10 +38,11 @@
 // 雷达帧 Unix 时间 → 北京时间（UTC+8）显示
 #define TIMEZONE_OFFSET_SEC (8 * 3600)
 
-// 缩放档位：z3–z12，跳过 z11（省一档 Flash，便于全静帧+10 帧动画共存）
+// 缩放档位（与 DesktopRadar ZOOM_MIN/MAX、步进 1 对齐）
 #define ZOOM_MIN 3
 #define ZOOM_MAX 12
-#define ZOOM_SKIP 11
+// 无跳过档（按住动画关闭后恢复 z11）；置为 -1 使既有 ZOOM_SKIP 判断失效
+#define ZOOM_SKIP (-1)
 // RainViewer 免费档原生雷达瓦片上限；更高档对 z7 瓦片上采样绘制
 #define RAINVIEWER_MAX_ZOOM 7
 
@@ -50,19 +51,11 @@
 
 // ---- BOOT 按键（GPIO9）----
 #define PIN_BTN_BOOT 9
-// 短按 / 按住播放阈值（对齐 DesktopRadar long_press_ms=500）
-#define BTN_HOLD_PLAY_MS 500
-#define BTN_SHORT_MS BTN_HOLD_PLAY_MS
+// 短按：按下时长小于此值（放宽，避免轻按无响应）
+#define BTN_SHORT_MS 800
 #define BTN_MED_MS 1500
 #define BTN_LONG_MS 10000
 
-// ---- 历史动画（本地静帧积累）----
-#define ANIM_FPS 5
-#define ANIM_WINDOW_HOURS 6.0f
-#define ANIM_MAX_FRAMES 10
-#define ANIM_FRAME_INTERVAL_MS (1000UL / (unsigned)ANIM_FPS)
-// 切走某档后保留其动画积累的宽限；超时未切回则丢弃并在新档重累加
-#define ANIM_ZOOM_GRACE_MS (60UL * 1000UL)
 // 短按切档后暂停后台预取，避免立刻又占满主循环导致秒切卡顿
 #define CACHE_PAUSE_AFTER_USER_MS 5000UL
 
@@ -86,11 +79,14 @@
 
 #define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
-// LittleFS 空闲低于此值视为逼近红线，追加时缩容去旧
+
+// 存储层仍保留未接线的 anim API 编译所需常量（按住播放已暂时关闭）
+#define ANIM_MAX_FRAMES 10
+#define ANIM_WINDOW_HOURS 6.0f
 #define ANIM_SPACE_RED_BYTES (2UL * FRAME_RGB565_BYTES)
 
-// 提升以作废旧缓存；9=本地积累动画（不再 past 整集烘焙）
-#define FRAME_CACHE_GEN 9
+// 提升以作废旧缓存；10=暂时关闭按住动画，清掉 anim 残留
+#define FRAME_CACHE_GEN 10
 
 // 雷达静帧刷新间隔（对齐 DesktopRadar 默认 300s）
 #define RADAR_REFRESH_MS (5UL * 60UL * 1000UL)

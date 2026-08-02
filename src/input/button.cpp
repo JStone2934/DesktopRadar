@@ -31,12 +31,12 @@ static void IRAM_ATTR bootIsr() {
   if (held < kDebounceMs) {
     return;
   }
-  if (held < BTN_HOLD_PLAY_MS) {
+  if (held < BTN_SHORT_MS) {
     s_latched = static_cast<uint8_t>(ButtonEvent::ShortPress);
   } else if (held >= BTN_LONG_MS) {
     s_latched = static_cast<uint8_t>(ButtonEvent::LongPress);
   }
-  // HOLD_PLAY..LONG：按住播放已消费，不锁存事件
+  // SHORT..LONG：中等按时长不锁存（长按配网 / 短按切档）
 }
 
 void buttonBegin() {
