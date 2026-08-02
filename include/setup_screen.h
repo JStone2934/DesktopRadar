@@ -3,7 +3,7 @@
 #include "LGFX_GC9A01.hpp"
 
 /**
- * 设置屏：步骤说明 + 缩小的 URL 二维码（整屏只应调用一次，避免堵 WebServer）。
+ * 设置屏：步骤说明 + URL 二维码（整屏只应调用一次，避免堵 WebServer）。
  * remainSec >= 0：显示剩余秒数；remainSec < 0：等待保存（无倒计时）。
  */
 void setupScreenDraw(LGFX* lcd, int remainSec);
