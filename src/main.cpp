@@ -31,8 +31,31 @@ static bool s_wifiOk = false;
 static bool s_statusScreen = false;  // 首次 Fetching 黑底，圆环不 blit 地图
 static int s_bakeZoom = -1;
 static float s_bakeLocal = 0.0f;
+// 全档静帧曾铺满一次后进度环保持满（本地积累不再单独「动画阶段」）
+static bool s_staticFullPassDone = false;
+// 用户交互后暂停后台缓存（预取/定时刷新）
+static uint32_t s_cachePauseUntil = 0;
+// 切缩放宽限：保留上一档动画最多 ANIM_ZOOM_GRACE_MS
+static int s_animPrevZoom = -1;
+static uint32_t s_animPrevLeftAt = 0;
+
+static void noteUserInteraction() {
+  const uint32_t until = millis() + CACHE_PAUSE_AFTER_USER_MS;
+  // 连按切档时延长安静窗
+  if (until > s_cachePauseUntil) {
+    s_cachePauseUntil = until;
+  }
+}
+
+static bool cachePaused() {
+  return (int32_t)(millis() - s_cachePauseUntil) < 0;
+}
 
 static float globalCacheDone01() {
+  // 动画阶段：满环保持消失（勿在此调用 frameCacheAnimHas 打盘）
+  if (s_staticFullPassDone) {
+    return 1.0f;
+  }
   const int slots = frameCacheZoomSlots();
   if (slots <= 0) {
     return 1.0f;
@@ -83,6 +106,16 @@ static void applyAlertForDisplayedZoom() {
 static void onComposeProgress(int zoom, float local01) {
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
+  // 全档已过：环已隐藏，勿每瓦片刷屏/打盘
+  if (s_staticFullPassDone) {
+    return;
+  }
+  static uint32_t s_lastRingMs = 0;
+  const uint32_t now = millis();
+  if (local01 < 0.999f && (now - s_lastRingMs) < 200) {
+    return;
+  }
+  s_lastRingMs = now;
   refreshEdgeRings();
 }
 
@@ -102,7 +135,11 @@ static void clearAllFrameCaches(const char* reason) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
     frameCacheRemove(z);
   }
+  frameCacheAnimClearAll();
   s_displayedZoom = -1;
+  s_staticFullPassDone = false;
+  s_animPrevZoom = -1;
+  s_animPrevLeftAt = 0;
   Serial.printf("frame caches cleared (%s)\n",
                 reason && reason[0] ? reason : "all");
 }
@@ -114,35 +151,112 @@ static void clearPeerFrameCaches(int keepZoom, const char* reason) {
     }
     frameCacheRemove(z);
   }
+  // 只保留 keepZoom 动画可能；其它 anim 清掉
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
+    if (z != keepZoom) {
+      frameCacheAnimClear(z);
+    }
+  }
   Serial.printf("peer frame caches cleared keep=z%d (%s)\n", keepZoom,
                 reason && reason[0] ? reason : "peers");
+}
+
+static void retainAnimZooms(int current) {
+  // 只保留 current +（宽限内的）prev；第三档立刻清
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
+    if (z == ZOOM_SKIP) {
+      continue;
+    }
+    if (z == current) {
+      continue;
+    }
+    if (z == s_animPrevZoom) {
+      continue;
+    }
+    if (frameCacheAnimStoredCount(z) > 0) {
+      frameCacheAnimClear(z);
+    }
+  }
+}
+
+static void noteZoomLeft(int fromZoom, int toZoom) {
+  if (fromZoom < ZOOM_MIN || fromZoom > ZOOM_MAX || fromZoom == toZoom) {
+    return;
+  }
+  // 切回宽限中的 prev：取消宽限
+  if (toZoom == s_animPrevZoom) {
+    s_animPrevZoom = -1;
+    s_animPrevLeftAt = 0;
+    retainAnimZooms(toZoom);
+    return;
+  }
+  // 已有另一档在宽限：立刻清掉更早的那档
+  if (s_animPrevZoom >= ZOOM_MIN && s_animPrevZoom != fromZoom &&
+      s_animPrevZoom != toZoom) {
+    frameCacheAnimClear(s_animPrevZoom);
+  }
+  s_animPrevZoom = fromZoom;
+  s_animPrevLeftAt = millis() == 0 ? 1 : millis();
+  retainAnimZooms(toZoom);
+}
+
+static void pumpAnimZoomGrace() {
+  if (s_animPrevZoom < ZOOM_MIN) {
+    return;
+  }
+  if (zoomCurrent() == s_animPrevZoom) {
+    s_animPrevZoom = -1;
+    s_animPrevLeftAt = 0;
+    return;
+  }
+  if ((millis() - s_animPrevLeftAt) >= ANIM_ZOOM_GRACE_MS) {
+    Serial.printf("anim grace expire clear z%d\n", s_animPrevZoom);
+    frameCacheAnimClear(s_animPrevZoom);
+    s_animPrevZoom = -1;
+    s_animPrevLeftAt = 0;
+  }
 }
 
 static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
   return fabsf(aLat - bLat) < 1e-5f && fabsf(aLon - bLon) < 1e-5f;
 }
 
+static bool buildAndCache(int zoom, bool pushToDisplay);
+static void handlePendingZoom();
+static void pumpPrefetch();
+static void ensureZoomVisible(int zoom, bool userInitiated);
+
 static bool showCached(int zoom) {
   const uint32_t t0 = millis();
   if (!frameCacheBlit(&lcd, zoom)) {
     return false;
   }
-  Serial.printf("blit z%d %lums\n", zoom, (unsigned long)(millis() - t0));
+  const uint32_t dt = millis() - t0;
+  if (dt >= 30) {
+    Serial.printf("blit z%d %lums\n", zoom, (unsigned long)dt);
+  }
   s_displayedZoom = zoom;
   s_statusScreen = false;
   applyAlertForDisplayedZoom();
-  refreshEdgeRings();
+  // 进度已满时勿再整屏 blit 擦环
+  if (!s_staticFullPassDone) {
+    refreshEdgeRings();
+  } else if (s_cfg.show_alert_ring) {
+    alertRingRedraw(&lcd, zoom);
+  }
   return true;
 }
 
 /** 造片阻塞中短按：已缓存则立刻秒切。 */
 static void onPendingZoomFeedback(int zoom) {
+  noteUserInteraction();
   if (frameCacheHas(zoom)) {
     showCached(zoom);
     return;
   }
-  // 未缓存：保持当前画面，仅靠进度环反映全局缓存
-  refreshEdgeRings();
+  if (!s_staticFullPassDone) {
+    refreshEdgeRings();
+  }
 }
 
 static bool buildAndCache(int zoom, bool pushToDisplay) {
@@ -189,23 +303,150 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     s_statusScreen = false;
     applyAlertForDisplayedZoom();
   }
+  // 当前档静帧成功 → 本地积累一帧（邻档预取不进动画队列）
+  if (zoom == zoomCurrent() && frameCacheHas(zoom)) {
+    uint32_t t = 0;
+    if (frameCacheReadRadarTime(zoom, &t)) {
+      frameCacheAnimAppendFromStatic(zoom, t);
+    }
+  }
   refreshEdgeRings();
   return true;
 }
 
-static void ensureZoomVisible(int zoom, bool userInitiated) {
-  zoomSetCurrent(zoom);
-
-  if (frameCacheHas(zoom)) {
-    showCached(zoom);
-    zoomPrefetchResetAround(zoom);
+/** 按住播放：5fps 循环；松手或 ≥10s 退出。 */
+static void playAnimLoop(int zoom) {
+  const int n = frameCacheAnimCount(zoom);
+  if (n < 2) {
     return;
   }
 
+  progressRingHide(&lcd, s_displayedZoom);
+  alertRingHide(&lcd, s_displayedZoom);
+  Serial.printf("anim play z%d frames=%d @%dfps\n", zoom, n, ANIM_FPS);
+
+  bool stopForSettings = false;
+  while (buttonIsDown()) {
+    if (buttonHeldMs() >= BTN_LONG_MS) {
+      stopForSettings = true;
+      break;
+    }
+    for (int i = 0; i < n; ++i) {
+      if (!buttonIsDown() || buttonHeldMs() >= BTN_LONG_MS) {
+        if (buttonHeldMs() >= BTN_LONG_MS) {
+          stopForSettings = true;
+        }
+        break;
+      }
+      const uint32_t t0 = millis();
+      if (!frameCacheAnimBlit(&lcd, zoom, i)) {
+        Serial.printf("anim blit fail i=%d\n", i);
+        break;
+      }
+      const uint32_t elapsed = millis() - t0;
+      uint32_t remain = 0;
+      if (elapsed < ANIM_FRAME_INTERVAL_MS) {
+        remain = ANIM_FRAME_INTERVAL_MS - elapsed;
+      }
+      while (remain > 0) {
+        if (!buttonIsDown() || buttonHeldMs() >= BTN_LONG_MS) {
+          if (buttonHeldMs() >= BTN_LONG_MS) {
+            stopForSettings = true;
+          }
+          remain = 0;
+          break;
+        }
+        const uint32_t slice = remain > 20 ? 20 : remain;
+        delay(slice);
+        remain -= slice;
+      }
+      if (!buttonIsDown() || stopForSettings) {
+        break;
+      }
+    }
+    if (!buttonIsDown() || stopForSettings) {
+      break;
+    }
+  }
+
+  // 恢复最新静帧
+  if (frameCacheHas(zoom)) {
+    showCached(zoom);
+  }
+  Serial.printf("anim stop z%d settings=%d\n", zoom, (int)stopForSettings);
+
+  // ≥10s：等松手以产生 LongPress（ISR 已在松手时锁存）
+  if (stopForSettings) {
+    while (buttonIsDown()) {
+      delay(10);
+    }
+  }
+}
+
+static void pumpAnimOrPrefetch() {
+  if (zoomHasPending()) {
+    handlePendingZoom();
+    return;
+  }
+  if (cachePaused()) {
+    return;
+  }
+  if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  const int z = zoomCurrent();
+  if (frameCacheCountReady() >= frameCacheZoomSlots()) {
+    s_staticFullPassDone = true;
+  }
+
+  // 本地积累：后台只补静帧；动画靠刷新/造片成功追加
+  if (frameCacheCountReady() < frameCacheZoomSlots()) {
+    const int readyBefore = frameCacheCountReady();
+    pumpPrefetch();
+    if (s_busyCompose) {
+      return;
+    }
+    if (frameCacheCountReady() == readyBefore) {
+      zoomPrefetchResetAround(z);
+      pumpPrefetch();
+    }
+  }
+}
+
+static void ensureZoomVisible(int zoom, bool userInitiated) {
+  if (userInitiated) {
+    noteUserInteraction();
+    // 打断后台造片，优先响应用户
+    if (s_busyCompose) {
+      composeRequestAbort();
+    }
+    zoomPrefetchClear();
+  }
+
+  const int prev = zoomCurrent();
+  zoomSetCurrent(zoom);
+  if (prev != zoom) {
+    noteZoomLeft(prev, zoom);
+  } else {
+    retainAnimZooms(zoom);
+  }
+
+  if (frameCacheHas(zoom)) {
+    showCached(zoom);
+    if (!userInitiated) {
+      zoomPrefetchResetAround(zoom);
+    }
+    return;
+  }
+
+  // 用户要看的未缓存档：立即造（仍优先于邻档预取）
   if (userInitiated && s_busyCompose) {
     composeRequestAbort();
   }
-  zoomPrefetchClear();
+  if (!userInitiated) {
+    zoomPrefetchClear();
+  }
 
   if (!buildAndCache(zoom, true)) {
     if (!zoomHasPending() && s_displayedZoom < 0) {
@@ -213,7 +454,9 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
     }
     return;
   }
-  zoomPrefetchResetAround(zoom);
+  if (!userInitiated) {
+    zoomPrefetchResetAround(zoom);
+  }
 }
 
 static void handlePendingZoom() {
@@ -365,6 +608,24 @@ void loop() {
     return;
   }
 
+  // 按住播放（本地积累满 ≥2 帧才可播；不再紧急 past 烘焙）
+  if (!s_busyCompose && buttonIsDown()) {
+    const uint32_t held = buttonHeldMs();
+    const int z = zoomCurrent();
+    if (held >= BTN_HOLD_PLAY_MS && frameCacheAnimHas(z)) {
+      playAnimLoop(z);
+      return;
+    }
+    if (held >= BTN_HOLD_PLAY_MS && frameCacheHas(z) && !frameCacheAnimHas(z)) {
+      static uint32_t s_lastAnimMissLog = 0;
+      if (millis() - s_lastAnimMissLog > 2000) {
+        s_lastAnimMissLog = millis();
+        Serial.printf("anim hold miss z%d stored=%d (need>=2)\n", z,
+                      frameCacheAnimStoredCount(z));
+      }
+    }
+  }
+
   // 当前档无成品时定期重试（避免首次造片失败后干等定时刷新）
   if (!s_busyCompose && !frameCacheHas(zoomCurrent()) &&
       zoomCanCompose(zoomCurrent())) {
@@ -376,8 +637,7 @@ void loop() {
     }
   }
 
-  // 到点或失败短重试：作废其它档并重建当前档；成功才推进 s_lastRefresh
-  // 失败退避中忽略 refreshDue，避免每圈狂刷
+  // 到点或失败短重试：只更当前静帧并追加到本地动画队列
   bool shouldRefresh = false;
   if (s_refreshFailAt != 0) {
     shouldRefresh =
@@ -385,14 +645,14 @@ void loop() {
   } else {
     shouldRefresh = (millis() - s_lastRefresh >= RADAR_REFRESH_MS);
   }
-  if (!s_busyCompose && shouldRefresh) {
+  if (!s_busyCompose && shouldRefresh && !cachePaused()) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
-      Serial.printf("scheduled refresh focus z%d (%s)\n", z,
+      Serial.printf("scheduled refresh focus z%d (%s) [accumulate]\n", z,
                     s_refreshFailAt != 0 ? "retry" : "due");
       zoomPrefetchClear();
-      clearPeerFrameCaches(z, "radar refresh");
-      if (buildAndCache(z, true)) {
+      const bool ok = buildAndCache(z, true);
+      if (ok || frameCacheHas(z)) {
         s_lastRefresh = millis();
         s_refreshFailAt = 0;
       } else {
@@ -405,7 +665,8 @@ void loop() {
     }
   }
 
-  pumpPrefetch();
+  pumpAnimZoomGrace();
+  pumpAnimOrPrefetch();
 
   // 预警环淡入：只叠彩环，不每圈强刷进度环
   if (s_cfg.show_alert_ring && alertRingNeedsTick()) {
@@ -416,11 +677,13 @@ void loop() {
   if (millis() - lastBeat >= 5000) {
     lastBeat = millis();
     Serial.printf(
-        "[%lu] heap=%u max=%u wifi=%d z=%d cached=%d ring=%d/%d fs=%u/%u\n",
+        "[%lu] heap=%u max=%u wifi=%d z=%d cached=%d anim=%d ring=%d/%d "
+        "fs=%u/%u\n",
         millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(),
         zoomCurrent(), (int)frameCacheHas(zoomCurrent()),
-        frameCacheCountReady(), frameCacheZoomSlots(),
-        (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+        frameCacheAnimCount(zoomCurrent()), frameCacheCountReady(),
+        frameCacheZoomSlots(), (unsigned)LittleFS.usedBytes(),
+        (unsigned)LittleFS.totalBytes());
   }
 
   delay(10);

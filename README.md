@@ -2,7 +2,7 @@
 
 端上气象雷达摆件固件（见 [`docs/plan.md`](docs/plan.md)）。
 
-**当前进度：** SoftAP / Web 配网（PSK + PEAP）已落地；高德底图 + RainViewer 静帧；BOOT 短按 z3–12；**RGB565 成品全档缓存**（秒切）；空闲按距离铺满；z≥8 雷达双线性上采样。HUD：中心白十字 + 红点、底栏北京时间 `WWW HH:MM`。历史动画尚未做。
+**当前进度：** SoftAP / Web 配网（PSK + PEAP）已落地；高德底图 + RainViewer 静帧；BOOT 短按 z3–10/z12（跳过 z11）；**RGB565 成品全档缓存**（秒切）；空闲按距离铺满；z≥8 雷达双线性上采样。HUD：中心白十字 + 红点、底栏北京时间 `WWW HH:MM`。**按住 BOOT 播放当前档历史动画**（预渲最多 10 帧，5fps，松手停）。
 
 ## 硬件接线
 
@@ -56,7 +56,7 @@ ESP32-C3 Super Mini 若上传失败：按住 **BOOT**，点一下 **RST**，松�
 | `MAP_LAT` / `MAP_LON` | NVS 未保存时的默认地图中心（广州） |
 | `SOFTAP_SSID` / `CONFIG_PORTAL_*` | 热点名、管理 URL、门户超时 |
 | `MAP_ZOOM` | 默认档（7） |
-| `ZOOM_MIN` / `ZOOM_MAX` | 3 / 12 |
+| `ZOOM_MIN` / `ZOOM_MAX` | 3 / 12（跳过 z11） |
 | `RAINVIEWER_MAX_ZOOM` | 7；更高档双线性放大 z7 雷达瓦片 |
 | `TIMEZONE_OFFSET_SEC` | 雷达帧时间 → 底栏显示（默认 UTC+8 北京时间） |
 | `RADAR_REFRESH_MS` | 全档重拉间隔（默认 5 分钟；失败后 `RADAR_REFRESH_RETRY_MS` 60s 重试） |
@@ -83,7 +83,7 @@ HUD 与雷达一并写入 `/frames/zNN.rgb565`，秒切时直接刷缓存，不�
 | 运行中 BOOT **短按** | 循环 z3→…→z12；已缓存档 **Flash→SPI 秒切** |
 | 运行中 BOOT **超长按**（≥10s） | 再次进入 SoftAP 配置 |
 | 未缓存 | 下载瓦片 → 烘焙成品（可较慢） |
-| 空闲 | 按距离预取全部 z3–12（首次约数分钟） |
+| 空闲 | 按距离预取 z3–10/z12（跳过 z11；首次约数分钟） |
 | 约 5 分钟 | 作废其它档成品，先重建当前档，再后台预取其余档；失败约 60s 重试 |
 
 ## 缓存结构

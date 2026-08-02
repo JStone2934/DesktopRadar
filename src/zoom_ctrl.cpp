@@ -20,11 +20,17 @@ void zoomSetCurrent(int zoom) {
   if (zoom > ZOOM_MAX) {
     zoom = ZOOM_MAX;
   }
+  if (zoom == ZOOM_SKIP) {
+    zoom = ZOOM_SKIP - 1;  // z11 → z10
+  }
   s_zoom = zoom;
 }
 
 int zoomCycleNext() {
   int z = s_zoom + 1;
+  if (z == ZOOM_SKIP) {
+    z = ZOOM_SKIP + 1;
+  }
   if (z > ZOOM_MAX) {
     z = ZOOM_MIN;
   }
@@ -33,7 +39,7 @@ int zoomCycleNext() {
 }
 
 bool zoomCanCompose(int zoom) {
-  return zoom >= ZOOM_MIN && zoom <= ZOOM_MAX;
+  return zoom >= ZOOM_MIN && zoom <= ZOOM_MAX && zoom != ZOOM_SKIP;
 }
 
 void zoomPrefetchClear() { s_prefetchLen = 0; }
@@ -55,7 +61,6 @@ static void enqueueUnique(int zoom) {
 
 void zoomPrefetchResetAround(int centerZoom) {
   s_prefetchLen = 0;
-  // DesktopRadar zoom_priority_order：center, ±1, ±2… 铺满 z3–12
   enqueueUnique(centerZoom);
   const int maxDelta = ZOOM_MAX - ZOOM_MIN;
   for (int delta = 1; delta <= maxDelta; ++delta) {

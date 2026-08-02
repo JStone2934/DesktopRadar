@@ -10,10 +10,10 @@ void zoomSetCurrent(int zoom);
 /** 循环 +1（ZOOM_MIN..ZOOM_MAX）。 */
 int zoomCycleNext();
 
-/** 是否可造片（z3–12；z>7 雷达上采样）。 */
+/** 是否可造片（z3–10、z12，跳过 z11；z>7 雷达上采样）。 */
 bool zoomCanCompose(int zoom);
 
-/** 清空并按距离排队入队全部档（z3–12）：当前档优先，再 ±1、±2… */
+/** 清空并按距离排队入队可用档（跳过 ZOOM_SKIP）：当前档优先，再 ±1、±2… */
 void zoomPrefetchResetAround(int centerZoom);
 
 /** 取出下一个预取目标；无则返回 false。 */
