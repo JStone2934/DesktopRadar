@@ -139,7 +139,7 @@ static void handleRoot() {
   html += F("</select><label>SSID</label><input name=\"ssid\" required maxlength=\"32\" "
             "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.ssid);
-  html += F("\"><div class=\"peap-only\" id=\"idRow\"><label>Identity（学号/工号）</label>"
+  html += F("\"><div class=\"peap-only\" id=\"idRow\"><label>用户名</label>"
             "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
             "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.identity);
@@ -272,8 +272,15 @@ static const char* parseForm(AppConfig* cfg) {
 
   Serial.printf("POST args=%d\n", s_server->args());
   for (int i = 0; i < s_server->args(); ++i) {
-    Serial.printf("  %s=[%s]\n", s_server->argName(i).c_str(),
-                  s_server->arg(i).c_str());
+    const String name = s_server->argName(i);
+    // 密码永不打明文；只记是否填写与长度
+    if (name.equalsIgnoreCase("pass") || name.equalsIgnoreCase("password")) {
+      const String v = s_server->arg(i);
+      Serial.printf("  %s=[%s len=%u]\n", name.c_str(),
+                    v.length() ? "***" : "(empty)", (unsigned)v.length());
+    } else {
+      Serial.printf("  %s=[%s]\n", name.c_str(), s_server->arg(i).c_str());
+    }
   }
 
   const String modeStr = s_server->arg("mode");

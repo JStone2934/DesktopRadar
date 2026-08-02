@@ -114,8 +114,12 @@ static bool wifiConnectPeap(const AppConfig& cfg) {
 #endif
 
   WiFi.begin(cfg.ssid);
-  Serial.printf("WiFi PEAP connecting to %s id=%s ...\n", cfg.ssid,
-                cfg.identity);
+  const size_t passLen = strnlen(cfg.pass, sizeof(cfg.pass));
+  Serial.printf("WiFi PEAP connecting to %s id=%s passLen=%u ...\n", cfg.ssid,
+                cfg.identity, (unsigned)passLen);
+  if (passLen == 0) {
+    Serial.println("WiFi PEAP: password empty — check portal save / NVS");
+  }
 
   if (!waitConnected(WIFI_CONNECT_TIMEOUT_MS)) {
     Serial.println("WiFi PEAP connect timeout");
