@@ -24,9 +24,10 @@ static AppConfig s_cfg;
 
 static int s_displayedZoom = -1;
 static uint32_t s_lastRefresh = 0;
+static uint32_t s_refreshFailAt = 0;  // 非 0：上次定时刷新失败，待短重试
 static bool s_busyCompose = false;
 static bool s_wifiOk = false;
-static bool s_statusScreen = false;  // Fetching/Baking 黑底，圆环不 blit 地图
+static bool s_statusScreen = false;  // 首次 Fetching 黑底，圆环不 blit 地图
 static int s_bakeZoom = -1;
 static float s_bakeLocal = 0.0f;
 
@@ -47,6 +48,9 @@ static float globalCacheDone01() {
 }
 
 static void refreshProgressRing() {
+  if (!s_cfg.show_progress) {
+    return;
+  }
   const int under = s_statusScreen ? -1 : s_displayedZoom;
   progressRingUpdate(&lcd, globalCacheDone01(), under);
 }
@@ -76,6 +80,17 @@ static void clearAllFrameCaches(const char* reason) {
   s_displayedZoom = -1;
   Serial.printf("frame caches cleared (%s)\n",
                 reason && reason[0] ? reason : "all");
+}
+
+static void clearPeerFrameCaches(int keepZoom, const char* reason) {
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; z++) {
+    if (z == keepZoom) {
+      continue;
+    }
+    frameCacheRemove(z);
+  }
+  Serial.printf("peer frame caches cleared keep=z%d (%s)\n", keepZoom,
+                reason && reason[0] ? reason : "peers");
 }
 
 static bool nearlySameLoc(float aLat, float aLon, float bLat, float bLon) {
@@ -113,12 +128,14 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   s_bakeZoom = zoom;
   s_bakeLocal = 0.0f;
 
-  if (pushToDisplay) {
+  if (pushToDisplay && s_displayedZoom < 0) {
     char line2[20];
     snprintf(line2, sizeof(line2), "zoom %d", zoom);
     s_statusScreen = true;
     showStatus("Fetching...", line2);
     refreshProgressRing();
+  } else if (pushToDisplay) {
+    Serial.printf("rebuild z%d (keep display)\n", zoom);
   } else {
     Serial.printf("prefetch bake z%d (no display)\n", zoom);
   }
@@ -135,6 +152,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     } else {
       Serial.printf("build z%d fail\n", zoom);
     }
+    frameCacheRestoreStale(zoom);
     s_statusScreen = false;
     refreshProgressRing();
     return false;
@@ -163,7 +181,7 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
   zoomPrefetchClear();
 
   if (!buildAndCache(zoom, true)) {
-    if (!zoomHasPending()) {
+    if (!zoomHasPending() && s_displayedZoom < 0) {
       showStatus("Compose fail", "see serial");
     }
     return;
@@ -229,6 +247,7 @@ static bool tryWifiAndRadar() {
     Serial.printf("compose miss z%d — will retry in loop\n", zoomCurrent());
   }
   s_lastRefresh = millis();
+  s_refreshFailAt = 0;
   return true;
 }
 
@@ -251,6 +270,10 @@ static void runPortalAndApply() {
     if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
       clearAllFrameCaches("location change");
     }
+  }
+
+  if (!s_cfg.show_progress) {
+    progressRingHide(&lcd, s_displayedZoom);
   }
 
   tryWifiAndRadar();
@@ -305,13 +328,13 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiConnect(&s_cfg)) {
       ensureZoomVisible(zoomCurrent(), true);
-      s_lastRefresh = millis();
+      // 不重置 s_lastRefresh：避免闪断推迟整轮雷达刷新
     }
     delay(2000);
     return;
   }
 
-  // 当前档无成品时定期重试（避免首次造片失败后干等 15 分钟刷新）
+  // 当前档无成品时定期重试（避免首次造片失败后干等定时刷新）
   if (!s_busyCompose && !frameCacheHas(zoomCurrent()) &&
       zoomCanCompose(zoomCurrent())) {
     static uint32_t lastUncachedRetry = 0;
@@ -319,19 +342,33 @@ void loop() {
       lastUncachedRetry = millis();
       Serial.printf("retry uncached z%d\n", zoomCurrent());
       ensureZoomVisible(zoomCurrent(), true);
-      s_lastRefresh = millis();
     }
   }
 
-  // 到点后作废全部缩放成品再重建：时间戳烤在 RGB565 里，只刷当前档会导致切档看到旧时间
-  if (millis() - s_lastRefresh >= RADAR_REFRESH_MS) {
-    s_lastRefresh = millis();
+  // 到点或失败短重试：作废其它档并重建当前档；成功才推进 s_lastRefresh
+  // 失败退避中忽略 refreshDue，避免每圈狂刷
+  bool shouldRefresh = false;
+  if (s_refreshFailAt != 0) {
+    shouldRefresh =
+        (millis() - s_refreshFailAt >= RADAR_REFRESH_RETRY_MS);
+  } else {
+    shouldRefresh = (millis() - s_lastRefresh >= RADAR_REFRESH_MS);
+  }
+  if (!s_busyCompose && shouldRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
-      Serial.printf("scheduled refresh all zooms (focus z%d)\n", z);
+      Serial.printf("scheduled refresh focus z%d (%s)\n", z,
+                    s_refreshFailAt != 0 ? "retry" : "due");
       zoomPrefetchClear();
-      clearAllFrameCaches("radar refresh");
-      buildAndCache(z, true);
+      clearPeerFrameCaches(z, "radar refresh");
+      if (buildAndCache(z, true)) {
+        s_lastRefresh = millis();
+        s_refreshFailAt = 0;
+      } else {
+        s_refreshFailAt = millis() == 0 ? 1 : millis();
+        Serial.printf("refresh fail, retry in %lus\n",
+                      (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL));
+      }
       handlePendingZoom();
       zoomPrefetchResetAround(zoomCurrent());
     }

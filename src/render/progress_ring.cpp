@@ -54,8 +54,8 @@ void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
 
   if (completed) {
     if (s_ringVisible) {
-      if (underlayZoom >= ZOOM_MIN && frameCacheHas(underlayZoom)) {
-        frameCacheBlit(lcd, underlayZoom);
+      if (underlayZoom >= ZOOM_MIN && frameCacheBlitUnderlay(lcd, underlayZoom)) {
+        // 已用旧/新成品擦掉环带
       } else {
         lcd->fillArc(cx, cy, rOuter, rInner, 0.0f, 360.0f, TFT_BLACK);
       }
@@ -66,10 +66,10 @@ void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
     return;
   }
 
-  if (underlayZoom >= ZOOM_MIN && frameCacheHas(underlayZoom)) {
-    frameCacheBlit(lcd, underlayZoom);
+  if (underlayZoom >= ZOOM_MIN && frameCacheBlitUnderlay(lcd, underlayZoom)) {
+    // 无缝更新：即使尚未 ready 也可 blit 旧成品
   } else {
-    // 状态黑屏：先擦环带再画剩余，避免变短时白痕残留
+    // 无底图：先擦环带再画剩余，避免变短时白痕残留
     lcd->fillArc(cx, cy, rOuter, rInner, 0.0f, 360.0f, TFT_BLACK);
   }
   paintRemainingArc(lcd, remaining);
@@ -84,7 +84,7 @@ void progressRingHide(LGFX* lcd, int underlayZoom) {
     return;
   }
   s_ringVisible = false;
-  if (lcd && underlayZoom >= ZOOM_MIN && frameCacheHas(underlayZoom)) {
-    frameCacheBlit(lcd, underlayZoom);
+  if (lcd && underlayZoom >= ZOOM_MIN) {
+    frameCacheBlitUnderlay(lcd, underlayZoom);
   }
 }

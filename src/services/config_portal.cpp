@@ -106,7 +106,7 @@ static void handleRoot() {
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
   String html;
-  html.reserve(3800);
+  html.reserve(5200);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
@@ -122,6 +122,8 @@ static void handleRoot() {
             ".hint{color:#aaa;font-size:.8rem;margin:4px 0 12px}"
             "button{width:100%;padding:12px;margin-top:16px;border:0;border-radius:8px;"
             "background:#2a7;color:#fff;font-size:1rem}"
+            "button.btn-geo{margin-top:10px;background:#444;font-size:.95rem}"
+            "button.btn-geo:disabled{opacity:.6}"
             ".peap-only{display:none}</style></head><body>"
             "<h1>桌面雷达设置</h1>"
             "<p class=\"hint\">连热点 Radar-Setup 后填写。密码留空=不修改。"
@@ -146,27 +148,59 @@ static void handleRoot() {
             "<input name=\"pass\" type=\"password\" maxlength=\"64\" value=\"\" "
             "autocomplete=\"new-password\">"
             "<label>纬度</label><div class=\"row\">"
-            "<select name=\"lat_hem\" autocomplete=\"off\">");
+            "<select name=\"lat_hem\" id=\"lat_hem\" autocomplete=\"off\">");
   html += latSouth ? F("<option value=\"N\">北纬</option>"
                        "<option value=\"S\" selected>南纬</option>")
                    : F("<option value=\"N\" selected>北纬</option>"
                        "<option value=\"S\">南纬</option>");
-  html += F("</select><input name=\"lat\" inputmode=\"decimal\" required maxlength=\"16\" "
-            "autocomplete=\"off\" placeholder=\"0~90\" value=\"");
+  html += F("</select><input name=\"lat\" id=\"lat\" inputmode=\"decimal\" required "
+            "maxlength=\"16\" autocomplete=\"off\" placeholder=\"0~90\" value=\"");
   html += latBuf;
   html += F("\"></div><label>经度</label><div class=\"row\">"
-            "<select name=\"lon_hem\" autocomplete=\"off\">");
+            "<select name=\"lon_hem\" id=\"lon_hem\" autocomplete=\"off\">");
   html += lonWest ? F("<option value=\"E\">东经</option>"
                       "<option value=\"W\" selected>西经</option>")
                   : F("<option value=\"E\" selected>东经</option>"
                       "<option value=\"W\">西经</option>");
-  html += F("</select><input name=\"lon\" inputmode=\"decimal\" required maxlength=\"16\" "
-            "autocomplete=\"off\" placeholder=\"0~180\" value=\"");
+  html += F("</select><input name=\"lon\" id=\"lon\" inputmode=\"decimal\" required "
+            "maxlength=\"16\" autocomplete=\"off\" placeholder=\"0~180\" value=\"");
   html += lonBuf;
-  html += F("\"></div><button type=\"submit\">保存并继续</button></form>"
-            "<script>function tog(){var p=document.getElementById('mode').value==='1';"
+  html += F("\"></div>"
+            "<button type=\"button\" class=\"btn-geo\" id=\"geoBtn\" "
+            "onclick=\"doGeo()\">获取当前位置</button>"
+            "<p class=\"hint\" id=\"geoHint\"></p>"
+            "<label>显示进度环</label><select name=\"show_ring\" "
+            "autocomplete=\"off\">");
+  html += s_seedCfg.show_progress
+              ? F("<option value=\"1\" selected>显示</option>"
+                  "<option value=\"0\">隐藏</option>")
+              : F("<option value=\"1\">显示</option>"
+                  "<option value=\"0\" selected>隐藏</option>");
+  html += F("</select><button type=\"submit\">保存并继续</button></form>"
+            "<script>"
+            "function tog(){var p=document.getElementById('mode').value==='1';"
             "document.getElementById('idRow').style.display=p?'block':'none';"
-            "document.getElementById('identity').required=p;}tog();</script>"
+            "document.getElementById('identity').required=p;}"
+            "function geoFail(){var h=document.getElementById('geoHint');"
+            "h.textContent='当前浏览器不支持，请手动填写或从地图复制';"
+            "var b=document.getElementById('geoBtn');b.disabled=false;"
+            "b.textContent='获取当前位置';}"
+            "function doGeo(){"
+            "var h=document.getElementById('geoHint');h.textContent='';"
+            "if(!navigator.geolocation){geoFail();return;}"
+            "var b=document.getElementById('geoBtn');b.disabled=true;"
+            "b.textContent='定位中…';"
+            "navigator.geolocation.getCurrentPosition(function(pos){"
+            "var la=pos.coords.latitude,lo=pos.coords.longitude;"
+            "document.getElementById('lat_hem').value=la<0?'S':'N';"
+            "document.getElementById('lon_hem').value=lo<0?'W':'E';"
+            "document.getElementById('lat').value=Math.abs(la).toFixed(5);"
+            "document.getElementById('lon').value=Math.abs(lo).toFixed(5);"
+            "h.textContent='已填入当前坐标';"
+            "b.disabled=false;b.textContent='获取当前位置';"
+            "},function(){geoFail();},"
+            "{enableHighAccuracy:true,timeout:15000,maximumAge:0});}"
+            "tog();</script>"
             "</body></html>");
   sendNoStoreHeaders();
   s_server->send(200, "text/html; charset=utf-8", html);
@@ -180,7 +214,7 @@ static const char kSavedHtml[] PROGMEM = R"HTML(
 <title>Saved</title>
 <style>body{font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px}</style>
 </head><body><h1>已保存</h1><p>设备将关闭热点并继续运行…</p>
-<p style="color:#888;font-size:.85rem">下次配置请打开 http://192.168.4.1/</p>
+<p style="color:#888;font-size:.85rem">下次请打开 http://192.168.4.1/ （不要用 /done）</p>
 </body></html>
 )HTML";
 
@@ -190,6 +224,17 @@ static void handleDone() {
   }
   s_webActive = true;
   sendNoStoreHeaders();
+
+  // 仅「刚 POST 保存成功」才出完成页；历史记录/强制门户再开 /done 时回表单，
+  // 避免非无痕浏览器一连热点就跳到「已保存」并误关门户。
+  if (s_saveRedirectAt == 0) {
+    Serial.println("portal: /done without pending save -> /");
+    s_server->sendHeader("Location", "/", true);
+    s_server->send(302, "text/plain", "");
+    return;
+  }
+
+  s_server->sendHeader("Clear-Site-Data", "\"cache\"");
   s_server->send_P(200, "text/html; charset=utf-8", kSavedHtml);
   // 浏览器跟完 PRG 拿到完成页后再关热点，避免历史记录卡在 POST
   s_saved = true;
@@ -306,6 +351,7 @@ static const char* parseForm(AppConfig* cfg) {
   // 缺省按北纬/东经（国内默认）
   cfg->lat = lat;
   cfg->lon = lon;
+  cfg->show_progress = (s_server->arg("show_ring") != "0");
   return nullptr;
 }
 
@@ -330,8 +376,9 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f\n",
-                (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon);
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d\n",
+                (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
+                (int)cfg.show_progress);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();
   s_server->sendHeader("Location", "/done", true);

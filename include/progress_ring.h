@@ -5,7 +5,7 @@
 /**
  * 屏缘白色圆环：表示全局缓存剩余量。
  * done01=0 满环；done01=1 消失。
- * underlayZoom>=0 且已缓存时先 blit 再画环（缩短时恢复地图边缘）。
+ * underlayZoom>=0 时优先 blit 成品（含造片中未 ready 的旧图）再画环。
  */
 void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom);
 

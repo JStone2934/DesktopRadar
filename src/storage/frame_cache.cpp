@@ -48,6 +48,44 @@ static void rgbPath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.rgb565", zoom);
 }
 
+static void rgbNewPath(int zoom, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d.rgb565.new", zoom);
+}
+
+/** 打开并校验成品长度；成功时返回已打开的 File（调用方关闭）。 */
+static bool openRgb565IfValid(int zoom, File* out) {
+  if (!out) {
+    return false;
+  }
+  char path[40];
+  rgbPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() != FRAME_RGB565_BYTES) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+  *out = f;
+  return true;
+}
+
+static bool blitRgb565File(LGFX* lcd, File& f) {
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+  uint16_t row[LCD_WIDTH];
+  for (int y = 0; y < LCD_HEIGHT; ++y) {
+    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
+        (int)FRAME_ROW_BYTES) {
+      lcd->setSwapBytes(prevSwap);
+      return false;
+    }
+    lcd->pushImage(0, y, LCD_WIDTH, 1, row);
+  }
+  lcd->setSwapBytes(prevSwap);
+  return true;
+}
+
 void frameCacheTilePath(int zoom, bool isRadar, int tx, int ty, char* out,
                         size_t outLen) {
   snprintf(out, outLen, "/frames/z%02d/%c_%d_%d.png", zoom, isRadar ? 'r' : 'b',
@@ -228,35 +266,36 @@ bool frameCacheBlit(LGFX* lcd, int zoom) {
   if (!lcd || !frameCacheHas(zoom)) {
     return false;
   }
-  char path[40];
-  rgbPath(zoom, path, sizeof(path));
-  File f = LittleFS.open(path, "r");
-  if (!f) {
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
     return false;
   }
   // 缓存内存放 native RGB565（与 color565 一致）；
   // LovyanGFX 默认将 uint16_t* 当作 swap565，必须 setSwapBytes(true)
-  const bool prevSwap = lcd->getSwapBytes();
-  lcd->setSwapBytes(true);
-  uint16_t row[LCD_WIDTH];
-  for (int y = 0; y < LCD_HEIGHT; ++y) {
-    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
-        (int)FRAME_ROW_BYTES) {
-      lcd->setSwapBytes(prevSwap);
-      f.close();
-      return false;
-    }
-    lcd->pushImage(0, y, LCD_WIDTH, 1, row);
-  }
-  lcd->setSwapBytes(prevSwap);
+  const bool ok = blitRgb565File(lcd, f);
   f.close();
-  return true;
+  return ok;
+}
+
+bool frameCacheBlitUnderlay(LGFX* lcd, int zoom) {
+  if (!lcd || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+  const bool ok = blitRgb565File(lcd, f);
+  f.close();
+  return ok;
 }
 
 bool frameCacheRemove(int zoom) {
   scrubTemp(zoom);
   char path[40];
   rgbPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  rgbNewPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
   readyPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
@@ -265,7 +304,13 @@ bool frameCacheRemove(int zoom) {
 }
 
 bool frameCachePrepare(int zoom) {
-  frameCacheRemove(zoom);
+  // 清临时瓦片与 ready，保留旧 .rgb565 供无缝底图
+  scrubTemp(zoom);
+  readyMaskSet(zoom, false);
+  char path[40];
+  rgbNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+
   if (!LittleFS.exists("/frames")) {
     LittleFS.mkdir("/frames");
   }
@@ -278,6 +323,30 @@ bool frameCachePrepare(int zoom) {
       return false;
     }
   }
+  return true;
+}
+
+bool frameCacheRestoreStale(int zoom) {
+  char path[40];
+  rgbNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+  f.close();
+
+  readyPath(zoom, path, sizeof(path));
+  File r = LittleFS.open(path, "w");
+  if (!r) {
+    Serial.printf("restore ready open fail z%d\n", zoom);
+    return false;
+  }
+  r.print("1");
+  r.close();
+  readyMaskSet(zoom, true);
+  Serial.printf("frameCache restore stale z%d\n", zoom);
   return true;
 }
 
@@ -438,7 +507,8 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
     return false;
   }
   char path[40];
-  rgbPath(zoom, path, sizeof(path));
+  rgbNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
   File f = LittleFS.open(path, "w");
   if (!f) {
     return false;
@@ -449,6 +519,27 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
   f.close();
   if (wrote != FRAME_RGB565_BYTES) {
     LittleFS.remove(path);
+    return false;
+  }
+  return true;
+}
+
+bool frameCachePromoteNewNoReady(int zoom) {
+  char newPath[40];
+  char path[40];
+  rgbNewPath(zoom, newPath, sizeof(newPath));
+  File f = LittleFS.open(newPath, "r");
+  if (!f || f.size() != FRAME_RGB565_BYTES) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+  f.close();
+  rgbPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  if (!LittleFS.rename(newPath, path)) {
+    Serial.printf("promote rename fail z%d\n", zoom);
     return false;
   }
   return true;
@@ -981,19 +1072,12 @@ void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
 }
 
 bool frameCacheCommit(int zoom) {
-  char path[40];
-  rgbPath(zoom, path, sizeof(path));
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() != FRAME_RGB565_BYTES) {
-    Serial.printf("commit reject z%d size=%u\n", zoom,
-                  f ? (unsigned)f.size() : 0);
-    if (f) {
-      f.close();
-    }
+  if (!frameCachePromoteNewNoReady(zoom)) {
+    Serial.printf("commit reject z%d (promote fail)\n", zoom);
     return false;
   }
-  f.close();
 
+  char path[40];
   // 删除临时瓦片（保留 rgb565）
   Viewport vp{};
   bool haveRadar = false;
@@ -1015,13 +1099,13 @@ bool frameCacheCommit(int zoom) {
   // 清空目录内残留后再 rmdir
   File d = LittleFS.open(dir);
   if (d && d.isDirectory()) {
-    File f = d.openNextFile();
-    while (f) {
+    File entry = d.openNextFile();
+    while (entry) {
       char child[64];
-      snprintf(child, sizeof(child), "%s/%s", dir, f.name());
-      f.close();
+      snprintf(child, sizeof(child), "%s/%s", dir, entry.name());
+      entry.close();
       LittleFS.remove(child);
-      f = d.openNextFile();
+      entry = d.openNextFile();
     }
   }
   if (d) {

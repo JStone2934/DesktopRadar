@@ -13,6 +13,7 @@ static constexpr const char* kKeyPass = "pass";
 static constexpr const char* kKeyId = "id";
 static constexpr const char* kKeyLat = "lat";
 static constexpr const char* kKeyLon = "lon";
+static constexpr const char* kKeyShowRing = "show_ring";
 
 void appConfigSetDefaults(AppConfig* cfg) {
   if (!cfg) {
@@ -25,6 +26,7 @@ void appConfigSetDefaults(AppConfig* cfg) {
   cfg->identity[0] = '\0';
   cfg->lat = MAP_LAT;
   cfg->lon = MAP_LON;
+  cfg->show_progress = true;
 }
 
 bool appConfigHasSaved() {
@@ -63,6 +65,7 @@ bool appConfigLoad(AppConfig* cfg) {
   String id = prefs.getString(kKeyId, "");
   cfg->lat = prefs.getFloat(kKeyLat, MAP_LAT);
   cfg->lon = prefs.getFloat(kKeyLon, MAP_LON);
+  cfg->show_progress = prefs.getBool(kKeyShowRing, true);
   prefs.end();
 
   strncpy(cfg->ssid, ssid.c_str(), sizeof(cfg->ssid) - 1);
@@ -100,6 +103,7 @@ bool appConfigSave(const AppConfig* cfg) {
   prefs.putString(kKeyId, cfg->identity);
   prefs.putFloat(kKeyLat, cfg->lat);
   prefs.putFloat(kKeyLon, cfg->lon);
+  prefs.putBool(kKeyShowRing, cfg->show_progress);
   prefs.end();
   return true;
 }

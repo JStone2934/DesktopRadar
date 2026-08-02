@@ -431,13 +431,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       zoom, vp.tx0, vp.tx1, vp.ty0, vp.ty1, overlayZoom, scale, rtx0, rtx1, rty0,
       rty1, (int)pushToDisplay);
 
-  if (pushToDisplay) {
-    lcd->fillScreen(TFT_BLACK);
-    lcd->setTextDatum(MC_DATUM);
-    lcd->setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd->setFont(&fonts::Font2);
-    lcd->drawString("Downloading...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
-  }
+  // 不中途黑屏：已有画面时保持 LCD；仅结束时 pushImage 替换
   reportComposeProgress(zoom, 0.02f);
 
   RainviewerFrame meta;
@@ -517,13 +511,6 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   frameCacheWriteMeta(zoom, vp, radarOk > 0, overlayZoom, scale, rtx0, rty0, rtx1,
                       rty1);
 
-  if (pushToDisplay) {
-    lcd->fillScreen(TFT_BLACK);
-    lcd->setTextDatum(MC_DATUM);
-    lcd->setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd->setFont(&fonts::Font2);
-    lcd->drawString("Baking...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
-  }
   reportComposeProgress(zoom, 0.78f);
   logHeap("before-bake");
   // 只清其它档残留，保留当前档刚下载的 PNG
@@ -684,6 +671,12 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   }
 
   if (!allowCommit) {
+    if (pushToDisplay) {
+      // 已上屏；替换 Flash 旧图供进度环，但不标 ready（无雷达不秒切）
+      if (frameCacheWriteRgb565(zoom, frame)) {
+        frameCachePromoteNewNoReady(zoom);
+      }
+    }
     free(frame);
     Serial.println("compose display-only (no radar cache commit)");
     return pushToDisplay;

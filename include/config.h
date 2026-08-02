@@ -78,5 +78,7 @@
 // 提升以作废旧缓存；7=底图 8-bit 压暗纠偏绿
 #define FRAME_CACHE_GEN 7
 
-// 雷达静帧刷新间隔
-#define RADAR_REFRESH_MS (15UL * 60UL * 1000UL)
+// 雷达静帧刷新间隔（对齐 DesktopRadar 默认 300s）
+#define RADAR_REFRESH_MS (5UL * 60UL * 1000UL)
+// 定时刷新失败/中止后重试间隔
+#define RADAR_REFRESH_RETRY_MS (60UL * 1000UL)

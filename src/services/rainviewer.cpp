@@ -8,7 +8,7 @@
 
 static RainviewerFrame s_metaCache;
 static uint32_t s_metaCacheMs = 0;
-static const uint32_t kMetaCacheTtlMs = 10UL * 60UL * 1000UL;
+static const uint32_t kMetaCacheTtlMs = 60UL * 1000UL;
 
 static bool rainviewerFetchLatestOnce(RainviewerFrame* out) {
   size_t len = 0;

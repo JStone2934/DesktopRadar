@@ -59,7 +59,7 @@ ESP32-C3 Super Mini 若上传失败：按住 **BOOT**，点一下 **RST**，松�
 | `ZOOM_MIN` / `ZOOM_MAX` | 3 / 12 |
 | `RAINVIEWER_MAX_ZOOM` | 7；更高档双线性放大 z7 雷达瓦片 |
 | `TIMEZONE_OFFSET_SEC` | 雷达帧时间 → 底栏显示（默认 UTC+8 北京时间） |
-| `RADAR_REFRESH_MS` | 全档重拉间隔（默认 15 分钟） |
+| `RADAR_REFRESH_MS` | 全档重拉间隔（默认 5 分钟；失败后 `RADAR_REFRESH_RETRY_MS` 60s 重试） |
 | `FRAME_CACHE_GEN` | 升高后启动清旧成品并重烘焙 |
 
 ## 显示（对齐 DesktopRadar 静帧 HUD）
@@ -84,7 +84,7 @@ HUD 与雷达一并写入 `/frames/zNN.rgb565`，秒切时直接刷缓存，不�
 | 运行中 BOOT **超长按**（≥10s） | 再次进入 SoftAP 配置 |
 | 未缓存 | 下载瓦片 → 烘焙成品（可较慢） |
 | 空闲 | 按距离预取全部 z3–12（首次约数分钟） |
-| 约 15 分钟 | 作废全部 z3–12 成品，先重建当前档，再后台预取其余档 |
+| 约 5 分钟 | 作废其它档成品，先重建当前档，再后台预取其余档；失败约 60s 重试 |
 
 ## 缓存结构
 
