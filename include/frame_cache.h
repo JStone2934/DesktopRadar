@@ -91,6 +91,9 @@ bool frameCacheCreateRgb565(int zoom, uint16_t backdropColor);
 /** 将内存中的 240×240 RGB565 写入 .rgb565.new（不覆盖旧成品）。 */
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame);
 
+/** 读已就绪静帧到内存缓冲（需 FRAME_RGB565_BYTES）。 */
+bool frameCacheLoadRgb565(int zoom, uint16_t* frame);
+
 /**
  * 将 .rgb565.new 替换为正式 .rgb565，不写 ready。
  * 用于无雷达时仅上屏、供进度环底图。
@@ -163,8 +166,12 @@ uint32_t frameCacheAnimTime(int zoom, int index);
 
 void frameCacheAnimClear(int zoom);
 void frameCacheAnimClearAll();
+/** 清掉除 keepZoom 外所有档的动画队列（换档后下一轮刷新用）。 */
+void frameCacheAnimClearOthers(int keepZoom);
+/** 清空本档动画并重建空目录（不动其它档）。 */
+bool frameCacheAnimBeginFill(int zoom);
 
-/** 确保 /anim/zNN 目录存在；清其它 zoom 的动画集。 */
+/** 确保 /anim/zNN 目录存在；清其它 zoom 的动画集并重建本档空目录。 */
 bool frameCacheAnimPrepare(int zoom);
 
 /** 写入一帧 RGB565（fII.rgb565）；不写 meta。 */

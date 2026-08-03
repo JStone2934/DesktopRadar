@@ -765,6 +765,20 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
   return true;
 }
 
+bool frameCacheLoadRgb565(int zoom, uint16_t* frame) {
+  if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+  const size_t n =
+      f.read(reinterpret_cast<uint8_t*>(frame), FRAME_RGB565_BYTES);
+  f.close();
+  return n == FRAME_RGB565_BYTES;
+}
+
 bool frameCachePromoteNewNoReady(int zoom) {
   char newPath[40];
   char path[40];
@@ -1619,6 +1633,18 @@ void frameCacheAnimClearAll() {
   }
 }
 
+void frameCacheAnimClearOthers(int keepZoom) {
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    if (z == ZOOM_SKIP || z == keepZoom) {
+      continue;
+    }
+    if (frameCacheAnimStoredCount(z) > 0) {
+      Serial.printf("anim clear other z%d (keep z%d)\n", z, keepZoom);
+      frameCacheAnimClear(z);
+    }
+  }
+}
+
 bool frameCacheAnimPrepare(int zoom) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return false;
@@ -1903,6 +1929,14 @@ static bool animEnsureDir(int zoom) {
     }
   }
   return true;
+}
+
+bool frameCacheAnimBeginFill(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  frameCacheAnimClear(zoom);
+  return animEnsureDir(zoom);
 }
 
 bool frameCacheAnimAppendFromStatic(int zoom, uint32_t timeSec) {

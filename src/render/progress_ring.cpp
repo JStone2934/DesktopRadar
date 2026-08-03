@@ -8,14 +8,37 @@
 static bool s_barVisible = false;
 static float s_lastDone = -1.0f;
 static uint32_t s_lastDrawMs = 0;
+static int s_lastHalf = 0;
 
 static inline int barY() { return LCD_HEIGHT - OVERLAY_BAR_H; }
 
-static void eraseBar(LGFX* lcd) {
-  if (!lcd) {
+/** 进度条半宽上限：避免画到屏缘预警环带（底栏顶边与环相交处）。 */
+static int maxSafeHalf() {
+  const int cy = LCD_HEIGHT / 2;
+  const int dy = barY() - cy;
+  const int rInner = (LCD_WIDTH / 2) - 1 - 3;
+  const int dy2 = dy * dy;
+  const int rI2 = rInner * rInner;
+  if (dy2 >= rI2) {
+    return 0;
+  }
+  int m = (int)floorf(sqrtf((float)(rI2 - dy2))) - 2;
+  if (m < 1) {
+    m = 1;
+  }
+  const int hard = LCD_WIDTH / 2 - 4;
+  return m < hard ? m : hard;
+}
+
+static void eraseHalf(LGFX* lcd, int half) {
+  if (!lcd || half <= 0) {
     return;
   }
-  lcd->fillRect(0, barY(), LCD_WIDTH, PROGRESS_BAR_THICK, TFT_BLACK);
+  const int cx = LCD_WIDTH / 2;
+  if (half > LCD_WIDTH / 2) {
+    half = LCD_WIDTH / 2;
+  }
+  lcd->fillRect(cx - half, barY(), half * 2, PROGRESS_BAR_THICK, TFT_BLACK);
 }
 
 static void paintBar(LGFX* lcd, float done01) {
@@ -26,22 +49,26 @@ static void paintBar(LGFX* lcd, float done01) {
     done01 = 1.0f;
   }
   const int cx = LCD_WIDTH / 2;
-  int half = (int)lroundf(done01 * (float)(LCD_WIDTH / 2));
+  const int safe = maxSafeHalf();
+  int half = (int)lroundf(done01 * (float)safe);
   if (half < 1) {
     half = 1;
   }
-  if (half > LCD_WIDTH / 2) {
-    half = LCD_WIDTH / 2;
+  if (half > safe) {
+    half = safe;
   }
-  // 先整条顶边涂黑再画白段，避免变短时白痕残留
-  eraseBar(lcd);
+  // 只擦旧白段再画，绝不全宽涂黑，避免伤预警环
+  if (s_lastHalf > half) {
+    eraseHalf(lcd, s_lastHalf);
+  }
   lcd->fillRect(cx - half, barY(), half * 2, PROGRESS_BAR_THICK, TFT_WHITE);
+  s_lastHalf = half;
 }
 
-void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
+bool progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
   (void)underlayZoom;
   if (!lcd) {
-    return;
+    return false;
   }
   if (done01 < 0.0f) {
     done01 = 0.0f;
@@ -55,31 +82,38 @@ void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
   const bool bigStep = (s_lastDone < 0.0f) ||
                        (fabsf(done01 - s_lastDone) >= 0.02f) || completed;
   if (!completed && !bigStep && (now - s_lastDrawMs) < 180) {
-    return;
+    return false;
   }
 
   if (completed) {
+    bool painted = false;
     if (s_barVisible) {
-      eraseBar(lcd);
+      eraseHalf(lcd, s_lastHalf > 0 ? s_lastHalf : maxSafeHalf());
       s_barVisible = false;
+      s_lastHalf = 0;
+      painted = true;
     }
     s_lastDone = 1.0f;
     s_lastDrawMs = now;
-    return;
+    return painted;
   }
 
   paintBar(lcd, done01);
   s_barVisible = true;
   s_lastDone = done01;
   s_lastDrawMs = now;
+  return true;
 }
 
-void progressRingHide(LGFX* lcd, int underlayZoom) {
+bool progressRingHide(LGFX* lcd, int underlayZoom) {
   (void)underlayZoom;
   s_lastDone = -1.0f;
   if (!s_barVisible) {
-    return;
+    s_lastHalf = 0;
+    return false;
   }
   s_barVisible = false;
-  eraseBar(lcd);
+  eraseHalf(lcd, s_lastHalf > 0 ? s_lastHalf : maxSafeHalf());
+  s_lastHalf = 0;
+  return true;
 }

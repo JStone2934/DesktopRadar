@@ -55,8 +55,9 @@
 
 // ---- BOOT 按键（GPIO9）----
 #define PIN_BTN_BOOT 9
-// 短按：按下时长小于此值（放宽，避免轻按无响应）
-#define BTN_SHORT_MS 800
+// 短按 / 按住播放阈值（对齐 DesktopRadar long_press_ms=500）
+#define BTN_HOLD_PLAY_MS 500
+#define BTN_SHORT_MS BTN_HOLD_PLAY_MS
 #define BTN_MED_MS 1500
 #define BTN_LONG_MS 10000
 
@@ -84,8 +85,9 @@
 #define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
 
-// 存储层仍保留未接线的 anim API 编译所需常量（按住播放已暂时关闭）
+#define ANIM_FPS 5
 #define ANIM_MAX_FRAMES 10
+#define ANIM_FRAME_INTERVAL_MS (1000UL / (unsigned)ANIM_FPS)
 #define ANIM_WINDOW_HOURS 6.0f
 #define ANIM_SPACE_RED_BYTES (2UL * FRAME_RGB565_BYTES)
 

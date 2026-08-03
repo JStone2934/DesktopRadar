@@ -39,17 +39,16 @@ static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
   if (a >= 255) {
     return src;
   }
-  const int inv = 255 - (int)a;
-  const int sr = ((src >> 11) & 0x1F) * 255 / 31;
-  const int sg = ((src >> 5) & 0x3F) * 255 / 63;
-  const int sb = (src & 0x1F) * 255 / 31;
-  const int dr = ((dst >> 11) & 0x1F) * 255 / 31;
-  const int dg = ((dst >> 5) & 0x3F) * 255 / 63;
-  const int db = (dst & 0x1F) * 255 / 31;
-  const int r = (sr * (int)a + dr * inv + 127) / 255;
-  const int g = (sg * (int)a + dg * inv + 127) / 255;
-  const int b = (sb * (int)a + db * inv + 127) / 255;
-  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+  // 565 通道近似混合（避免逐通道扩到 8bit）
+  const uint32_t alpha = a;
+  const uint32_t inv = 255u - alpha;
+  const uint32_t s = src;
+  const uint32_t d = dst;
+  const uint32_t rb =
+      (((s & 0xF81Fu) * alpha) + ((d & 0xF81Fu) * inv)) >> 8;
+  const uint32_t g =
+      (((s & 0x07E0u) * alpha) + ((d & 0x07E0u) * inv)) >> 8;
+  return (uint16_t)((rb & 0xF81Fu) | (g & 0x07E0u));
 }
 
 /**
@@ -136,7 +135,7 @@ static bool paintCachedFaded(LGFX* lcd, uint8_t alpha) {
   // 按行聚合连续段 pushImage（比逐点 writePixel 快）
   const bool prevSwap = lcd->getSwapBytes();
   lcd->setSwapBytes(true);
-  uint16_t spanBuf[64];
+  uint16_t spanBuf[LCD_WIDTH];
   int i = 0;
   while (i < s_underCount) {
     const int y = s_underY[i];
@@ -148,8 +147,7 @@ static bool paintCachedFaded(LGFX* lcd, uint8_t alpha) {
     while (p < j) {
       const int x0 = s_underX[p];
       int q = p + 1;
-      while (q < j && s_underX[q] == (uint8_t)(s_underX[q - 1] + 1) &&
-             (q - p) < (int)(sizeof(spanBuf) / sizeof(spanBuf[0]))) {
+      while (q < j && s_underX[q] == (uint8_t)(s_underX[q - 1] + 1)) {
         ++q;
       }
       const int len = q - p;
