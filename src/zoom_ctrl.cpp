@@ -5,11 +5,40 @@
 #include "frame_cache.h"
 
 static int s_zoom = MAP_ZOOM;
+static int s_displayedZoom = -1;
 static int s_prefetchQ[ZOOM_MAX - ZOOM_MIN + 1];
 static int s_prefetchLen = 0;
+static uint32_t s_prefetchCoolUntil[ZOOM_MAX - ZOOM_MIN + 1];
 static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
 static ZoomPendingFeedbackFn s_pendingFeedback = nullptr;
+
+static constexpr uint32_t kPrefetchFailCoolMs = 45000UL;
+
+static inline int coolSlot(int zoom) { return zoom - ZOOM_MIN; }
+
+static bool zoomPrefetchCooling(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return true;
+  }
+  return (int32_t)(millis() - s_prefetchCoolUntil[coolSlot(zoom)]) < 0;
+}
+
+void zoomPrefetchNoteFail(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  s_prefetchCoolUntil[coolSlot(zoom)] = millis() + kPrefetchFailCoolMs;
+  Serial.printf("prefetch cool z%d for %lus\n", zoom,
+                (unsigned long)(kPrefetchFailCoolMs / 1000UL));
+}
+
+void zoomPrefetchNoteOk(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  s_prefetchCoolUntil[coolSlot(zoom)] = 0;
+}
 
 int zoomCurrent() { return s_zoom; }
 
@@ -23,23 +52,45 @@ void zoomSetCurrent(int zoom) {
   s_zoom = zoom;
 }
 
-int zoomCycleNext() {
-  int z = s_zoom + 1;
-  if (z > ZOOM_MAX) {
-    z = ZOOM_MIN;
+void zoomNoteDisplayed(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    s_displayedZoom = -1;
+    return;
   }
-  s_zoom = z;
+  s_displayedZoom = zoom;
+}
+
+int zoomDisplayed() { return s_displayedZoom; }
+
+int zoomCycleNext() {
+  int z = s_zoom;
+  for (int i = 0; i < (ZOOM_MAX - ZOOM_MIN + 1); ++i) {
+    ++z;
+    if (z > ZOOM_MAX) {
+      z = ZOOM_MIN;
+    }
+    if (zoomCanCompose(z)) {
+      s_zoom = z;
+      return s_zoom;
+    }
+  }
   return s_zoom;
 }
 
 bool zoomCanCompose(int zoom) {
-  return zoom >= ZOOM_MIN && zoom <= ZOOM_MAX;
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  if (zoom == ZOOM_SKIP) {
+    return false;
+  }
+  return true;
 }
 
 void zoomPrefetchClear() { s_prefetchLen = 0; }
 
 static void enqueueUnique(int zoom) {
-  if (!zoomCanCompose(zoom) || frameCacheHas(zoom)) {
+  if (!zoomCanCompose(zoom) || frameCacheHas(zoom) || zoomPrefetchCooling(zoom)) {
     return;
   }
   for (int i = 0; i < s_prefetchLen; ++i) {
@@ -72,7 +123,7 @@ bool zoomPrefetchPop(int* outZoom) {
     s_prefetchQ[i - 1] = s_prefetchQ[i];
   }
   --s_prefetchLen;
-  if (frameCacheHas(*outZoom)) {
+  if (frameCacheHas(*outZoom) || zoomPrefetchCooling(*outZoom)) {
     return zoomPrefetchPop(outZoom);
   }
   return true;
@@ -92,6 +143,14 @@ int zoomTakePending() {
 
 bool zoomHasPending() { return s_pendingZoom >= 0; }
 
+bool zoomClearPendingIf(int zoom) {
+  if (s_pendingZoom != zoom) {
+    return false;
+  }
+  s_pendingZoom = -1;
+  return true;
+}
+
 void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn) {
   s_pendingFeedback = fn;
 }
@@ -100,6 +159,13 @@ void inputServiceDuringBlock() {
   const ButtonEvent ev = buttonPoll();
   if (ev != ButtonEvent::ShortPress) {
     return;
+  }
+  // 以屏上所见档为基准 +1，避免造片失败后逻辑档超前造成跳档
+  if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX &&
+      s_displayedZoom != s_zoom) {
+    Serial.printf("input resync logic=z%d display=z%d\n", s_zoom,
+                  s_displayedZoom);
+    s_zoom = s_displayedZoom;
   }
   const int next = zoomCycleNext();
   zoomSetPending(next);

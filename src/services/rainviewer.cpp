@@ -16,6 +16,18 @@ struct PastCache {
 static PastCache s_pastCache;
 static const uint32_t kMetaCacheTtlMs = 60UL * 1000UL;
 
+/** 钉住本轮刷新使用的最新帧，避免预取过程中 meta 过期导致各档时间不一致。 */
+static RainviewerFrame s_pinnedLatest;
+static bool s_latestPinned = false;
+
+void rainviewerInvalidatePin() {
+  s_latestPinned = false;
+  s_pinnedLatest.host = "";
+  s_pinnedLatest.path = "";
+  s_pinnedLatest.time = 0;
+  s_pastCache.ms = 0;  // 下次 ensurePastCache 强制重拉
+}
+
 /** 将 past 数组过滤进 cache（旧→新，最多 ANIM_MAX_FRAMES）。 */
 static bool fillPastCache(const char* host, JsonArray past, float windowHours,
                           PastCache* cache) {
@@ -126,11 +138,21 @@ bool rainviewerFetchLatest(RainviewerFrame* out) {
   if (!out) {
     return false;
   }
+  if (s_latestPinned && s_pinnedLatest.time != 0 &&
+      s_pinnedLatest.path.length() > 0) {
+    *out = s_pinnedLatest;
+    Serial.printf("RainViewer pinned host=%s path=%s time=%lu\n",
+                  out->host.c_str(), out->path.c_str(),
+                  (unsigned long)out->time);
+    return true;
+  }
   if (!ensurePastCache()) {
     return false;
   }
   *out = s_pastCache.frames[s_pastCache.count - 1];
-  Serial.printf("RainViewer latest host=%s path=%s time=%lu\n",
+  s_pinnedLatest = *out;
+  s_latestPinned = true;
+  Serial.printf("RainViewer latest(pin) host=%s path=%s time=%lu\n",
                 out->host.c_str(), out->path.c_str(),
                 (unsigned long)out->time);
   return true;

@@ -56,8 +56,8 @@
 #define BTN_MED_MS 1500
 #define BTN_LONG_MS 10000
 
-// 短按切档后暂停后台预取，避免立刻又占满主循环导致秒切卡顿
-#define CACHE_PAUSE_AFTER_USER_MS 5000UL
+// 短按切到「未缓存」档后短暂暂停预取，避免与造片抢主循环；已缓存秒切不暂停
+#define CACHE_PAUSE_AFTER_USER_MS 1500UL
 
 // ---- 数据源 ----
 #define RAINVIEWER_API "https://api.rainviewer.com/public/weather-maps.json"
@@ -85,8 +85,8 @@
 #define ANIM_WINDOW_HOURS 6.0f
 #define ANIM_SPACE_RED_BYTES (2UL * FRAME_RGB565_BYTES)
 
-// 提升以作废旧缓存；10=暂时关闭按住动画，清掉 anim 残留
-#define FRAME_CACHE_GEN 10
+// 提升以作废旧缓存；11=拒绝底图缺瓦仍 commit 的残缺成品（黑角）
+#define FRAME_CACHE_GEN 11
 
 // 雷达静帧刷新间隔（对齐 DesktopRadar 默认 300s）
 #define RADAR_REFRESH_MS (5UL * 60UL * 1000UL)

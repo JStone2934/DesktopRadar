@@ -26,7 +26,7 @@ bool frameCacheHas(int zoom);
 /** z3–z12 中已就绪的档位数。 */
 int frameCacheCountReady();
 
-/** 可缓存的总档位数（ZOOM_MAX - ZOOM_MIN + 1）。 */
+/** 可缓存的总档位数（ZOOM_MAX - ZOOM_MIN + 1，再去掉 ZOOM_SKIP）。 */
 int frameCacheZoomSlots();
 
 /** 行刷 RGB565 到 LCD（秒切，需 ready）。 */
@@ -37,6 +37,20 @@ bool frameCacheBlit(LGFX* lcd, int zoom);
  * 供进度环在无缝更新时保留画面。
  */
 bool frameCacheBlitUnderlay(LGFX* lcd, int zoom);
+
+/**
+ * 将预警环按 alpha(0–255) 与指定档底图混合后画到 LCD。
+ * alpha=0：只恢复环带底图像素（透明）；alpha=255：实色环（不读文件）。
+ */
+bool frameCachePaintAlertRing(LGFX* lcd, int zoom, uint16_t color565,
+                              uint8_t alpha);
+
+/**
+ * 采样环带底图像素到缓冲区（供呼吸动画缓存，避免每帧读 Flash）。
+ * 返回 false 表示无成品或缓冲区不足。
+ */
+bool frameCacheSampleAlertRing(int zoom, uint16_t* pix, uint8_t* xs, uint8_t* ys,
+                               int cap, int* outCount);
 
 bool frameCacheRemove(int zoom);
 

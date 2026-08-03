@@ -293,8 +293,11 @@ bool frameCacheHas(int zoom) {
 }
 
 int frameCacheZoomSlots() {
-  // z3–z12 去掉 ZOOM_SKIP
-  return (ZOOM_MAX - ZOOM_MIN + 1) - 1;
+  int n = ZOOM_MAX - ZOOM_MIN + 1;
+  if (ZOOM_SKIP >= ZOOM_MIN && ZOOM_SKIP <= ZOOM_MAX) {
+    --n;
+  }
+  return n;
 }
 
 int frameCacheCountReady() {
@@ -336,6 +339,191 @@ bool frameCacheBlitUnderlay(LGFX* lcd, int zoom) {
   const bool ok = blitRgb565File(lcd, f);
   f.close();
   return ok;
+}
+
+static inline int expand5(int v) { return (v << 3) | (v >> 2); }
+static inline int expand6(int v) { return (v << 2) | (v >> 4); }
+
+static inline uint16_t pack565(int r8, int g8, int b8) {
+  if (r8 < 0) {
+    r8 = 0;
+  } else if (r8 > 255) {
+    r8 = 255;
+  }
+  if (g8 < 0) {
+    g8 = 0;
+  } else if (g8 > 255) {
+    g8 = 255;
+  }
+  if (b8 < 0) {
+    b8 = 0;
+  } else if (b8 > 255) {
+    b8 = 255;
+  }
+  return (uint16_t)(((r8 & 0xF8) << 8) | ((g8 & 0xFC) << 3) | (b8 >> 3));
+}
+
+/** 8-bit 域 alpha 混合，避免 RGB565 绿通道偏多造成发绿。 */
+static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
+  if (a == 0) {
+    return dst;
+  }
+  if (a == 255) {
+    return src;
+  }
+  const int inv = 255 - a;
+  const int r = (expand5((src >> 11) & 0x1F) * a +
+                 expand5((dst >> 11) & 0x1F) * inv + 127) /
+                255;
+  const int g = (expand6((src >> 5) & 0x3F) * a +
+                 expand6((dst >> 5) & 0x3F) * inv + 127) /
+                255;
+  const int b =
+      (expand5(src & 0x1F) * a + expand5(dst & 0x1F) * inv + 127) / 255;
+  return pack565(r, g, b);
+}
+
+bool frameCachePaintAlertRing(LGFX* lcd, int zoom, uint16_t color565,
+                              uint8_t alpha) {
+  if (!lcd || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  const int rOuter = (LCD_WIDTH / 2) - 1;
+  const int rInner = rOuter - 3;
+
+  if (alpha >= 255) {
+    lcd->fillArc(cx, cy, rOuter, rInner, 0.0f, 360.0f, color565);
+    return true;
+  }
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+
+  const int rO2 = rOuter * rOuter;
+  const int rI2 = rInner * rInner;
+  const int y0 = cy - rOuter;
+  const int y1 = cy + rOuter;
+  if (y0 > 0) {
+    if (!f.seek((size_t)y0 * FRAME_ROW_BYTES)) {
+      f.close();
+      return false;
+    }
+  }
+
+  uint16_t row[LCD_WIDTH];
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+
+  for (int y = y0; y <= y1; ++y) {
+    if (y < 0 || y >= LCD_HEIGHT) {
+      continue;
+    }
+    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
+        (int)FRAME_ROW_BYTES) {
+      lcd->setSwapBytes(prevSwap);
+      f.close();
+      return false;
+    }
+    const int dy = y - cy;
+    const int dy2 = dy * dy;
+    if (dy2 > rO2) {
+      continue;
+    }
+    int spanStart = -1;
+    for (int x = 0; x <= LCD_WIDTH; ++x) {
+      bool inRing = false;
+      if (x < LCD_WIDTH) {
+        const int dx = x - cx;
+        const int d2 = dx * dx + dy2;
+        inRing = (d2 <= rO2 && d2 >= rI2);
+        if (inRing) {
+          row[x] = (alpha == 0) ? row[x] : blend565(color565, row[x], alpha);
+        }
+      }
+      if (inRing) {
+        if (spanStart < 0) {
+          spanStart = x;
+        }
+      } else if (spanStart >= 0) {
+        lcd->pushImage(spanStart, y, x - spanStart, 1, row + spanStart);
+        spanStart = -1;
+      }
+    }
+  }
+
+  lcd->setSwapBytes(prevSwap);
+  f.close();
+  return true;
+}
+
+bool frameCacheSampleAlertRing(int zoom, uint16_t* pix, uint8_t* xs, uint8_t* ys,
+                               int cap, int* outCount) {
+  if (!pix || !xs || !ys || !outCount || cap <= 0 || zoom < ZOOM_MIN ||
+      zoom > ZOOM_MAX) {
+    return false;
+  }
+  *outCount = 0;
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  const int rOuter = (LCD_WIDTH / 2) - 1;
+  const int rInner = rOuter - 3;
+  const int rO2 = rOuter * rOuter;
+  const int rI2 = rInner * rInner;
+  const int y0 = cy - rOuter;
+  const int y1 = cy + rOuter;
+  if (y0 > 0) {
+    if (!f.seek((size_t)y0 * FRAME_ROW_BYTES)) {
+      f.close();
+      return false;
+    }
+  }
+
+  uint16_t row[LCD_WIDTH];
+  int n = 0;
+  for (int y = y0; y <= y1; ++y) {
+    if (y < 0 || y >= LCD_HEIGHT) {
+      continue;
+    }
+    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
+        (int)FRAME_ROW_BYTES) {
+      f.close();
+      return false;
+    }
+    const int dy = y - cy;
+    const int dy2 = dy * dy;
+    if (dy2 > rO2) {
+      continue;
+    }
+    for (int x = 0; x < LCD_WIDTH; ++x) {
+      const int dx = x - cx;
+      const int d2 = dx * dx + dy2;
+      if (d2 > rO2 || d2 < rI2) {
+        continue;
+      }
+      if (n >= cap) {
+        f.close();
+        return false;
+      }
+      pix[n] = row[x];
+      xs[n] = (uint8_t)x;
+      ys[n] = (uint8_t)y;
+      ++n;
+    }
+  }
+  f.close();
+  *outCount = n;
+  return n > 0;
 }
 
 bool frameCacheRemove(int zoom) {
@@ -598,49 +786,6 @@ bool frameCachePromoteNewNoReady(int zoom) {
   return true;
 }
 
-static inline int expand5(int v) { return (v << 3) | (v >> 2); }
-static inline int expand6(int v) { return (v << 2) | (v >> 4); }
-
-static inline uint16_t pack565(int r8, int g8, int b8) {
-  if (r8 < 0) {
-    r8 = 0;
-  } else if (r8 > 255) {
-    r8 = 255;
-  }
-  if (g8 < 0) {
-    g8 = 0;
-  } else if (g8 > 255) {
-    g8 = 255;
-  }
-  if (b8 < 0) {
-    b8 = 0;
-  } else if (b8 > 255) {
-    b8 = 255;
-  }
-  return (uint16_t)(((r8 & 0xF8) << 8) | ((g8 & 0xFC) << 3) | (b8 >> 3));
-}
-
-/** 8-bit 域 alpha 混合，避免 RGB565 绿通道偏多造成发绿。 */
-static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
-  if (a == 0) {
-    return dst;
-  }
-  if (a == 255) {
-    return src;
-  }
-  const int inv = 255 - a;
-  const int r = (expand5((src >> 11) & 0x1F) * a +
-                 expand5((dst >> 11) & 0x1F) * inv + 127) /
-                255;
-  const int g = (expand6((src >> 5) & 0x3F) * a +
-                 expand6((dst >> 5) & 0x3F) * inv + 127) /
-                255;
-  const int b =
-      (expand5(src & 0x1F) * a + expand5(dst & 0x1F) * inv + 127) / 255;
-  return pack565(r, g, b);
-}
-
-/** 对齐 DesktopRadar prepare_basemap_tile：tile×t + backdrop×(1-t)，在 8-bit 计算。 */
 static inline uint16_t darkenBasemap565(uint16_t pix) {
   const float t = BASEMAP_BLEND;
   const float u = 1.0f - t;

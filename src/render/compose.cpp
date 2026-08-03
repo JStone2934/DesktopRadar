@@ -125,9 +125,7 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
 }
 
 struct PngDecodeCtx {
-  const uint8_t* data;
-  size_t len;
-  size_t pos;
+  File* in;  // 流式读 PNG，避免整文件进 RAM 撑爆 maxAlloc
   File* rawOut;
   File* alphaOut;  // 非空时同步写每像素 alpha
   uint16_t row[TILE_SIZE];
@@ -140,23 +138,17 @@ struct PngDecodeCtx {
 
 static uint32_t pngReadCb(void* user, uint8_t* buf, uint32_t len) {
   auto* ctx = (PngDecodeCtx*)user;
-  if (!ctx || !ctx->data) {
+  if (!ctx || !ctx->in) {
     return 0;
   }
   if (!buf) {
-    ctx->pos += len;
+    // pngle 用空 buf 表示跳过
+    const size_t pos = ctx->in->position();
+    ctx->in->seek(pos + len);
     return len;
   }
-  if (ctx->pos >= ctx->len) {
-    return 0;
-  }
-  uint32_t n = len;
-  if (ctx->pos + n > ctx->len) {
-    n = (uint32_t)(ctx->len - ctx->pos);
-  }
-  memcpy(buf, ctx->data + ctx->pos, n);
-  ctx->pos += n;
-  return n;
+  const int n = ctx->in->read(buf, len);
+  return n > 0 ? (uint32_t)n : 0;
 }
 
 static void pngWritePadRows(PngDecodeCtx* ctx, uint32_t count) {
@@ -251,29 +243,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
     }
     return false;
   }
-  if (in) {
-    in.close();
-  }
-  in = LittleFS.open(pngPath, "r");
-  if (!in) {
-    return false;
-  }
-  const size_t pngLen = in.size();
   in.seek(0);
-  uint8_t* pngData = (uint8_t*)malloc(pngLen);
-  if (!pngData) {
-    Serial.printf("  png malloc fail %u max=%u\n", (unsigned)pngLen,
-                  ESP.getMaxAllocHeap());
-    in.close();
-    return false;
-  }
-  if (in.read(pngData, pngLen) != (int)pngLen) {
-    Serial.println("  png read fail");
-    free(pngData);
-    in.close();
-    return false;
-  }
-  in.close();
 
   LittleFS.remove(rawPath);
   if (alphaPath) {
@@ -281,7 +251,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   }
   File raw = LittleFS.open(rawPath, "w");
   if (!raw) {
-    free(pngData);
+    in.close();
     return false;
   }
   File alphaFile;
@@ -289,7 +259,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   if (alphaPath) {
     alphaFile = LittleFS.open(alphaPath, "w");
     if (!alphaFile) {
-      free(pngData);
+      in.close();
       raw.close();
       LittleFS.remove(rawPath);
       return false;
@@ -297,23 +267,28 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
     alphaPtr = &alphaFile;
   }
 
+  // 给 pngle 腾连续堆：先丢掉其它临时碎片机会
   logHeap("pngle-before");
   pngle_t* pngle = lgfx_pngle_new();
   if (!pngle) {
+    // 再试一次：短延时后重试（偶发碎片）
+    delay(20);
+    pngle = lgfx_pngle_new();
+  }
+  if (!pngle) {
     Serial.printf("  pngle_new fail max=%u\n", ESP.getMaxAllocHeap());
-    free(pngData);
+    in.close();
     raw.close();
     if (alphaPtr) {
       alphaPtr->close();
       LittleFS.remove(alphaPath);
     }
+    LittleFS.remove(rawPath);
     return false;
   }
 
   PngDecodeCtx ctx{};
-  ctx.data = pngData;
-  ctx.len = pngLen;
-  ctx.pos = 0;
+  ctx.in = &in;
   ctx.rawOut = &raw;
   ctx.alphaOut = alphaPtr;
   ctx.lastY = 0;
@@ -326,7 +301,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   if (lgfx_pngle_prepare(pngle, pngReadCb, &ctx) < 0) {
     Serial.println("  pngle_prepare fail");
     lgfx_pngle_destroy(pngle);
-    free(pngData);
+    in.close();
     raw.close();
     LittleFS.remove(rawPath);
     if (alphaPtr) {
@@ -341,7 +316,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   if (w <= 0 || h <= 0 || w > TILE_SIZE || h > TILE_SIZE) {
     Serial.printf("  bad png size %dx%d\n", w, h);
     lgfx_pngle_destroy(pngle);
-    free(pngData);
+    in.close();
     raw.close();
     LittleFS.remove(rawPath);
     if (alphaPtr) {
@@ -359,7 +334,7 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   }
 
   lgfx_pngle_destroy(pngle);
-  free(pngData);
+  in.close();
   raw.flush();
   const size_t sz = raw.size();
   raw.close();
@@ -434,6 +409,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   // 不中途黑屏：已有画面时保持 LCD；仅结束时 pushImage 替换
   reportComposeProgress(zoom, 0.02f);
 
+  // 先腾出其它档临时文件，再下载，避免后下的底图因 Flash 满失败
+  frameCacheScrubOrphansExcept(zoom);
+
   RainviewerFrame meta;
   const bool haveRadarMeta = rainviewerFetchLatest(&meta);
   if (composeAbortRequested()) {
@@ -457,6 +435,12 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     reportComposeProgress(zoom, 0.06f + 0.69f * frac);
   };
 
+  auto fetchBasemapOnce = [&](int tx, int ty) -> bool {
+    Serial.printf("  dl basemap z=%d x=%d y=%d\n", zoom, tx, ty);
+    return fetchTileToFs(zoom, false, tx, ty, basemapTileUrl(zoom, tx, ty),
+                         AMAP_REFERER, 800, "basemap");
+  };
+
   int baseOk = 0;
   int radarOk = 0;
 
@@ -465,15 +449,27 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       if (composeAbortRequested()) {
         return false;
       }
-      Serial.printf("  dl basemap z=%d x=%d y=%d\n", zoom, tx, ty);
-      if (fetchTileToFs(zoom, false, tx, ty, basemapTileUrl(zoom, tx, ty),
-                        AMAP_REFERER, 800, "basemap")) {
+      bool ok = fetchBasemapOnce(tx, ty);
+      if (!ok) {
+        // 单瓦失败再试一次（网络/Flash 抖动）
+        Serial.printf("  retry basemap z=%d x=%d y=%d\n", zoom, tx, ty);
+        ok = fetchBasemapOnce(tx, ty);
+      }
+      if (ok) {
         ++baseOk;
+      } else {
+        Serial.printf("  basemap FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
       }
       afterTile();
     }
   }
-  Serial.printf("Basemap dl ok=%d\n", baseOk);
+  Serial.printf("Basemap dl ok=%d/%d\n", baseOk, baseTiles);
+
+  // 底图必须齐全：缺 1 张就会在圆屏上留下约 1/4 近黑块，且会进缓存
+  if (baseOk < baseTiles) {
+    Serial.printf("basemap incomplete %d/%d, skip commit\n", baseOk, baseTiles);
+    return false;
+  }
 
   if (haveRadarMeta && !composeAbortRequested()) {
     for (int ty = rty0; ty <= rty1; ++ty) {
@@ -491,7 +487,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       }
     }
   }
-  Serial.printf("Radar dl ok=%d\n", radarOk);
+  Serial.printf("Radar dl ok=%d/%d\n", radarOk, radarTiles);
 
   // 元数据成功但瓦片全失败：勿写入「无雷达」成品，否则秒切会一直缺雷达
   if (haveRadarMeta && radarOk == 0) {
@@ -504,7 +500,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     Serial.println("RainViewer meta unavailable; bake display-only if needed");
   }
 
-  if (composeAbortRequested() || (baseOk == 0 && radarOk == 0)) {
+  if (composeAbortRequested()) {
     return false;
   }
 
@@ -513,8 +509,6 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   reportComposeProgress(zoom, 0.78f);
   logHeap("before-bake");
-  // 只清其它档残留，保留当前档刚下载的 PNG
-  frameCacheScrubOrphansExcept(zoom);
 
   char pngPath[48];
   char rawPath[48];
@@ -545,6 +539,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   };
 
   int decoded = 0;
+  int baseDecoded = 0;
   const int bakeTiles = baseTiles + (radarOk > 0 ? radarTiles : 0);
   auto afterBakeStep = [&](int step) {
     const float frac =
@@ -560,9 +555,17 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       }
       if (decodeOne(false, tx, ty, false)) {
         ++decoded;
+        ++baseDecoded;
+      } else {
+        Serial.printf("  basemap decode FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
       }
       afterBakeStep(decoded);
     }
+  }
+  if (baseDecoded < baseTiles) {
+    Serial.printf("basemap decode incomplete %d/%d, skip commit\n", baseDecoded,
+                  baseTiles);
+    return false;
   }
   if (radarOk > 0) {
     for (int ty = rty0; ty <= rty1; ++ty) {
@@ -578,10 +581,8 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       }
     }
   }
-  Serial.printf("Decoded tiles=%d\n", decoded);
-  if (decoded == 0) {
-    return false;
-  }
+  Serial.printf("Decoded tiles=%d (base=%d/%d)\n", decoded, baseDecoded,
+                baseTiles);
 
   reportComposeProgress(zoom, 0.90f);
   logHeap("malloc-frame");
@@ -625,6 +626,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   radarCenterSampleReset(&centerSample);
 
   int stamped = 0;
+  int baseStamped = 0;
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
     for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
       pollButtonDuringCompose();
@@ -634,9 +636,19 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       }
       if (stampOne(false, tx, ty, 1, false, nullptr)) {
         ++stamped;
+        ++baseStamped;
+      } else {
+        Serial.printf("  basemap stamp FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
       }
       afterBakeStep(decoded + stamped);
     }
+  }
+  if (baseStamped < baseTiles) {
+    Serial.printf("basemap stamp incomplete %d/%d — leave black quadrant, "
+                  "abort commit\n",
+                  baseStamped, baseTiles);
+    free(frame);
+    return false;
   }
   if (radarOk > 0) {
     for (int ty = rty0; ty <= rty1; ++ty) {
@@ -654,13 +666,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     }
   }
 
-  Serial.printf("Stamped tiles=%d fs used=%u/%u\n", stamped,
-                (unsigned)LittleFS.usedBytes(),
+  Serial.printf("Stamped tiles=%d (base=%d/%d) fs used=%u/%u\n", stamped,
+                baseStamped, baseTiles, (unsigned)LittleFS.usedBytes(),
                 (unsigned)LittleFS.totalBytes());
-  if (stamped == 0) {
-    free(frame);
-    return false;
-  }
 
   bool hasCloud = false;
   uint16_t alertColor = 0;
@@ -672,6 +680,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   reportComposeProgress(zoom, 0.97f);
   frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
   frameCacheDrawOverlayBuf(frame, haveRadarMeta ? meta.time : 0);
+  if (haveRadarMeta && meta.time != 0) {
+    frameCacheWriteRadarTime(zoom, meta.time);
+  }
 
   if (pushToDisplay) {
     // 即使不 commit 也先刷一帧，避免接口抖动时黑屏
