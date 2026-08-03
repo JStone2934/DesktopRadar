@@ -72,11 +72,14 @@ static float globalCacheDone01() {
 }
 
 static void refreshProgressRing() {
-  if (!s_cfg.show_progress) {
-    return;
-  }
   const int under = s_statusScreen ? -1 : s_displayedZoom;
-  progressRingUpdate(&lcd, globalCacheDone01(), under);
+  if (s_cfg.show_progress) {
+    progressRingUpdate(&lcd, globalCacheDone01(), under);
+  }
+  // 进度条全宽涂黑会擦掉底缘环带；预警环压回最上层
+  if (s_cfg.show_alert_ring) {
+    alertRingRedraw(&lcd, under);
+  }
 }
 
 /**
@@ -487,6 +490,9 @@ static void runPortalAndApply() {
 
   if (!s_cfg.show_progress) {
     progressRingHide(&lcd, s_displayedZoom);
+    if (s_cfg.show_alert_ring) {
+      alertRingRedraw(&lcd, s_displayedZoom);
+    }
   }
   if (!s_cfg.show_alert_ring) {
     alertRingHide(&lcd, s_displayedZoom);
