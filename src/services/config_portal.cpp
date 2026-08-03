@@ -169,7 +169,7 @@ static void handleRoot() {
             "<button type=\"button\" class=\"btn-geo\" id=\"geoBtn\" "
             "onclick=\"doGeo()\">获取当前位置</button>"
             "<p class=\"hint\" id=\"geoHint\"></p>"
-            "<label>显示进度环</label><select name=\"show_ring\" "
+            "<label>显示进度条</label><select name=\"show_ring\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_progress
               ? F("<option value=\"1\" selected>显示</option>"

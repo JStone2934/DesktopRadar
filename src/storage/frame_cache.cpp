@@ -1407,12 +1407,12 @@ void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
   spr.setColorDepth(16);
   spr.setBuffer(frame, LCD_WIDTH, LCD_HEIGHT, 16);
 
-  const int barH = 24;  // Font2 ≈16 + 8
-  spr.fillRect(0, LCD_HEIGHT - barH, LCD_WIDTH, barH, TFT_BLACK);
+  spr.fillRect(0, LCD_HEIGHT - OVERLAY_BAR_H, LCD_WIDTH, OVERLAY_BAR_H,
+               TFT_BLACK);
   spr.setFont(&fonts::Font2);
   spr.setTextDatum(MC_DATUM);
   spr.setTextColor(TFT_WHITE, TFT_BLACK);
-  spr.drawString(label, LCD_WIDTH / 2, LCD_HEIGHT - barH / 2);
+  spr.drawString(label, LCD_WIDTH / 2, LCD_HEIGHT - OVERLAY_BAR_H / 2);
 }
 
 bool frameCacheCommit(int zoom) {

@@ -1,6 +1,6 @@
 /**
  * ESP32-C3 桌面气象雷达 — SoftAP 配网 + RGB565 全档缓存
- * （按住历史动画暂时关闭，保留静帧/预取/预警环/进度环）
+ * （按住历史动画暂时关闭，保留静帧/预取/预警环/进度条）
  */
 
 #include <Arduino.h>
@@ -30,10 +30,10 @@ static uint32_t s_lastRefresh = 0;
 static uint32_t s_refreshFailAt = 0;  // 非 0：上次定时刷新失败，待短重试
 static bool s_busyCompose = false;
 static bool s_wifiOk = false;
-static bool s_statusScreen = false;  // 首次 Fetching 黑底，圆环不 blit 地图
+static bool s_statusScreen = false;  // 首次 Fetching 黑底，不 blit 地图
 static int s_bakeZoom = -1;
 static float s_bakeLocal = 0.0f;
-// 全档静帧曾铺满一次后进度环保持满
+// 全档静帧曾铺满一次后进度条保持满（隐藏）
 static bool s_staticFullPassDone = false;
 // 用户交互后暂停后台预取（不挡定时雷达刷新）
 static uint32_t s_cachePauseUntil = 0;
@@ -79,15 +79,6 @@ static void refreshProgressRing() {
   progressRingUpdate(&lcd, globalCacheDone01(), under);
 }
 
-/** 进度环之下、预警环之上；预警可盖住进度环。 */
-static void refreshEdgeRings() {
-  refreshProgressRing();
-  const int under = s_statusScreen ? -1 : s_displayedZoom;
-  if (s_cfg.show_alert_ring) {
-    alertRingRedraw(&lcd, under);
-  }
-}
-
 /**
  * 按指定缩放档的预警数据重启呼吸环。
  * underlay 用当前屏上档位，与底图做透明混合。
@@ -128,7 +119,7 @@ static void onComposeProgress(int zoom, float local01) {
     return;
   }
   s_lastRingMs = now;
-  refreshEdgeRings();
+  refreshProgressRing();
 }
 
 static void showStatus(const char* line1, const char* line2 = nullptr) {
@@ -214,8 +205,10 @@ static bool showCached(int zoom) {
     applyAlertForDisplayedZoom();
   }
   if (!s_staticFullPassDone) {
-    refreshEdgeRings();
-  } else if (s_cfg.show_alert_ring && !switched) {
+    refreshProgressRing();
+  }
+  // 整屏 blit 会擦掉屏缘预警；同档再显时补一帧（换档交给 tick）
+  if (s_cfg.show_alert_ring && !switched) {
     alertRingRedraw(&lcd, zoom);
   }
   return true;
@@ -252,7 +245,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     snprintf(line2, sizeof(line2), "zoom %d", zoom);
     s_statusScreen = true;
     showStatus("Fetching...", line2);
-    refreshEdgeRings();
+    refreshProgressRing();
   } else if (pushToDisplay) {
     Serial.printf("rebuild z%d (keep display)\n", zoom);
   } else {
@@ -273,7 +266,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     }
     frameCacheRestoreStale(zoom);
     s_statusScreen = false;
-    refreshEdgeRings();
+    refreshProgressRing();
     return false;
   }
 
@@ -286,7 +279,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
       s_statusScreen = false;
       showCached(zoom);
     }
-    refreshEdgeRings();
+    refreshProgressRing();
     return false;
   }
 
@@ -296,7 +289,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     zoomNoteDisplayed(zoom);
     applyAlertForDisplayedZoom();
   }
-  refreshEdgeRings();
+  refreshProgressRing();
   return true;
 }
 

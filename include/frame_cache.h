@@ -34,7 +34,6 @@ bool frameCacheBlit(LGFX* lcd, int zoom);
 
 /**
  * 行刷底图：只要 .rgb565 长度正确即可（含造片中已清 ready 的旧成品）。
- * 供进度环在无缝更新时保留画面。
  */
 bool frameCacheBlitUnderlay(LGFX* lcd, int zoom);
 

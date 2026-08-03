@@ -3,9 +3,9 @@
 #include "LGFX_GC9A01.hpp"
 
 /**
- * 屏缘白色圆环：表示全局缓存剩余量。
- * done01=0 满环；done01=1 消失。
- * underlayZoom>=0 时优先 blit 成品（含造片中未 ready 的旧图）再画环。
+ * 底栏横向进度条：贴在日期黑条上沿。
+ * done01=0 无条；增大时自中心向两侧延伸；done01≈1 消失。
+ * underlayZoom 保留兼容调用，不再用于整屏 blit。
  */
 void progressRingUpdate(LGFX* lcd, float done01, int underlayZoom);
 

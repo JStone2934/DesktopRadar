@@ -18,6 +18,10 @@
 #define LCD_WIDTH  240
 #define LCD_HEIGHT 240
 
+// 底栏日期条高度；进度条贴其顶边
+#define OVERLAY_BAR_H 24
+#define PROGRESS_BAR_THICK 2
+
 // 杜邦线/飞线先用较低速率；稳定后再提到 40M
 #define SPI_FREQ_WRITE 20000000
 

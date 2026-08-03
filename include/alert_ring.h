@@ -14,7 +14,7 @@ void alertRingClear(LGFX* lcd, int underlayZoom);
 void alertRingHide(LGFX* lcd, int underlayZoom);
 /** 脉冲/淡入期间由 loop 调用；已常显时几乎无开销。 */
 void alertRingTick(LGFX* lcd, int underlayZoom);
-/** 强制用当前状态重绘一帧（进度环刷新后叠在上层）。 */
+/** 强制用当前状态重绘一帧（例如整屏 blit 后恢复屏缘）。 */
 void alertRingRedraw(LGFX* lcd, int underlayZoom);
 bool alertRingIsVisible();
 bool alertRingNeedsTick();
