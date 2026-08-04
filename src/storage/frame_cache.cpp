@@ -9,34 +9,30 @@
 
 // bit0 = ZOOM_MIN … 避免每秒 open 缺失 ready 刷屏
 static uint16_t s_readyMask = 0;
-// 每档动画已积累帧数（含 1 帧半成品；可播仍看 >=2）
-static int s_animStored[ZOOM_MAX - ZOOM_MIN + 1];
+// 新鲜度掩码：bit=1 表示该档为本轮已重建（新雷达）；ready 仅表示成品存在（可能过时）
+static uint16_t s_freshMask = 0;
+static int s_protectedZoom = -1;
 
-static void animRestoreReadyScan();
-
-static inline int zoomBit(int zoom) { return zoom - ZOOM_MIN; }
-
-static inline int animSlot(int zoom) { return zoom - ZOOM_MIN; }
-
-static void animSetStored(int zoom, int count) {
+static inline void freshMaskSet(int zoom, bool on) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return;
   }
-  s_animStored[animSlot(zoom)] = count > 0 ? count : 0;
+  const uint16_t bit = (uint16_t)(1u << (zoom - ZOOM_MIN));
+  if (on) {
+    s_freshMask |= bit;
+  } else {
+    s_freshMask &= (uint16_t)~bit;
+  }
 }
 
-static int animGetStored(int zoom) {
+static inline bool freshMaskGet(int zoom) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
-    return 0;
+    return false;
   }
-  return s_animStored[animSlot(zoom)];
+  return (s_freshMask & (uint16_t)(1u << (zoom - ZOOM_MIN))) != 0;
 }
 
-static void animClearStoredAll() {
-  for (int i = 0; i < (ZOOM_MAX - ZOOM_MIN + 1); ++i) {
-    s_animStored[i] = 0;
-  }
-}
+static inline int zoomBit(int zoom) { return zoom - ZOOM_MIN; }
 
 static void readyMaskSet(int zoom, bool on) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
@@ -218,12 +214,10 @@ void frameCacheScrubOrphansExcept(int keepZoom) {
 
 bool frameCacheBegin() {
   s_readyMask = 0;
+  s_freshMask = 0;
   if (LittleFS.begin(false)) {
     if (!LittleFS.exists("/frames")) {
       LittleFS.mkdir("/frames");
-    }
-    if (!LittleFS.exists("/anim")) {
-      LittleFS.mkdir("/anim");
     }
     Serial.printf("LittleFS mounted total=%u used=%u\n",
                   (unsigned)LittleFS.totalBytes(),
@@ -235,9 +229,46 @@ bool frameCacheBegin() {
       return false;
     }
     LittleFS.mkdir("/frames");
-    LittleFS.mkdir("/anim");
     Serial.printf("LittleFS formatted total=%u\n",
                   (unsigned)LittleFS.totalBytes());
+  }
+  // 动画系统已下线：回收旧 /anim 目录释放空间
+  if (LittleFS.exists("/anim")) {
+    File ad = LittleFS.open("/anim");
+    if (ad && ad.isDirectory()) {
+      File ef = ad.openNextFile();
+      while (ef) {
+        char child[48];
+        snprintf(child, sizeof(child), "/anim/%s", ef.name());
+        const bool isDir = ef.isDirectory();
+        ef.close();
+        if (isDir) {
+          File sd = LittleFS.open(child);
+          if (sd && sd.isDirectory()) {
+            File sf = sd.openNextFile();
+            while (sf) {
+              char gc[64];
+              snprintf(gc, sizeof(gc), "%s/%s", child, sf.name());
+              sf.close();
+              LittleFS.remove(gc);
+              sf = sd.openNextFile();
+            }
+          }
+          if (sd) {
+            sd.close();
+          }
+          LittleFS.rmdir(child);
+        } else {
+          LittleFS.remove(child);
+        }
+        ef = ad.openNextFile();
+      }
+    }
+    if (ad) {
+      ad.close();
+    }
+    LittleFS.rmdir("/anim");
+    Serial.println("removed legacy /anim dir");
   }
 
   // 缓存世代：作废旧的无雷达成品
@@ -252,7 +283,6 @@ bool frameCacheBegin() {
     for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
       frameCacheRemove(z);
     }
-    frameCacheAnimClearAll();
     File gw = LittleFS.open("/frames/gen", "w");
     if (gw) {
       gw.printf("%d\n", FRAME_CACHE_GEN);
@@ -281,10 +311,11 @@ bool frameCacheBegin() {
     f.close();
     if (ok) {
       readyMaskSet(z, true);
+      // 启动时把磁盘上有效成品视为新鲜（首次刷新前不重建）
+      freshMaskSet(z, true);
     }
   }
 
-  animRestoreReadyScan();
   return true;
 }
 
@@ -540,17 +571,28 @@ bool frameCacheRemove(int zoom) {
   radarTimePath(zoom, path, sizeof(path));
   LittleFS.remove(path);
   readyMaskSet(zoom, false);
-  frameCacheAnimClear(zoom);
+  freshMaskSet(zoom, false);
   return true;
 }
 
 bool frameCachePrepare(int zoom) {
-  // 清临时瓦片与 ready，保留旧 .rgb565 供无缝底图
-  scrubTemp(zoom);
-  readyMaskSet(zoom, false);
+  // 清临时瓦片目录与 .new，保留旧 .rgb565 + .ready 供刷新期间秒切
+  // （新帧写 .rgb565.new，commit 时原子替换；旧 .rgb565 始终可 blit）
+  scrubTempDirKeepReady(zoom);
   char path[40];
   rgbNewPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
+
+  // 旧 .rgb565 无效时才清 ready（首次造片/损坏时）
+  File chk;
+  if (!openRgb565IfValid(zoom, &chk)) {
+    readyMaskSet(zoom, false);
+    char rp[40];
+    readyPath(zoom, rp, sizeof(rp));
+    LittleFS.remove(rp);
+  } else {
+    chk.close();
+  }
 
   if (!LittleFS.exists("/frames")) {
     LittleFS.mkdir("/frames");
@@ -587,6 +629,7 @@ bool frameCacheRestoreStale(int zoom) {
   r.print("1");
   r.close();
   readyMaskSet(zoom, true);
+  freshMaskSet(zoom, false);
   Serial.printf("frameCache restore stale z%d\n", zoom);
   return true;
 }
@@ -1480,643 +1523,72 @@ bool frameCacheCommit(int zoom) {
   r.print("1");
   r.close();
   readyMaskSet(zoom, true);
+  freshMaskSet(zoom, true);
   Serial.printf("frameCache commit z%d rgb565 ok\n", zoom);
   return true;
 }
 
-// ---- 历史动画 ----
+// ---- 新鲜度 ----
 
-#pragma pack(push, 1)
-struct AnimMetaBin {
-  uint16_t gen;
-  uint16_t zoom;
-  uint16_t count;
-  uint16_t reserved;
-  uint32_t times[ANIM_MAX_FRAMES];
-};
-#pragma pack(pop)
+void frameCacheMarkFresh(int zoom, bool fresh) { freshMaskSet(zoom, fresh); }
 
-static void animDirPath(int zoom, char* out, size_t n) {
-  snprintf(out, n, "/anim/z%02d", zoom);
-}
+bool frameCacheIsFresh(int zoom) { return freshMaskGet(zoom); }
 
-static void animMetaPath(int zoom, char* out, size_t n) {
-  snprintf(out, n, "/anim/z%02d/meta.bin", zoom);
-}
-
-static void animFramePath(int zoom, int index, char* out, size_t n) {
-  snprintf(out, n, "/anim/z%02d/f%02d.rgb565", zoom, index);
-}
-
-static void animBasePath(int zoom, char* out, size_t n) {
-  snprintf(out, n, "/anim/z%02d/base.rgb565", zoom);
-}
-
-static void removeDirContents(const char* dir) {
-  if (!LittleFS.exists(dir)) {
-    return;
-  }
-  File d = LittleFS.open(dir);
-  if (d && d.isDirectory()) {
-    File f = d.openNextFile();
-    while (f) {
-      char child[64];
-      snprintf(child, sizeof(child), "%s/%s", dir, f.name());
-      f.close();
-      LittleFS.remove(child);
-      f = d.openNextFile();
-    }
-  }
-  if (d) {
-    d.close();
-  }
-  LittleFS.rmdir(dir);
-}
-
-static bool readAnimMeta(int zoom, AnimMetaBin* out) {
-  if (!out || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
-    return false;
-  }
-  char path[40];
-  animMetaPath(zoom, path, sizeof(path));
-  if (!LittleFS.exists(path)) {
-    return false;
-  }
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() != sizeof(AnimMetaBin)) {
-    if (f) {
-      f.close();
-    }
-    return false;
-  }
-  const size_t n = f.read(reinterpret_cast<uint8_t*>(out), sizeof(AnimMetaBin));
-  f.close();
-  if (n != sizeof(AnimMetaBin)) {
-    return false;
-  }
-  if (out->gen != FRAME_CACHE_GEN || out->zoom != (uint16_t)zoom ||
-      out->count < 1 || out->count > ANIM_MAX_FRAMES) {
-    return false;
-  }
-  return true;
-}
-
-static void animRestoreReadyScan() {
-  animClearStoredAll();
+void frameCacheMarkAllFresh(bool fresh) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
     if (z == ZOOM_SKIP) {
       continue;
     }
-    AnimMetaBin meta{};
-    if (!readAnimMeta(z, &meta)) {
-      continue;
-    }
-    char path[40];
-    animFramePath(z, 0, path, sizeof(path));
-    if (!LittleFS.exists(path)) {
-      continue;
-    }
-    File f0 = LittleFS.open(path, "r");
-    const bool ok0 = f0 && f0.size() == FRAME_RGB565_BYTES;
-    if (f0) {
-      f0.close();
-    }
-    if (!ok0) {
-      continue;
-    }
-    animSetStored(z, (int)meta.count);
-    Serial.printf("anim restore z%d count=%d\n", z, (int)meta.count);
+    freshMaskSet(z, fresh);
   }
 }
 
-void frameCacheAnimClear(int zoom) {
-  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
-    return;
-  }
-  animSetStored(zoom, 0);
-  char dir[32];
-  animDirPath(zoom, dir, sizeof(dir));
-  removeDirContents(dir);
-}
-
-void frameCacheAnimClearAll() {
-  animClearStoredAll();
-  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-    if (z == ZOOM_SKIP) {
-      continue;
-    }
-    char dir[32];
-    animDirPath(z, dir, sizeof(dir));
-    removeDirContents(dir);
-  }
-  if (!LittleFS.exists("/anim")) {
-    return;
-  }
-  File d = LittleFS.open("/anim");
-  if (d && d.isDirectory()) {
-    File f = d.openNextFile();
-    while (f) {
-      char child[48];
-      snprintf(child, sizeof(child), "/anim/%s", f.name());
-      const bool isDir = f.isDirectory();
-      f.close();
-      if (isDir) {
-        removeDirContents(child);
-      } else {
-        LittleFS.remove(child);
-      }
-      f = d.openNextFile();
-    }
-  }
-  if (d) {
-    d.close();
-  }
-}
-
-void frameCacheAnimClearOthers(int keepZoom) {
+void frameCacheMarkAllStaleExcept(int keepZoom) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
     if (z == ZOOM_SKIP || z == keepZoom) {
       continue;
     }
-    if (frameCacheAnimStoredCount(z) > 0) {
-      Serial.printf("anim clear other z%d (keep z%d)\n", z, keepZoom);
-      frameCacheAnimClear(z);
-    }
+    freshMaskSet(z, false);
   }
 }
 
-bool frameCacheAnimPrepare(int zoom) {
-  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
-    return false;
-  }
-  if (!LittleFS.exists("/anim")) {
-    LittleFS.mkdir("/anim");
-  }
+int frameCacheCountFresh() {
+  int n = 0;
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-    if (z != zoom) {
-      frameCacheAnimClear(z);
+    if (z == ZOOM_SKIP) {
+      continue;
+    }
+    if (freshMaskGet(z)) {
+      ++n;
     }
   }
-  animSetStored(zoom, 0);
-  char dir[32];
-  animDirPath(zoom, dir, sizeof(dir));
-  removeDirContents(dir);
-  if (!LittleFS.mkdir(dir)) {
-    if (!LittleFS.exists(dir)) {
-      Serial.printf("anim mkdir fail %s\n", dir);
-      return false;
-    }
-  }
-  return true;
+  return n;
 }
 
-bool frameCacheAnimWriteFrame(int zoom, int index, const uint16_t* frame) {
-  if (!frame || index < 0 || index >= ANIM_MAX_FRAMES) {
-    return false;
-  }
-  char path[40];
-  animFramePath(zoom, index, path, sizeof(path));
-  LittleFS.remove(path);
-  File f = LittleFS.open(path, "w");
-  if (!f) {
-    return false;
-  }
-  const size_t wrote =
-      f.write(reinterpret_cast<const uint8_t*>(frame), FRAME_RGB565_BYTES);
-  f.flush();
-  f.close();
-  if (wrote != FRAME_RGB565_BYTES) {
-    LittleFS.remove(path);
-    return false;
-  }
-  return true;
-}
+void frameCacheSetProtectedZoom(int zoom) { s_protectedZoom = zoom; }
 
-bool frameCacheAnimWriteBase(int zoom, const uint16_t* frame) {
-  if (!frame) {
-    return false;
-  }
-  char path[40];
-  animBasePath(zoom, path, sizeof(path));
-  LittleFS.remove(path);
-  File f = LittleFS.open(path, "w");
-  if (!f) {
-    return false;
-  }
-  const size_t wrote =
-      f.write(reinterpret_cast<const uint8_t*>(frame), FRAME_RGB565_BYTES);
-  f.flush();
-  f.close();
-  if (wrote != FRAME_RGB565_BYTES) {
-    LittleFS.remove(path);
-    return false;
-  }
-  return true;
-}
-
-bool frameCacheAnimReadBase(int zoom, uint16_t* frame) {
-  if (!frame) {
-    return false;
-  }
-  char path[40];
-  animBasePath(zoom, path, sizeof(path));
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() != FRAME_RGB565_BYTES) {
-    if (f) {
-      f.close();
-    }
-    return false;
-  }
-  const size_t n =
-      f.read(reinterpret_cast<uint8_t*>(frame), FRAME_RGB565_BYTES);
-  f.close();
-  return n == FRAME_RGB565_BYTES;
-}
-
-void frameCacheAnimRemoveBase(int zoom) {
-  char path[40];
-  animBasePath(zoom, path, sizeof(path));
-  LittleFS.remove(path);
-}
-
-bool frameCacheAnimCommitMeta(int zoom, int count, const uint32_t* times) {
-  if (!times || count < 1 || count > ANIM_MAX_FRAMES) {
-    return false;
-  }
-  for (int i = 0; i < count; ++i) {
-    char path[40];
-    animFramePath(zoom, i, path, sizeof(path));
-    File f = LittleFS.open(path, "r");
-    if (!f || f.size() != FRAME_RGB565_BYTES) {
-      if (f) {
-        f.close();
-      }
-      Serial.printf("anim commit missing f%02d z%d\n", i, zoom);
-      return false;
-    }
-    f.close();
-  }
-
-  AnimMetaBin meta{};
-  meta.gen = FRAME_CACHE_GEN;
-  meta.zoom = (uint16_t)zoom;
-  meta.count = (uint16_t)count;
-  meta.reserved = 0;
-  for (int i = 0; i < count; ++i) {
-    meta.times[i] = times[i];
-  }
-
-  char path[40];
-  animMetaPath(zoom, path, sizeof(path));
-  LittleFS.remove(path);
-  File f = LittleFS.open(path, "w");
-  if (!f) {
-    return false;
-  }
-  const size_t wrote =
-      f.write(reinterpret_cast<const uint8_t*>(&meta), sizeof(meta));
-  f.flush();
-  f.close();
-  if (wrote != sizeof(meta)) {
-    LittleFS.remove(path);
-    return false;
-  }
-  // 本地积累不再依赖 base；仍保留若磁盘上已有
-  animSetStored(zoom, count);
-  Serial.printf("anim commit z%d frames=%d\n", zoom, count);
-  return true;
-}
-
-bool frameCacheAnimReadTimes(int zoom, uint32_t* times, int maxOut, int* outCount) {
-  if (!times || !outCount || maxOut <= 0) {
-    return false;
-  }
-  *outCount = 0;
-  AnimMetaBin meta{};
-  if (!readAnimMeta(zoom, &meta)) {
-    return false;
-  }
-  const int n = (int)meta.count;
-  if (n < 1 || n > maxOut) {
-    return false;
-  }
-  for (int i = 0; i < n; ++i) {
-    times[i] = meta.times[i];
-  }
-  *outCount = n;
-  return true;
-}
-
-bool frameCacheAnimHasBase(int zoom) {
-  char path[40];
-  animBasePath(zoom, path, sizeof(path));
-  if (!LittleFS.exists(path)) {
-    return false;
-  }
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() != FRAME_RGB565_BYTES) {
-    if (f) {
-      f.close();
-    }
-    return false;
-  }
-  f.close();
-  return true;
-}
-
-bool frameCacheAnimDropOldest(int zoom, int dropCount) {
-  AnimMetaBin meta{};
-  if (!readAnimMeta(zoom, &meta)) {
-    return false;
-  }
-  const int n = (int)meta.count;
-  if (dropCount <= 0 || dropCount >= n) {
-    return false;
-  }
-  const int keep = n - dropCount;
-
-  // 删最旧
-  for (int i = 0; i < dropCount; ++i) {
-    char path[40];
-    animFramePath(zoom, i, path, sizeof(path));
-    LittleFS.remove(path);
-  }
-
-  // 两阶段改名，避免覆盖
-  for (int i = 0; i < keep; ++i) {
-    char src[40];
-    char tmp[48];
-    animFramePath(zoom, i + dropCount, src, sizeof(src));
-    snprintf(tmp, sizeof(tmp), "/anim/z%02d/t%02d.rgb565", zoom, i);
-    LittleFS.remove(tmp);
-    if (!LittleFS.rename(src, tmp)) {
-      Serial.printf("anim drop rename1 fail %s -> %s\n", src, tmp);
-      return false;
-    }
-  }
-  for (int i = 0; i < keep; ++i) {
-    char tmp[48];
-    char dst[40];
-    snprintf(tmp, sizeof(tmp), "/anim/z%02d/t%02d.rgb565", zoom, i);
-    animFramePath(zoom, i, dst, sizeof(dst));
-    LittleFS.remove(dst);
-    if (!LittleFS.rename(tmp, dst)) {
-      Serial.printf("anim drop rename2 fail %s -> %s\n", tmp, dst);
-      return false;
-    }
-  }
-
-  // 更新 meta 时间戳与 count，避免后续 Drop/Read 与磁盘不一致
-  for (int i = 0; i < keep; ++i) {
-    meta.times[i] = meta.times[i + dropCount];
-  }
-  meta.count = (uint16_t)keep;
-  for (int i = keep; i < ANIM_MAX_FRAMES; ++i) {
-    meta.times[i] = 0;
-  }
-  char mpath[40];
-  animMetaPath(zoom, mpath, sizeof(mpath));
-  LittleFS.remove(mpath);
-  File mf = LittleFS.open(mpath, "w");
-  if (!mf) {
-    animSetStored(zoom, 0);
-    return false;
-  }
-  const size_t mw =
-      mf.write(reinterpret_cast<const uint8_t*>(&meta), sizeof(meta));
-  mf.flush();
-  mf.close();
-  if (mw != sizeof(meta)) {
-    LittleFS.remove(mpath);
-    animSetStored(zoom, 0);
-    return false;
-  }
-
-  animSetStored(zoom, keep);
-  Serial.printf("anim dropOldest z%d drop=%d keep=%d\n", zoom, dropCount, keep);
-  return true;
-}
-
-bool frameCacheAnimHas(int zoom) {
-  return animGetStored(zoom) >= 2;
-}
-
-int frameCacheAnimCount(int zoom) {
-  const int n = animGetStored(zoom);
-  return n >= 2 ? n : 0;
-}
-
-int frameCacheAnimStoredCount(int zoom) {
-  return animGetStored(zoom);
-}
-
-static size_t animFsFreeBytes() {
-  const size_t total = LittleFS.totalBytes();
-  const size_t used = LittleFS.usedBytes();
-  return total > used ? (total - used) : 0;
-}
-
-static bool animEnsureDir(int zoom) {
-  if (!LittleFS.exists("/anim")) {
-    LittleFS.mkdir("/anim");
-  }
-  char dir[32];
-  animDirPath(zoom, dir, sizeof(dir));
-  if (!LittleFS.exists(dir)) {
-    if (!LittleFS.mkdir(dir)) {
-      Serial.printf("anim mkdir fail %s\n", dir);
-      return false;
-    }
-  }
-  return true;
-}
-
-bool frameCacheAnimBeginFill(int zoom) {
-  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
-    return false;
-  }
-  frameCacheAnimClear(zoom);
-  return animEnsureDir(zoom);
-}
-
-bool frameCacheAnimAppendFromStatic(int zoom, uint32_t timeSec) {
-  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX || timeSec == 0) {
-    return false;
-  }
-  if (!frameCacheHas(zoom)) {
-    return false;
-  }
-  if (!animEnsureDir(zoom)) {
-    return false;
-  }
-
-  uint32_t times[ANIM_MAX_FRAMES];
-  int count = 0;
-  if (frameCacheAnimReadTimes(zoom, times, ANIM_MAX_FRAMES, &count)) {
-    if (count > 0 && times[count - 1] == timeSec) {
-      Serial.printf("anim append skip dup z%d t=%lu\n", zoom,
-                    (unsigned long)timeSec);
-      return true;
-    }
-  } else {
-    count = 0;
-  }
-
-  int cap = ANIM_MAX_FRAMES;
-  if (animFsFreeBytes() < ANIM_SPACE_RED_BYTES) {
-    // 红线：目标容量压到 max(2, 现有) 以便去旧腾空间
-    if (count >= 2) {
-      cap = count;  // 追加前会先 drop 到 count-1
-    } else {
-      cap = 2;
-    }
-    Serial.printf("anim append redline free=%u cap=%d\n",
-                  (unsigned)animFsFreeBytes(), cap);
-  }
-
-  // 满 cap：去旧直到 count < cap
-  while (count >= cap && count >= 1) {
-    if (count == 1) {
-      frameCacheAnimClear(zoom);
-      if (!animEnsureDir(zoom)) {
-        return false;
-      }
-      count = 0;
-      break;
-    }
-    if (!frameCacheAnimDropOldest(zoom, 1)) {
-      Serial.println("anim append drop fail");
-      return false;
-    }
-    for (int i = 0; i < count - 1; ++i) {
-      times[i] = times[i + 1];
-    }
-    --count;
-    if (animFsFreeBytes() < ANIM_SPACE_RED_BYTES && cap > 2) {
-      cap = count > 2 ? count : 2;
-    }
-  }
-
-  // 仍不够写一帧：继续去旧（不拆邻档静帧）
-  while (animFsFreeBytes() < FRAME_RGB565_BYTES + 4096UL && count > 0) {
-    if (count == 1) {
-      frameCacheAnimClear(zoom);
-      if (!animEnsureDir(zoom)) {
-        return false;
-      }
-      count = 0;
-      break;
-    }
-    if (!frameCacheAnimDropOldest(zoom, 1)) {
-      break;
-    }
-    for (int i = 0; i < count - 1; ++i) {
-      times[i] = times[i + 1];
-    }
-    --count;
-  }
-  if (animFsFreeBytes() < FRAME_RGB565_BYTES + 4096UL) {
-    Serial.printf("anim append no space free=%u\n",
-                  (unsigned)animFsFreeBytes());
-    return false;
-  }
-
-  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
-  if (!frame) {
-    Serial.println("anim append malloc fail");
-    return false;
-  }
-  File sf;
-  if (!openRgb565IfValid(zoom, &sf)) {
-    free(frame);
-    Serial.println("anim append static missing");
-    return false;
-  }
-  const size_t n =
-      sf.read(reinterpret_cast<uint8_t*>(frame), FRAME_RGB565_BYTES);
-  sf.close();
-  if (n != FRAME_RGB565_BYTES) {
-    free(frame);
-    return false;
-  }
-
-  if (count >= ANIM_MAX_FRAMES) {
-    free(frame);
-    return false;
-  }
-  if (!frameCacheAnimWriteFrame(zoom, count, frame)) {
-    free(frame);
-    Serial.println("anim append write fail");
-    return false;
-  }
-  free(frame);
-
-  times[count] = timeSec;
-  ++count;
-  if (!frameCacheAnimCommitMeta(zoom, count, times)) {
-    Serial.println("anim append commit fail");
-    return false;
-  }
-  Serial.printf("anim append z%d count=%d t=%lu free=%u\n", zoom, count,
-                (unsigned long)timeSec, (unsigned)animFsFreeBytes());
-  return true;
-}
-
-uint32_t frameCacheAnimTime(int zoom, int index) {
-  AnimMetaBin meta{};
-  if (!readAnimMeta(zoom, &meta) || index < 0 || index >= (int)meta.count) {
-    return 0;
-  }
-  return meta.times[index];
-}
-
-bool frameCacheAnimBlit(LGFX* lcd, int zoom, int index) {
-  if (!lcd || index < 0) {
-    return false;
-  }
-  AnimMetaBin meta{};
-  if (!readAnimMeta(zoom, &meta) || index >= (int)meta.count) {
-    return false;
-  }
-  char path[40];
-  animFramePath(zoom, index, path, sizeof(path));
-  File f = LittleFS.open(path, "r");
-  if (!f || f.size() != FRAME_RGB565_BYTES) {
-    if (f) {
-      f.close();
-    }
-    return false;
-  }
-  const bool ok = blitRgb565File(lcd, f);
-  f.close();
-  return ok;
-}
-
-bool frameCacheAnimEnsureSpace(size_t needBytes, int keepZoom) {
+bool frameCacheEnsureBakeSpace(size_t needBytes, int keepZoom) {
   auto freeBytes = []() -> size_t {
     const size_t total = LittleFS.totalBytes();
     const size_t used = LittleFS.usedBytes();
     return total > used ? (total - used) : 0;
   };
 
-  // 先清其它 zoom 动画
-  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-    if (z != keepZoom) {
-      frameCacheAnimClear(z);
-    }
-  }
-
   if (freeBytes() >= needBytes) {
     return true;
   }
 
-  // 按与 keepZoom 距离从远到近删静帧
+  // 按与 keepZoom 距离从远到近，丢弃「过时(!fresh)且已就绪」的档成品。
+  // 新鲜档受保护（避免初始预取抖动）；keepZoom 与受保护(显示)档不丢。
   while (freeBytes() < needBytes) {
     int bestZ = -1;
     int bestDist = -1;
     for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-      if (z == keepZoom || !frameCacheHas(z)) {
+      if (z == keepZoom || z == s_protectedZoom || z == ZOOM_SKIP) {
         continue;
+      }
+      if (!frameCacheHas(z) || freshMaskGet(z)) {
+        continue;  // 仅丢过时且已就绪的
       }
       const int dist = abs(z - keepZoom);
       if (dist > bestDist) {
@@ -2127,9 +1599,8 @@ bool frameCacheAnimEnsureSpace(size_t needBytes, int keepZoom) {
     if (bestZ < 0) {
       break;
     }
-    Serial.printf("anim space: drop static z%d (need=%u free=%u)\n", bestZ,
+    Serial.printf("bake space: drop stale z%d (need=%u free=%u)\n", bestZ,
                   (unsigned)needBytes, (unsigned)freeBytes());
-    // 只删静帧，不递归清 anim（keepZoom 的 anim 可能正在造）
     scrubTemp(bestZ);
     char path[40];
     rgbPath(bestZ, path, sizeof(path));
@@ -2140,11 +1611,14 @@ bool frameCacheAnimEnsureSpace(size_t needBytes, int keepZoom) {
     LittleFS.remove(path);
     alertPath(bestZ, path, sizeof(path));
     LittleFS.remove(path);
+    radarTimePath(bestZ, path, sizeof(path));
+    LittleFS.remove(path);
     readyMaskSet(bestZ, false);
+    // fresh 已是 false（过时），无需改
   }
 
   const bool ok = freeBytes() >= needBytes;
-  Serial.printf("anim ensureSpace need=%u free=%u ok=%d\n", (unsigned)needBytes,
+  Serial.printf("bake ensureSpace need=%u free=%u ok=%d\n", (unsigned)needBytes,
                 (unsigned)freeBytes(), (int)ok);
   return ok;
 }

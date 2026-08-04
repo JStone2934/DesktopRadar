@@ -85,11 +85,9 @@
 #define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))
 
-#define ANIM_FPS 5
+// RainViewer past 帧缓存上限与时间窗（rainviewer.cpp 仍使用）
 #define ANIM_MAX_FRAMES 10
-#define ANIM_FRAME_INTERVAL_MS (1000UL / (unsigned)ANIM_FPS)
 #define ANIM_WINDOW_HOURS 6.0f
-#define ANIM_SPACE_RED_BYTES (2UL * FRAME_RGB565_BYTES)
 
 // 提升以作废旧缓存；11=拒绝底图缺瓦仍 commit 的残缺成品（黑角）
 #define FRAME_CACHE_GEN 11

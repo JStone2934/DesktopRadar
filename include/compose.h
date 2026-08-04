@@ -25,9 +25,3 @@ void composeSetDisplayFn(ComposeDisplayFn fn);
  */
 bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                        bool pushToDisplay);
-
-/**
- * 用 RainViewer past 为当前缩放补满动画队列（最多 ANIM_MAX_FRAMES）。
- * 不覆盖已就绪静帧；底图只拉一次。可 abort。
- */
-bool composeAnimFillPast(LGFX* lcd, float lat, float lon, int zoom);

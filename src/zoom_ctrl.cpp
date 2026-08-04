@@ -90,7 +90,7 @@ bool zoomCanCompose(int zoom) {
 void zoomPrefetchClear() { s_prefetchLen = 0; }
 
 static void enqueueUnique(int zoom) {
-  if (!zoomCanCompose(zoom) || frameCacheHas(zoom) || zoomPrefetchCooling(zoom)) {
+  if (!zoomCanCompose(zoom) || frameCacheIsFresh(zoom) || zoomPrefetchCooling(zoom)) {
     return;
   }
   for (int i = 0; i < s_prefetchLen; ++i) {
@@ -123,7 +123,7 @@ bool zoomPrefetchPop(int* outZoom) {
     s_prefetchQ[i - 1] = s_prefetchQ[i];
   }
   --s_prefetchLen;
-  if (frameCacheHas(*outZoom) || zoomPrefetchCooling(*outZoom)) {
+  if (frameCacheIsFresh(*outZoom) || zoomPrefetchCooling(*outZoom)) {
     return zoomPrefetchPop(outZoom);
   }
   return true;

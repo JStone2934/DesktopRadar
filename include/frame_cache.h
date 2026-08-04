@@ -150,68 +150,32 @@ bool frameCacheCommit(int zoom);
 bool frameCacheOpenTileWrite(int zoom, bool isRadar, int tx, int ty,
                              fs::File* out);
 
-// ---- 历史动画帧（本地静帧积累环形队列）----
+// ---- 新鲜度（本轮刷新是否已重建）----
+// ready 表示成品存在（可秒切，可能是过时数据）；fresh 表示本轮已重建（新雷达）。
+// 刷新开始时把全部标为过时（fresh=false），逐档重建 commit 时置 fresh=true。
+// 预取队列只入队 !fresh 的档；进度条按 fresh 计数。
 
-/** 动画集是否可播（meta + 帧齐全，count>=2）。 */
-bool frameCacheAnimHas(int zoom);
+/** 标记某档是否为本轮新鲜成品。 */
+void frameCacheMarkFresh(int zoom, bool fresh);
+bool frameCacheIsFresh(int zoom);
 
-/** 可播帧数；未可播返回 0。 */
-int frameCacheAnimCount(int zoom);
+/** 全部标记为 fresh（true）或全部过时（false）。 */
+void frameCacheMarkAllFresh(bool fresh);
+/** 除 keepZoom 外全部标记过时（刷新入口用，保留旧帧可秒切）。 */
+void frameCacheMarkAllStaleExcept(int keepZoom);
 
-/** 该档已积累帧数（含仅 1 帧的半成品）；无则 0。 */
-int frameCacheAnimStoredCount(int zoom);
-
-/** 读第 index 帧的 Unix 时间戳；失败返回 0。 */
-uint32_t frameCacheAnimTime(int zoom, int index);
-
-void frameCacheAnimClear(int zoom);
-void frameCacheAnimClearAll();
-/** 清掉除 keepZoom 外所有档的动画队列（换档后下一轮刷新用）。 */
-void frameCacheAnimClearOthers(int keepZoom);
-/** 清空本档动画并重建空目录（不动其它档）。 */
-bool frameCacheAnimBeginFill(int zoom);
-
-/** 确保 /anim/zNN 目录存在；清其它 zoom 的动画集并重建本档空目录。 */
-bool frameCacheAnimPrepare(int zoom);
-
-/** 写入一帧 RGB565（fII.rgb565）；不写 meta。 */
-bool frameCacheAnimWriteFrame(int zoom, int index, const uint16_t* frame);
-
-/** 写入基底模板（旧 past 烘焙用；本地积累路径不再依赖）。 */
-bool frameCacheAnimWriteBase(int zoom, const uint16_t* frame);
-bool frameCacheAnimReadBase(int zoom, uint16_t* frame);
-void frameCacheAnimRemoveBase(int zoom);
+/** 当前 fresh 档数。 */
+int frameCacheCountFresh();
 
 /**
- * 提交 meta（count + times[] + gen + zoom）。
- * 允许 count==1（半成品）；可播仍要求 count>=2。
+ * 设置受保护档（屏上正在显示），ensureBakeSpace 不会丢弃它。
+ * -1 表示无保护。显示档变化时调用。
  */
-bool frameCacheAnimCommitMeta(int zoom, int count, const uint32_t* times);
-
-/** 读取已提交动画的时间戳列表；count>=1 即可。 */
-bool frameCacheAnimReadTimes(int zoom, uint32_t* times, int maxOut, int* outCount);
-
-/** 是否仍有动画底图基底。 */
-bool frameCacheAnimHasBase(int zoom);
+void frameCacheSetProtectedZoom(int zoom);
 
 /**
- * 丢掉最旧的 dropCount 帧，其余文件前移改名。
- * 调用后需再 WriteFrame / CommitMeta 补全新帧。
+ * 造片前腐空间：若可用空间 < needBytes，按与 keepZoom 距离从远到近
+ * 丢弃「过时且已就绪」的档成品（保留 keepZoom 与受保护档）。
+ * 新鲜档不会被丢弃，避免初始预取抖动。被丢档仍是 !fresh，会被预取重建。
  */
-bool frameCacheAnimDropOldest(int zoom, int dropCount);
-
-/**
- * 将当前静帧 RGB565 追加到该档动画队列。
- * 末帧时间戳相同则跳过；满 cap 或空间红线则去旧缩容。
- * 不删除邻档静帧。
- */
-bool frameCacheAnimAppendFromStatic(int zoom, uint32_t timeSec);
-
-/** 行刷动画第 index 帧。 */
-bool frameCacheAnimBlit(LGFX* lcd, int zoom, int index);
-
-/**
- * 为 needBytes 腾出 LittleFS 空间：先清其它 anim，再按与 keepZoom
- * 距离删除最远静帧（保留 keepZoom）。
- */
-bool frameCacheAnimEnsureSpace(size_t needBytes, int keepZoom);
+bool frameCacheEnsureBakeSpace(size_t needBytes, int keepZoom);
