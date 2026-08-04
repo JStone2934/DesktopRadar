@@ -6,7 +6,7 @@ enum class ButtonEvent : uint8_t {
   None = 0,
   ShortPress,  // 松手且按住 < BTN_HOLD_PLAY_MS（与按住播放互斥）
   MedPress,    // 保留
-  LongPress,   // 松手且按住 >= BTN_LONG_MS
+  LongPress,   // 已废弃（原长按配网，已移除）
 };
 
 void buttonBegin();

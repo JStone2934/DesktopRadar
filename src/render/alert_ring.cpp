@@ -14,7 +14,7 @@ static constexpr uint32_t kPulseMs = kFadeInMs + kFadeOutMs;
 static constexpr uint32_t kAnimUntilHoldMs =
     (uint32_t)kPulseCycles * kPulseMs + kFadeInMs;
 /** 呼吸帧间隔：过密的 writePixel 会拖慢主循环、拖住短按响应 */
-static constexpr uint32_t kDrawMinMs = 120;
+static constexpr uint32_t kDrawMinMs = 80;
 
 /** 环带约 π(Ro²−Ri²)≈2200px，留余量。 */
 static constexpr int kRingCap = 2800;
@@ -32,6 +32,30 @@ static uint16_t s_underPix[kRingCap];
 static uint8_t s_underX[kRingCap];
 static uint8_t s_underY[kRingCap];
 
+static inline int expand5(int v) { return (v << 3) | (v >> 2); }
+static inline int expand6(int v) { return (v << 2) | (v >> 4); }
+
+static inline uint16_t pack565(int r8, int g8, int b8) {
+  if (r8 < 0) {
+    r8 = 0;
+  } else if (r8 > 255) {
+    r8 = 255;
+  }
+  if (g8 < 0) {
+    g8 = 0;
+  } else if (g8 > 255) {
+    g8 = 255;
+  }
+  if (b8 < 0) {
+    b8 = 0;
+  } else if (b8 > 255) {
+    b8 = 255;
+  }
+  return (uint16_t)(((r8 & 0xF8) << 8) | ((g8 & 0xFC) << 3) | (b8 >> 3));
+}
+
+/** 8-bit 域逐通道 alpha 混合，与 frame_cache.cpp 保持一致。
+ *  旧的打包近似法 R 通道乘法溢出到 G 位，导致呼吸时颜色串色闪烁。 */
 static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
   if (a == 0) {
     return dst;
@@ -39,16 +63,16 @@ static inline uint16_t blend565(uint16_t src, uint16_t dst, uint8_t a) {
   if (a >= 255) {
     return src;
   }
-  // 565 通道近似混合（避免逐通道扩到 8bit）
-  const uint32_t alpha = a;
-  const uint32_t inv = 255u - alpha;
-  const uint32_t s = src;
-  const uint32_t d = dst;
-  const uint32_t rb =
-      (((s & 0xF81Fu) * alpha) + ((d & 0xF81Fu) * inv)) >> 8;
-  const uint32_t g =
-      (((s & 0x07E0u) * alpha) + ((d & 0x07E0u) * inv)) >> 8;
-  return (uint16_t)((rb & 0xF81Fu) | (g & 0x07E0u));
+  const int inv = 255 - a;
+  const int r = (expand5((src >> 11) & 0x1F) * a +
+                 expand5((dst >> 11) & 0x1F) * inv + 127) /
+                255;
+  const int g = (expand6((src >> 5) & 0x3F) * a +
+                 expand6((dst >> 5) & 0x3F) * inv + 127) /
+                255;
+  const int b =
+      (expand5(src & 0x1F) * a + expand5(dst & 0x1F) * inv + 127) / 255;
+  return pack565(r, g, b);
 }
 
 /**
@@ -238,7 +262,9 @@ void alertRingSet(uint16_t color565, bool hasCloud) {
   }
   s_active = true;
   s_color = color565;
-  s_fadeStartMs = millis() == 0 ? 1 : millis();
+  // 前移 80ms 使首帧 alpha≈41（而非 0），消除换档后环带空窗闪烁
+  const uint32_t now = millis();
+  s_fadeStartMs = (now > 80) ? (now - 80) : 1;
   s_lastFade = -1.0f;
   s_lastDrawMs = 0;
   s_visible = false;

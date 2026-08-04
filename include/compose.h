@@ -11,6 +11,15 @@ typedef void (*ComposeProgressFn)(int zoom, float local01);
 void composeSetProgressFn(ComposeProgressFn fn);
 
 /**
+ * 造片上屏回调：composeRadarFrame 在 pushImage 将新帧写入 LCD 后立即调用。
+ * 主循环据此同步 s_displayedZoom / 预警环 underlay，避免后续 reportComposeProgress
+ * 触发 pumpAlertRingDuringCompose 时仍使用旧档底图导致闪烁。
+ */
+typedef void (*ComposeDisplayFn)(int zoom);
+
+void composeSetDisplayFn(ComposeDisplayFn fn);
+
+/**
  * 两阶段造片：HTTPS 瓦片落盘 → 烘焙 RGB565 成品。
  * pushToDisplay 时烘焙后行刷上屏。
  */

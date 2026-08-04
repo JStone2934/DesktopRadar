@@ -19,8 +19,10 @@
 #include <lgfx/utility/lgfx_pngle.h>
 
 static ComposeProgressFn s_progressFn = nullptr;
+static ComposeDisplayFn s_displayFn = nullptr;
 
 void composeSetProgressFn(ComposeProgressFn fn) { s_progressFn = fn; }
+void composeSetDisplayFn(ComposeDisplayFn fn) { s_displayFn = fn; }
 
 static void reportComposeProgress(int zoom, float local01) {
   if (!s_progressFn) {
@@ -689,6 +691,11 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     lcd->setSwapBytes(true);
     lcd->pushImage(0, 0, LCD_WIDTH, LCD_HEIGHT, frame);
     lcd->setSwapBytes(false);
+    // 立即通知主循环：LCD 已切到本档，同步 s_displayedZoom / 预警环 underlay，
+    // 避免后续 reportComposeProgress → pumpAlertRingDuringCompose 用旧档底图
+    if (s_displayFn) {
+      s_displayFn(zoom);
+    }
   }
 
   if (!allowCommit) {

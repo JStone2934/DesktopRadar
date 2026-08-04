@@ -33,10 +33,8 @@ static void IRAM_ATTR bootIsr() {
   }
   if (held < BTN_SHORT_MS) {
     s_latched = static_cast<uint8_t>(ButtonEvent::ShortPress);
-  } else if (held >= BTN_LONG_MS) {
-    s_latched = static_cast<uint8_t>(ButtonEvent::LongPress);
   }
-  // SHORT..LONG：中等按时长不锁存（长按配网 / 短按切档）
+  // ≥500ms 不锁存：按住播放由 loop 轮询 buttonIsDown 处理
 }
 
 void buttonBegin() {

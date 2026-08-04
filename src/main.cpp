@@ -103,6 +103,20 @@ static void applyAlertForZoom(int alertZoom) {
 
 static void applyAlertForDisplayedZoom() { applyAlertForZoom(s_displayedZoom); }
 
+/**
+ * composeRadarFrame 在 pushImage 上屏后立即回调：同步 s_displayedZoom 与预警环，
+ * 使后续 reportComposeProgress → pumpAlertRingDuringCompose 使用正确档位底图。
+ */
+static void onComposeDisplay(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  s_displayedZoom = zoom;
+  s_statusScreen = false;
+  zoomNoteDisplayed(zoom);
+  applyAlertForZoom(zoom);
+}
+
 /** 造片/补满阻塞期间也推进预警呼吸，避免冻帧后跳变。 */
 static void pumpAlertRingDuringCompose() {
   if (!s_cfg.show_alert_ring || !alertRingNeedsTick()) {
@@ -280,20 +294,13 @@ static void playAnimLoop(int zoom) {
   }
 
   progressRingHide(&lcd, s_displayedZoom);
-  alertRingHide(&lcd, s_displayedZoom);
+  // 不清预警环状态：动画帧全屏 blit 会覆盖环带，
+  // 播放结束后 showCached → alertRingRedraw 即可恢复呼吸
   Serial.printf("anim play z%d frames=%d @%dfps\n", zoom, n, ANIM_FPS);
 
-  bool stopForSettings = false;
   while (buttonIsDown()) {
-    if (buttonHeldMs() >= BTN_LONG_MS) {
-      stopForSettings = true;
-      break;
-    }
     for (int i = 0; i < n; ++i) {
-      if (!buttonIsDown() || buttonHeldMs() >= BTN_LONG_MS) {
-        if (buttonHeldMs() >= BTN_LONG_MS) {
-          stopForSettings = true;
-        }
+      if (!buttonIsDown()) {
         break;
       }
       const uint32_t t0 = millis();
@@ -307,10 +314,7 @@ static void playAnimLoop(int zoom) {
         remain = ANIM_FRAME_INTERVAL_MS - elapsed;
       }
       while (remain > 0) {
-        if (!buttonIsDown() || buttonHeldMs() >= BTN_LONG_MS) {
-          if (buttonHeldMs() >= BTN_LONG_MS) {
-            stopForSettings = true;
-          }
+        if (!buttonIsDown()) {
           remain = 0;
           break;
         }
@@ -318,18 +322,15 @@ static void playAnimLoop(int zoom) {
         delay(slice);
         remain -= slice;
       }
-      if (!buttonIsDown() || stopForSettings) {
+      if (!buttonIsDown()) {
         break;
       }
     }
-    if (stopForSettings || !buttonIsDown()) {
+    if (!buttonIsDown()) {
       break;
     }
   }
 
-  if (stopForSettings) {
-    // 长按进门户由 loop 下一轮 LongPress 处理；先恢复静帧
-  }
   showCached(zoom);
 }
 
@@ -351,7 +352,7 @@ static bool showCached(int zoom) {
   if (switched) {
     applyAlertForDisplayedZoom();
     if (s_cfg.show_alert_ring) {
-      alertRingTick(&lcd, zoom);
+      alertRingRedraw(&lcd, zoom);
     }
   }
   if (!s_staticFullPassDone) {
@@ -434,10 +435,8 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   }
 
   if (pushToDisplay) {
-    s_displayedZoom = zoom;
-    s_statusScreen = false;
-    zoomNoteDisplayed(zoom);
-    applyAlertForDisplayedZoom();
+    // s_displayedZoom / statusScreen / 预警环已由 onComposeDisplay 回调同步；
+    // 不再重复 applyAlertForDisplayedZoom 以免二次重启呼吸动画
     maybeAppendAnimFromStatic(zoom);
   }
   refreshProgressRing();
@@ -663,6 +662,7 @@ void setup() {
   zoomSetCurrent(MAP_ZOOM);
   zoomSetPendingFeedback(onPendingZoomFeedback);
   composeSetProgressFn(onComposeProgress);
+  composeSetDisplayFn(onComposeDisplay);
 
   showStatus("LittleFS...", "");
   if (!frameCacheBegin()) {
@@ -676,13 +676,6 @@ void loop() {
   static uint32_t lastBeat = 0;
 
   const ButtonEvent ev = buttonPoll();
-  if (ev == ButtonEvent::LongPress) {
-    Serial.println("long press -> config portal");
-    showStatus("Setup...", "hold release ok");
-    delay(200);
-    runPortalAndApply();
-    return;
-  }
   if (ev == ButtonEvent::ShortPress) {
     if (s_wifiOk) {
       handleShortPress();
@@ -751,12 +744,11 @@ void loop() {
     const uint32_t held = buttonHeldMs();
     const int z =
         (s_displayedZoom >= ZOOM_MIN) ? s_displayedZoom : zoomCurrent();
-    if (held >= BTN_HOLD_PLAY_MS && held < BTN_LONG_MS &&
-        frameCacheAnimHas(z)) {
+    if (held >= BTN_HOLD_PLAY_MS && frameCacheAnimHas(z)) {
       playAnimLoop(z);
       return;
     }
-    if (held >= BTN_HOLD_PLAY_MS && held < BTN_LONG_MS && frameCacheHas(z) &&
+    if (held >= BTN_HOLD_PLAY_MS && frameCacheHas(z) &&
         !frameCacheAnimHas(z)) {
       static uint32_t s_lastAnimMissLog = 0;
       if (millis() - s_lastAnimMissLog > 2000) {

@@ -15,7 +15,8 @@ static inline int barY() { return LCD_HEIGHT - OVERLAY_BAR_H; }
 /** 进度条半宽上限：避免画到屏缘预警环带（底栏顶边与环相交处）。 */
 static int maxSafeHalf() {
   const int cy = LCD_HEIGHT / 2;
-  const int dy = barY() - cy;
+  // 用进度条底边（y=barY+THICK-1）计算，此处环内半径最小，确保不覆盖环带像素
+  const int dy = barY() + PROGRESS_BAR_THICK - 1 - cy;
   const int rInner = (LCD_WIDTH / 2) - 1 - 3;
   const int dy2 = dy * dy;
   const int rI2 = rInner * rInner;
