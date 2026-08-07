@@ -5,6 +5,12 @@
 
 <img width="1835" height="1370" alt="image" src="https://github.com/user-attachments/assets/cca9febc-5ed4-47bf-96b6-3602aa7d1247" />
 
+## 方案分支
+
+本 `master` 分支是树莓派完整方案，支持多图层、宏键盘、旋钮、1602 LCD 和远程 GPU 查询。
+
+如果只需要一个更低成本、更简约的桌面雷达摆件，可以查看 [`esp32c3` 分支](https://github.com/JStone2934/DesktopRadar/tree/esp32c3)：它使用 **ESP32-C3 Super Mini + GC9A01 圆屏**，不需要树莓派，功能聚焦在 SoftAP 配网、RainViewer 雷达静帧、底图合成和端上缓存。
+
 ## 功能概览
 
 | 模块 | 说明 |
