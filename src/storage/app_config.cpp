@@ -11,10 +11,24 @@ static constexpr const char* kKeyMode = "mode";
 static constexpr const char* kKeySsid = "ssid";
 static constexpr const char* kKeyPass = "pass";
 static constexpr const char* kKeyId = "id";
+static constexpr const char* kKeyOuterId = "outer_id";
 static constexpr const char* kKeyLat = "lat";
 static constexpr const char* kKeyLon = "lon";
 static constexpr const char* kKeyShowRing = "show_ring";
 static constexpr const char* kKeyAlertRing = "alert_ring";
+
+uint16_t appConfigSecretSig(const char* s) {
+  uint16_t sig = 0x4d3b;
+  if (!s) {
+    return sig;
+  }
+  for (const uint8_t* p = reinterpret_cast<const uint8_t*>(s); *p; ++p) {
+    sig = (uint16_t)((sig << 5) | (sig >> 11));
+    sig = (uint16_t)(sig ^ *p);
+    sig = (uint16_t)(sig + 0x27d4);
+  }
+  return sig;
+}
 
 void appConfigSetDefaults(AppConfig* cfg) {
   if (!cfg) {
@@ -25,6 +39,7 @@ void appConfigSetDefaults(AppConfig* cfg) {
   strncpy(cfg->ssid, WIFI_SSID, sizeof(cfg->ssid) - 1);
   strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
   cfg->identity[0] = '\0';
+  cfg->outer_identity[0] = '\0';
   cfg->lat = MAP_LAT;
   cfg->lon = MAP_LON;
   cfg->show_progress = true;
@@ -58,13 +73,16 @@ bool appConfigLoad(AppConfig* cfg) {
 
   cfg->wifi_mode =
       static_cast<AppWifiMode>(prefs.getUChar(kKeyMode, APP_WIFI_PSK));
-  if (cfg->wifi_mode != APP_WIFI_PSK && cfg->wifi_mode != APP_WIFI_PEAP) {
+  if (cfg->wifi_mode != APP_WIFI_PSK &&
+      cfg->wifi_mode != APP_WIFI_PEAP &&
+      cfg->wifi_mode != APP_WIFI_OPEN) {
     cfg->wifi_mode = APP_WIFI_PSK;
   }
 
   String ssid = prefs.getString(kKeySsid, cfg->ssid);
   String pass = prefs.getString(kKeyPass, cfg->pass);
   String id = prefs.getString(kKeyId, "");
+  String outerId = prefs.getString(kKeyOuterId, "");
   cfg->lat = prefs.getFloat(kKeyLat, MAP_LAT);
   cfg->lon = prefs.getFloat(kKeyLon, MAP_LON);
   cfg->show_progress = prefs.getBool(kKeyShowRing, true);
@@ -77,6 +95,13 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->pass[sizeof(cfg->pass) - 1] = '\0';
   strncpy(cfg->identity, id.c_str(), sizeof(cfg->identity) - 1);
   cfg->identity[sizeof(cfg->identity) - 1] = '\0';
+  strncpy(cfg->outer_identity, outerId.c_str(), sizeof(cfg->outer_identity) - 1);
+  cfg->outer_identity[sizeof(cfg->outer_identity) - 1] = '\0';
+  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s\n",
+                (unsigned)cfg->wifi_mode, cfg->ssid,
+                (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
+                (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
+                cfg->outer_identity);
 
   if (cfg->ssid[0] == '\0') {
     appConfigSetDefaults(cfg);
@@ -104,10 +129,16 @@ bool appConfigSave(const AppConfig* cfg) {
   prefs.putString(kKeySsid, cfg->ssid);
   prefs.putString(kKeyPass, cfg->pass);
   prefs.putString(kKeyId, cfg->identity);
+  prefs.putString(kKeyOuterId, cfg->outer_identity);
   prefs.putFloat(kKeyLat, cfg->lat);
   prefs.putFloat(kKeyLon, cfg->lon);
   prefs.putBool(kKeyShowRing, cfg->show_progress);
   prefs.putBool(kKeyAlertRing, cfg->show_alert_ring);
   prefs.end();
+  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s\n",
+                (unsigned)cfg->wifi_mode, cfg->ssid,
+                (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
+                (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
+                cfg->outer_identity);
   return true;
 }

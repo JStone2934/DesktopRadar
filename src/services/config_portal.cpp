@@ -13,11 +13,132 @@
 #include "wifi_sta.h"
 
 static WebServer* s_server = nullptr;
+static LGFX* s_portalLcd = nullptr;
 static volatile bool s_saved = false;
 static volatile bool s_webActive = false;
 static uint32_t s_saveRedirectAt = 0;  // POST 成功后等待 /done；超时兜底关门户
 static AppConfig s_formCfg;
 static AppConfig s_seedCfg;
+
+struct PortalNetwork {
+  String ssid;
+  int32_t rssi;
+  wifi_auth_mode_t auth;
+  AppWifiMode mode;
+};
+
+static PortalNetwork s_portalNetworks[24];
+static int s_portalNetworkCount = 0;
+
+static AppWifiMode portalModeForAuth(wifi_auth_mode_t auth) {
+  if (auth == WIFI_AUTH_OPEN) {
+    return APP_WIFI_OPEN;
+  }
+  if (auth == WIFI_AUTH_WPA2_ENTERPRISE || auth == WIFI_AUTH_WPA3_ENT_192) {
+    return APP_WIFI_PEAP;
+  }
+  return APP_WIFI_PSK;
+}
+
+static int portalModeRank(AppWifiMode mode) {
+  if (mode == APP_WIFI_PEAP) {
+    return 3;
+  }
+  if (mode == APP_WIFI_PSK) {
+    return 2;
+  }
+  if (mode == APP_WIFI_OPEN) {
+    return 1;
+  }
+  return 0;
+}
+
+static const char* portalAuthLabel(AppWifiMode mode) {
+  if (mode == APP_WIFI_OPEN) {
+    return "开放";
+  }
+  if (mode == APP_WIFI_PEAP) {
+    return "企业";
+  }
+  return "加密";
+}
+
+static void scanPortalNetworks() {
+  s_portalNetworkCount = 0;
+  for (PortalNetwork& network : s_portalNetworks) {
+    network.ssid = "";
+  }
+
+  Serial.println("portal: scanning nearby WiFi networks ...");
+  const int found = WiFi.scanNetworks(false, true);
+  for (int i = 0; i < found; ++i) {
+    const String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0 || ssid == SOFTAP_SSID) {
+      continue;
+    }
+    const int32_t rssi = WiFi.RSSI(i);
+    const wifi_auth_mode_t auth = WiFi.encryptionType(i);
+    int existing = -1;
+    for (int j = 0; j < s_portalNetworkCount; ++j) {
+      if (s_portalNetworks[j].ssid == ssid) {
+        existing = j;
+        break;
+      }
+    }
+    if (existing >= 0) {
+      if (rssi > s_portalNetworks[existing].rssi) {
+        s_portalNetworks[existing].rssi = rssi;
+        s_portalNetworks[existing].auth = auth;
+      }
+      const AppWifiMode candidateMode = portalModeForAuth(auth);
+      if (portalModeRank(candidateMode) >
+          portalModeRank(s_portalNetworks[existing].mode)) {
+        s_portalNetworks[existing].mode = candidateMode;
+      }
+      continue;
+    }
+    if (s_portalNetworkCount >=
+        (int)(sizeof(s_portalNetworks) / sizeof(s_portalNetworks[0]))) {
+      continue;
+    }
+    PortalNetwork& network = s_portalNetworks[s_portalNetworkCount++];
+    network.ssid = ssid;
+    network.rssi = rssi;
+    network.auth = auth;
+    network.mode = portalModeForAuth(auth);
+  }
+  WiFi.scanDelete();
+
+  bool seedFound = false;
+  for (int i = 0; i < s_portalNetworkCount; ++i) {
+    if (s_portalNetworks[i].ssid == s_seedCfg.ssid) {
+      seedFound = true;
+      // 对已保存的 SSID，保留用户上一次确认过的认证类型。校园网同一
+      // SSID 往往有多个 BSSID，扫描结果里的 auth 不应覆盖已知配置。
+      s_portalNetworks[i].mode = s_seedCfg.wifi_mode;
+    }
+  }
+  if (!seedFound && s_seedCfg.ssid[0] != '\0' &&
+      s_portalNetworkCount <
+          (int)(sizeof(s_portalNetworks) / sizeof(s_portalNetworks[0]))) {
+    PortalNetwork& saved = s_portalNetworks[s_portalNetworkCount++];
+    saved.ssid = s_seedCfg.ssid;
+    saved.rssi = -127;
+    saved.auth = WIFI_AUTH_MAX;
+    saved.mode = s_seedCfg.wifi_mode;
+  }
+
+  for (int i = 0; i < s_portalNetworkCount - 1; ++i) {
+    for (int j = i + 1; j < s_portalNetworkCount; ++j) {
+      if (s_portalNetworks[j].rssi > s_portalNetworks[i].rssi) {
+        const PortalNetwork tmp = s_portalNetworks[i];
+        s_portalNetworks[i] = s_portalNetworks[j];
+        s_portalNetworks[j] = tmp;
+      }
+    }
+  }
+  Serial.printf("portal: WiFi choices=%d\n", s_portalNetworkCount);
+}
 
 static void floatToBuf(float v, char* buf, size_t n) {
   if (!buf || n < 8) {
@@ -54,27 +175,7 @@ static void appendEscaped(String& out, const char* s) {
   }
 }
 
-static bool isCaptiveProbe(const String& uri, const String& host) {
-  if (uri.indexOf("generate_204") >= 0 || uri.indexOf("gen_204") >= 0) {
-    return true;
-  }
-  if (uri.indexOf("hotspot-detect") >= 0 || uri.indexOf("connecttest") >= 0) {
-    return true;
-  }
-  if (uri.indexOf("ncsi") >= 0 || uri.indexOf("success.txt") >= 0) {
-    return true;
-  }
-  if (uri == "/fwlink" || uri.indexOf("canonical.html") >= 0) {
-    return true;
-  }
-  if (host.length() && host.indexOf("192.168.4.1") < 0 &&
-      host.indexOf("radar") < 0) {
-    return true;
-  }
-  return false;
-}
-
-/** 禁止浏览器/强制门户缓存「已保存」页，避免下次打开仍显示完成态。 */
+/** 禁止浏览器缓存「已保存」页，避免下次打开仍显示完成态。 */
 static void sendNoStoreHeaders() {
   if (!s_server) {
     return;
@@ -89,24 +190,19 @@ static void handleRoot() {
     return;
   }
 
-  const String uri = s_server->uri();
-  const String host = s_server->hostHeader();
-  if (!isCaptiveProbe(uri, host)) {
-    s_webActive = true;
-    Serial.println("portal: setup page opened, timeout disabled");
-  }
+  s_webActive = true;
+  Serial.println("portal: setup page opened manually, timeout disabled");
 
   // 输入框只填绝对值；正负由北纬/南纬、东经/西经决定
   char latBuf[24];
   char lonBuf[24];
   floatToBuf(fabsf(s_seedCfg.lat), latBuf, sizeof(latBuf));
   floatToBuf(fabsf(s_seedCfg.lon), lonBuf, sizeof(lonBuf));
-  const bool peap = (s_seedCfg.wifi_mode == APP_WIFI_PEAP);
   const bool latSouth = s_seedCfg.lat < 0.0f;
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
   String html;
-  html.reserve(5800);
+  html.reserve(11000);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
@@ -124,29 +220,70 @@ static void handleRoot() {
             "background:#2a7;color:#fff;font-size:1rem}"
             "button.btn-geo{margin-top:10px;background:#444;font-size:.95rem}"
             "button.btn-geo:disabled{opacity:.6}"
+            ".check{display:flex;gap:8px;align-items:center;margin:8px 0 0;color:#aaa;font-size:.85rem}"
+            ".check input{width:auto}"
             ".peap-only{display:none}</style></head><body>"
             "<h1>桌面雷达设置</h1>"
-            "<p class=\"hint\">连热点 Radar-Setup 后填写。密码留空=不修改。"
+            "<p class=\"hint\">扫描列表只负责填入 SSID；认证类型请手动确认。已保存过的同一网络密码可留空复用。"
             "坐标填绝对值，再用北纬/南纬、东经/西经；小数点如 23.1291</p>"
             "<form method=\"POST\" action=\"/save\" accept-charset=\"UTF-8\" "
             "autocomplete=\"off\">"
-            "<label>WiFi 类型</label><select name=\"mode\" id=\"mode\" autocomplete=\"off\" "
-            "onchange=\"tog()\">");
-  html += peap ? F("<option value=\"0\">家用 WiFi (PSK)</option>"
-                   "<option value=\"1\" selected>校园/企业 (PEAP)</option>")
-               : F("<option value=\"0\" selected>家用 WiFi (PSK)</option>"
-                   "<option value=\"1\">校园/企业 (PEAP)</option>");
-  html += F("</select><label>SSID</label><input name=\"ssid\" required maxlength=\"32\" "
-            "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" value=\"");
+            "<label>扫描结果</label><select id=\"scan\" autocomplete=\"off\" "
+            "onchange=\"pickScan()\"><option value=\"\">手动输入 / 保持下方 SSID</option>");
+  for (int i = 0; i < s_portalNetworkCount; ++i) {
+    const PortalNetwork& network = s_portalNetworks[i];
+    html += F("<option value=\"");
+    appendEscaped(html, network.ssid.c_str());
+    html += F("\" data-mode=\"");
+    html += String((unsigned)network.mode);
+    html += F("\"");
+    html += F(">");
+    appendEscaped(html, network.ssid.c_str());
+    html += F(" · ");
+    html += portalAuthLabel(network.mode);
+    if (network.rssi > -127) {
+      html += F(" · ");
+      html += String(network.rssi);
+      html += F(" dBm");
+    } else {
+      html += F(" · 已保存/当前未发现");
+    }
+    html += F("</option>");
+  }
+  html += F("</select><p class=\"hint\">列表按信号强度排列；如果学校 WiFi 是 PEAP，请在下面手动选 PEAP。</p>"
+            "<label>SSID</label><input name=\"ssid\" id=\"ssid\" required maxlength=\"32\" "
+            "autocomplete=\"off\" autocapitalize=\"none\" autocorrect=\"off\" "
+            "spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.ssid);
-  html += F("\"><div class=\"peap-only\" id=\"idRow\"><label>用户名</label>"
+  html += F("\"><label>认证类型</label><select name=\"mode\" id=\"mode\" "
+            "autocomplete=\"off\" onchange=\"netChanged()\">");
+  html += s_seedCfg.wifi_mode == APP_WIFI_PSK
+              ? F("<option value=\"0\" selected>普通密码 WiFi (WPA/WPA2/WPA3)</option>")
+              : F("<option value=\"0\">普通密码 WiFi (WPA/WPA2/WPA3)</option>");
+  html += s_seedCfg.wifi_mode == APP_WIFI_PEAP
+              ? F("<option value=\"1\" selected>企业 WiFi (PEAP/MSCHAPv2)</option>")
+              : F("<option value=\"1\">企业 WiFi (PEAP/MSCHAPv2)</option>");
+  html += s_seedCfg.wifi_mode == APP_WIFI_OPEN
+              ? F("<option value=\"2\" selected>开放网络 / MAC 白名单</option>")
+              : F("<option value=\"2\">开放网络 / MAC 白名单</option>");
+  html += F("</select>"
+            "<div class=\"peap-only\" id=\"idRow\"><label>PEAP 用户名</label>"
             "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
             "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.identity);
+  html += F("\"><label>外层 Identity（可选）</label>"
+            "<input name=\"outer_identity\" id=\"outer_identity\" maxlength=\"63\" "
+            "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" "
+            "placeholder=\"留空则使用 PEAP 用户名\" value=\"");
+  appendEscaped(html, s_seedCfg.outer_identity);
   // 密码不回填；留空则保留原密码。new-password 降低浏览器自动填充旧会话密码
-  html += F("\"></div><label>Password（留空不改）</label>"
-            "<input name=\"pass\" type=\"password\" maxlength=\"64\" value=\"\" "
-            "autocomplete=\"new-password\">"
+  html += F("\"></div><label id=\"passLabel\">Password（已保存可留空）</label>"
+            "<input name=\"pass\" id=\"pass\" type=\"password\" maxlength=\"64\" "
+            "value=\"\" autocomplete=\"new-password\" autocapitalize=\"none\" "
+            "autocorrect=\"off\" spellcheck=\"false\">"
+            "<label class=\"check\"><input type=\"checkbox\" onclick=\""
+            "document.getElementById('pass').type=this.checked?'text':'password'\">"
+            "显示密码</label>"
             "<label>纬度</label><div class=\"row\">"
             "<select name=\"lat_hem\" id=\"lat_hem\" autocomplete=\"off\">");
   html += latSouth ? F("<option value=\"N\">北纬</option>"
@@ -186,9 +323,16 @@ static void handleRoot() {
   html += F("</select><p class=\"hint\">开启后：中心有云图时屏缘显示对应颜色圆环</p>"
             "<button type=\"submit\">保存并继续</button></form>"
             "<script>"
-            "function tog(){var p=document.getElementById('mode').value==='1';"
+            "function pickScan(){var s=document.getElementById('scan'),x=s.options[s.selectedIndex];"
+            "if(!x||!x.value)return;document.getElementById('ssid').value=x.value;"
+            "if(x.dataset.mode)document.getElementById('mode').value=x.dataset.mode;netChanged();}"
+            "function netChanged(){var m=document.getElementById('mode').value;"
+            "var p=m==='1',o=m==='2';"
             "document.getElementById('idRow').style.display=p?'block':'none';"
-            "document.getElementById('identity').required=p;}"
+            "document.getElementById('identity').required=p;"
+            "document.getElementById('outer_identity').disabled=!p;"
+            "document.getElementById('pass').disabled=o;"
+            "document.getElementById('passLabel').textContent=o?'Password（开放网络无需填写）':'Password（已保存可留空）';}"
             "function geoFail(){var h=document.getElementById('geoHint');"
             "h.textContent='当前浏览器不支持，请手动填写或从地图复制';"
             "var b=document.getElementById('geoBtn');b.disabled=false;"
@@ -208,7 +352,7 @@ static void handleRoot() {
             "b.disabled=false;b.textContent='获取当前位置';"
             "},function(){geoFail();},"
             "{enableHighAccuracy:true,timeout:15000,maximumAge:0});}"
-            "tog();</script>"
+            "netChanged();</script>"
             "</body></html>");
   sendNoStoreHeaders();
   s_server->send(200, "text/html; charset=utf-8", html);
@@ -284,15 +428,22 @@ static const char* parseForm(AppConfig* cfg) {
     // 密码永不打明文；只记是否填写与长度
     if (name.equalsIgnoreCase("pass") || name.equalsIgnoreCase("password")) {
       const String v = s_server->arg(i);
-      Serial.printf("  %s=[%s len=%u]\n", name.c_str(),
-                    v.length() ? "***" : "(empty)", (unsigned)v.length());
+      Serial.printf("  %s=[%s len=%u sig=%04x]\n", name.c_str(),
+                    v.length() ? "***" : "(empty)", (unsigned)v.length(),
+                    (unsigned)appConfigSecretSig(v.c_str()));
     } else {
       Serial.printf("  %s=[%s]\n", name.c_str(), s_server->arg(i).c_str());
     }
   }
 
   const String modeStr = s_server->arg("mode");
-  cfg->wifi_mode = (modeStr == "1") ? APP_WIFI_PEAP : APP_WIFI_PSK;
+  if (modeStr == "1") {
+    cfg->wifi_mode = APP_WIFI_PEAP;
+  } else if (modeStr == "2") {
+    cfg->wifi_mode = APP_WIFI_OPEN;
+  } else {
+    cfg->wifi_mode = APP_WIFI_PSK;
+  }
 
   String ssid = s_server->arg("ssid");
   ssid.trim();
@@ -304,32 +455,62 @@ static const char* parseForm(AppConfig* cfg) {
   }
   strncpy(cfg->ssid, ssid.c_str(), sizeof(cfg->ssid) - 1);
 
+  String id = s_server->arg("identity");
+  id.trim();
+  if (id.length() > 63) {
+    return "PEAP 用户名过长";
+  }
+  strncpy(cfg->identity, id.c_str(), sizeof(cfg->identity) - 1);
+
+  String outerId = s_server->arg("outer_identity");
+  outerId.trim();
+  if (outerId.length() > 63) {
+    return "外层 Identity 过长";
+  }
+  strncpy(cfg->outer_identity, outerId.c_str(),
+          sizeof(cfg->outer_identity) - 1);
+
+  if (cfg->wifi_mode != APP_WIFI_PEAP) {
+    cfg->identity[0] = '\0';
+    cfg->outer_identity[0] = '\0';
+  }
+
+  if (cfg->wifi_mode == APP_WIFI_PEAP && cfg->identity[0] == '\0') {
+    return "PEAP 需要用户名";
+  }
+
+  const bool sameSavedNetwork =
+      cfg->wifi_mode == s_seedCfg.wifi_mode && ssid == s_seedCfg.ssid;
+  const bool sameSavedSecret =
+      sameSavedNetwork &&
+      (cfg->wifi_mode != APP_WIFI_PEAP ||
+       strcmp(cfg->identity, s_seedCfg.identity) == 0);
+
   String pass = s_server->arg("pass");
   if (pass.length() > 64) {
     return "密码过长";
   }
-  if (pass.length() == 0) {
-    // 留空：保留已有密码；若 NVS/默认也空则用 config.h（仅 PSK）
-    strncpy(cfg->pass, s_seedCfg.pass, sizeof(cfg->pass) - 1);
-    if (cfg->wifi_mode == APP_WIFI_PSK && cfg->pass[0] == '\0') {
-      strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
+  if (cfg->wifi_mode == APP_WIFI_OPEN) {
+    cfg->pass[0] = '\0';
+  } else if (pass.length() == 0) {
+    // 只允许同一已保存网络复用密码，避免把旧网络密码误用于新 SSID。
+    if (!sameSavedSecret) {
+      return "首次连接该网络需要密码";
     }
+    strncpy(cfg->pass, s_seedCfg.pass, sizeof(cfg->pass) - 1);
   } else {
     strncpy(cfg->pass, pass.c_str(), sizeof(cfg->pass) - 1);
   }
+  Serial.printf("form password selected: len=%u sig=%04x reused=%d\n",
+                (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
+                (unsigned)appConfigSecretSig(cfg->pass),
+                (int)(pass.length() == 0 && sameSavedNetwork &&
+                      cfg->wifi_mode != APP_WIFI_OPEN));
   if (cfg->wifi_mode == APP_WIFI_PSK && cfg->pass[0] == '\0') {
     return "PSK 密码不能为空";
   }
-
-  String id = s_server->arg("identity");
-  id.trim();
-  if (id.length() > 63) {
-    return "Identity 过长";
-  }
-  strncpy(cfg->identity, id.c_str(), sizeof(cfg->identity) - 1);
-
-  if (cfg->wifi_mode == APP_WIFI_PEAP && cfg->identity[0] == '\0') {
-    return "PEAP 需要 Identity";
+  if (cfg->wifi_mode == APP_WIFI_PEAP && cfg->pass[0] == '\0') {
+    return "PEAP 密码不能为空";
   }
 
   bool latOk = false;
@@ -400,25 +581,11 @@ static void handleSave() {
   s_server->sendHeader("Location", "/done", true);
   s_server->send(303, "text/plain", "");
   s_saveRedirectAt = millis() == 0 ? 1 : millis();
+  setupScreenShowSaved(s_portalLcd, cfg.ssid);
 }
 
 static void handleNotFound() {
   if (!s_server) {
-    return;
-  }
-  const String uri = s_server->uri();
-  const String host = s_server->hostHeader();
-  if (isCaptiveProbe(uri, host)) {
-    sendNoStoreHeaders();
-    // 带时间戳，降低系统强制门户缓存旧成功页
-    char loc[48];
-    snprintf(loc, sizeof(loc), "http://192.168.4.1/?t=%lu",
-             (unsigned long)millis());
-    String body = String("<!DOCTYPE html><html><head><meta charset=utf-8>"
-                         "<meta http-equiv=refresh content='0;url=") +
-                  loc + "'></head><body><p>Open <a href='" + loc + "'>" + loc +
-                  "</a></p></body></html>";
-    s_server->send(200, "text/html; charset=utf-8", body);
     return;
   }
   // 旧书签 /save、/done 等一律回表单
@@ -427,13 +594,8 @@ static void handleNotFound() {
   s_server->send(302, "text/plain", "");
 }
 
-static void pumpServer(WebServer& server) {
-  for (int i = 0; i < 16; ++i) {
-    server.handleClient();
-  }
-}
-
 PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
+  s_portalLcd = lcd;
   s_saved = false;
   s_webActive = false;
   s_saveRedirectAt = 0;
@@ -445,18 +607,32 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   wifiDisconnectClean();
   WiFi.persistent(false);
   WiFi.setSleep(false);
+
+  // scanNetworks() 会打开 STA。扫描必须发生在 SoftAP 启动前，避免设置
+  // 热点变成 AP+STA 混合状态，保存后再切企业 WiFi 时继承不干净的射频状态。
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  scanPortalNetworks();
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
+  // 使用 WPA2 配置热点，保留手机端稳定拿 IP 的改动；但这里明确只进入
+  // AP 模式。保存后会完整关闭 AP，再由 wifi_sta.cpp 单独启动 STA/PEAP。
   WiFi.mode(WIFI_AP);
   delay(50);
-
   const IPAddress apIP(192, 168, 4, 1);
   const IPAddress gateway(192, 168, 4, 1);
   const IPAddress subnet(255, 255, 255, 0);
   WiFi.softAPConfig(apIP, gateway, subnet);
-  const bool apOk = WiFi.softAP(SOFTAP_SSID, nullptr, 1, 0, 4);
-  delay(150);
+  const bool apOk = WiFi.softAP(SOFTAP_SSID, SOFTAP_PASS, 6, 0, 4);
+  WiFi.setSleep(false);
+  delay(250);
 
   const IPAddress ip = WiFi.softAPIP();
-  Serial.printf("SoftAP %s ok=%d IP=%s\n", SOFTAP_SSID, (int)apOk,
+  const bool modeOk = (WiFi.getMode() & WIFI_AP) != 0;
+  const bool configOk = ip == apIP;
+  Serial.printf("SoftAP %s WPA2 channel=6 mode=%d config=%d ap=%d IP=%s\n",
+                SOFTAP_SSID, (int)modeOk, (int)configOk, (int)apOk,
                 ip.toString().c_str());
 
   WebServer server(80);
@@ -476,6 +652,10 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   server.onNotFound(handleNotFound);
   server.begin();
 
+  // 不启动通配 DNS，也不劫持系统联网探测。手机只连接热点，用户按屏幕
+  // 提示手动打开固定地址；这样不会触发缓慢的“登录网络”自动弹窗。
+  Serial.printf("portal manual URL only: %s\n", CONFIG_PORTAL_URL);
+
   if (lcd) {
     setupScreenDraw(lcd, (int)((timeoutMs + 999) / 1000));
   }
@@ -486,7 +666,7 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   PortalResult result = PortalResult::TimedOut;
 
   while (true) {
-    pumpServer(server);
+    server.handleClient();
 
     // POST 已成功但浏览器未拉 /done：约 1.5s 后仍关闭门户
     if (!s_saved && s_saveRedirectAt != 0 &&
@@ -512,14 +692,15 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
       break;
     }
 
-    const bool holdOpen =
-        s_webActive || (WiFi.softAPgetStationNum() > 0);
+    // 用户手动打开页面后不再自动关闭；页面未打开时，手机仍连接热点也
+    // 暂停倒计时，避免刚准备输入时被 60 秒超时打断。
+    const bool holdOpen = s_webActive || (WiFi.softAPgetStationNum() > 0);
     if (holdOpen) {
       if (lcd && !waitingDrawn && s_webActive) {
         waitingDrawn = true;
         setupScreenUpdateStatus(lcd, -1);
       }
-      delay(2);
+      delay(5);
       continue;
     }
 
@@ -536,11 +717,12 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
       setupScreenUpdateStatus(lcd, remain);
     }
 
-    delay(2);
+    delay(5);
   }
 
   // 先摘掉全局指针，再 close/stop，最后断 AP（顺序很重要）
   s_server = nullptr;
+  s_portalLcd = nullptr;
   server.close();
   delay(50);
   server.stop();
@@ -548,7 +730,7 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   WiFi.softAPdisconnect(true);
   delay(100);
   WiFi.mode(WIFI_OFF);
-  delay(100);
+  delay(200);
 
   if (outCfg) {
     if (result == PortalResult::Saved) {

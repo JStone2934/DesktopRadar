@@ -31,9 +31,10 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 
 // SoftAP 配置门户
-#define SOFTAP_SSID "Radar-Setup"
+#define SOFTAP_SSID "Radar-Setup-2"
+#define SOFTAP_PASS "radar1234"
 #define CONFIG_PORTAL_URL "http://192.168.4.1"
-#define CONFIG_PORTAL_TIMEOUT_MS 60000
+#define CONFIG_PORTAL_TIMEOUT_MS 180000
 
 // ---- 地图中心：广州市区 ----
 #define MAP_LAT 23.1291f

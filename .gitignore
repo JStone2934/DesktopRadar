@@ -7,3 +7,4 @@
 __pycache__/
 serial_*.txt
 serial_btn.txt
+src/idf_component.yml.orig

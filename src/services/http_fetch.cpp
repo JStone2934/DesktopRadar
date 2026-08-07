@@ -2,6 +2,7 @@
 
 #include <FS.h>
 #include <HTTPClient.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <stdlib.h>
 #include <string.h>

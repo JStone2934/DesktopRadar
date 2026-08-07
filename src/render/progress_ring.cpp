@@ -77,6 +77,9 @@ bool progressRingUpdate(LGFX* lcd, float done01, int underlayZoom) {
   if (done01 > 1.0f) {
     done01 = 1.0f;
   }
+  if (s_barVisible && s_lastDone >= 0.0f && done01 < s_lastDone) {
+    done01 = s_lastDone;
+  }
 
   const uint32_t now = millis();
   const bool completed = done01 >= 0.998f;

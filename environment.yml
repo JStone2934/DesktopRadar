@@ -1,0 +1,7 @@
+name: radar-esp32c3
+
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - platformio==6.1.19

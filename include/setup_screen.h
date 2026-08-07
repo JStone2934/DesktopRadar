@@ -10,3 +10,6 @@ void setupScreenDraw(LGFX* lcd, int remainSec);
 
 /** 仅刷新底部倒计时/等待文案，不重画二维码。 */
 void setupScreenUpdateStatus(LGFX* lcd, int remainSec);
+
+/** 保存成功后立即替换二维码，明确告知用户设备已进入联网阶段。 */
+void setupScreenShowSaved(LGFX* lcd, const char* ssid);

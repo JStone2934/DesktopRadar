@@ -77,18 +77,22 @@ void setupScreenDraw(LGFX* lcd, int remainSec) {
   lcd->setTextSize(1.5f);
 
   char line[48];
-  int y = 6;
+  int y = 4;
 
-  lcd->drawString("1.先连接热点", LCD_WIDTH / 2, y);
-  y += 22;
+  lcd->drawString("1.连接热点", LCD_WIDTH / 2, y);
+  y += 19;
   snprintf(line, sizeof(line), "%s", SOFTAP_SSID);
   lcd->drawString(line, LCD_WIDTH / 2, y);
-  y += 24;
+  y += 20;
 
-  lcd->drawString("2.再扫码或手动打开", LCD_WIDTH / 2, y);
-  y += 22;
+  snprintf(line, sizeof(line), "密码: %s", SOFTAP_PASS);
+  lcd->drawString(line, LCD_WIDTH / 2, y);
+  y += 20;
+
+  lcd->drawString("2.手动打开或扫网址码", LCD_WIDTH / 2, y);
+  y += 19;
   lcd->drawString(CONFIG_PORTAL_URL, LCD_WIDTH / 2, y);
-  y += 18;
+  y += 16;
 
   lcd->setTextSize(1.0f);
 
@@ -182,4 +186,25 @@ void setupScreenUpdateStatus(LGFX* lcd, int remainSec) {
     return;
   }
   drawStatusLine(lcd, remainSec);
+}
+
+void setupScreenShowSaved(LGFX* lcd, const char* ssid) {
+  if (!lcd) {
+    return;
+  }
+
+  lcd->fillScreen(TFT_BLACK);
+  lcd->setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd->setTextDatum(MC_DATUM);
+  lcd->setFont(&fonts::efontCN_12);
+  lcd->setTextSize(1.6f);
+  lcd->drawString("配置已保存", LCD_WIDTH / 2, 92);
+
+  lcd->setTextSize(1.25f);
+  lcd->drawString("正在连接 WiFi", LCD_WIDTH / 2, 126);
+
+  if (ssid && ssid[0]) {
+    lcd->setTextSize(1.0f);
+    lcd->drawString(ssid, LCD_WIDTH / 2, 154);
+  }
 }
