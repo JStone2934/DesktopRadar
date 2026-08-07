@@ -1,15 +1,11 @@
 # 桌面气象雷达
 
+> 一个更低成本、更简约的桌面雷达摆件方案，可以查看 [`esp32c3` 分支](https://github.com/JStone2934/DesktopRadar/tree/esp32c3)。
+
 在树莓派上将 **GC9A01 圆形 IPS 屏（240×240）** 与可选 **1602A I2C 字符屏** 组合，显示以当前位置为中心的多图层气象图、飞机雷达、短临预报，并支持远程 GPU 状态查询。
 <img width="4096" height="3072" alt="5f2d9b2b9efe151d5fd62cbc57716e23" src="https://github.com/user-attachments/assets/9a167de9-d3ce-43b5-8259-5f699aef28ea" />
 
 <img width="1835" height="1370" alt="image" src="https://github.com/user-attachments/assets/cca9febc-5ed4-47bf-96b6-3602aa7d1247" />
-
-## 方案分支
-
-本 `master` 分支是树莓派完整方案，支持多图层、宏键盘、旋钮、1602 LCD 和远程 GPU 查询。
-
-如果只需要一个更低成本、更简约的桌面雷达摆件，可以查看 [`esp32c3` 分支](https://github.com/JStone2934/DesktopRadar/tree/esp32c3)：它使用 **ESP32-C3 Super Mini + GC9A01 圆屏**，不需要树莓派，功能聚焦在 SoftAP 配网、RainViewer 雷达静帧、底图合成和端上缓存。
 
 ## 功能概览
 
