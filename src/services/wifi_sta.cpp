@@ -180,11 +180,15 @@ static bool authMatchesMode(wifi_auth_mode_t auth, AppWifiMode mode) {
          auth != WIFI_AUTH_WPA3_ENT_192;
 }
 
-static ApChoice scanBestAp(const char* ssid, AppWifiMode mode) {
+static ApChoice scanBestAp(const char* ssid, AppWifiMode mode,
+                           uint8_t skipUsable = 0) {
   ApChoice best{};
   best.rssi = -127;
+  ApChoice ranked[4]{};
+  int rankedCount = 0;
 
-  Serial.printf("WiFi scan target: ssid=%s mode=%u\n", ssid, (unsigned)mode);
+  Serial.printf("WiFi scan target: ssid=%s mode=%u skip=%u\n", ssid,
+                (unsigned)mode, (unsigned)skipUsable);
   const int found = WiFi.scanNetworks(false, true);
   Serial.printf("WiFi scan found %d networks\n", found);
   for (int i = 0; i < found; ++i) {
@@ -202,15 +206,36 @@ static ApChoice scanBestAp(const char* ssid, AppWifiMode mode) {
     if (!usable || !bssid) {
       continue;
     }
-    if (!best.found || rssi > best.rssi) {
-      best.found = true;
-      memcpy(best.bssid, bssid, sizeof(best.bssid));
-      best.channel = (uint8_t)channel;
-      best.rssi = rssi;
-      best.auth = auth;
+    ApChoice candidate{};
+    candidate.found = true;
+    memcpy(candidate.bssid, bssid, sizeof(candidate.bssid));
+    candidate.channel = (uint8_t)channel;
+    candidate.rssi = rssi;
+    candidate.auth = auth;
+
+    int pos = rankedCount;
+    if (pos >= (int)(sizeof(ranked) / sizeof(ranked[0]))) {
+      pos = (int)(sizeof(ranked) / sizeof(ranked[0])) - 1;
+      if (rssi <= ranked[pos].rssi) {
+        continue;
+      }
+    } else {
+      ++rankedCount;
     }
+    while (pos > 0 && rssi > ranked[pos - 1].rssi) {
+      ranked[pos] = ranked[pos - 1];
+      --pos;
+    }
+    ranked[pos] = candidate;
   }
   WiFi.scanDelete();
+
+  if (rankedCount > 0) {
+    if (skipUsable >= (uint8_t)rankedCount) {
+      skipUsable = 0;
+    }
+    best = ranked[skipUsable];
+  }
 
   if (best.found) {
     Serial.printf("WiFi selected AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u rssi=%d auth=%s\n",
@@ -301,14 +326,15 @@ static bool waitForIp(uint32_t timeoutMs, const char* label) {
 
 static bool connectWithAttempts(const char* label, uint8_t attempts,
                                 uint32_t timeoutMs, uint32_t retryBaseMs,
-                                bool (*beginAttempt)(void*), void* ctx) {
+                                bool (*beginAttempt)(void*, uint8_t),
+                                void* ctx) {
   for (uint8_t attempt = 1; attempt <= attempts; ++attempt) {
     Serial.printf("WiFi %s attempt %u/%u\n", label, (unsigned)attempt,
                   (unsigned)attempts);
     if (!prepareStaRadio()) {
       return false;
     }
-    if (!beginAttempt(ctx)) {
+    if (!beginAttempt(ctx, attempt)) {
       WiFi.mode(WIFI_OFF);
       delay(250);
       continue;
@@ -328,7 +354,8 @@ struct PskContext {
   const AppConfig* cfg;
 };
 
-static bool beginPskAttempt(void* raw) {
+static bool beginPskAttempt(void* raw, uint8_t attempt) {
+  (void)attempt;
   const PskContext* ctx = static_cast<const PskContext*>(raw);
   const AppConfig* cfg = ctx->cfg;
   WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
@@ -381,7 +408,8 @@ struct OpenContext {
   const AppConfig* cfg;
 };
 
-static bool beginOpenAttempt(void* raw) {
+static bool beginOpenAttempt(void* raw, uint8_t attempt) {
+  (void)attempt;
   const OpenContext* ctx = static_cast<const OpenContext*>(raw);
   WiFi.setMinSecurity(WIFI_AUTH_OPEN);
   const ApChoice ap = scanBestAp(ctx->cfg->ssid, APP_WIFI_OPEN);
@@ -450,14 +478,15 @@ static bool setPeapCredentials(const AppConfig& cfg) {
 #endif
 }
 
-static bool beginPeapAttempt(void* raw) {
+static bool beginPeapAttempt(void* raw, uint8_t attempt) {
   const PeapContext* ctx = static_cast<const PeapContext*>(raw);
   const AppConfig* cfg = ctx->cfg;
   const char* outer =
       cfg->outer_identity[0] ? cfg->outer_identity : cfg->identity;
 
   WiFi.setMinSecurity(WIFI_AUTH_OPEN);
-  const ApChoice ap = scanBestAp(cfg->ssid, APP_WIFI_PEAP);
+  const uint8_t skip = (attempt == 2) ? 1 : 0;
+  const ApChoice ap = scanBestAp(cfg->ssid, APP_WIFI_PEAP, skip);
   if (!setStaConfig(cfg->ssid, nullptr, WIFI_AUTH_OPEN, &ap)) {
     return false;
   }
@@ -490,7 +519,7 @@ static bool wifiConnectPeap(const AppConfig& cfg) {
   }
 
   PeapContext ctx{&cfg};
-  return connectWithAttempts("PEAP", 4, 60000, 2000, beginPeapAttempt, &ctx);
+  return connectWithAttempts("PEAP", 3, 35000, 1500, beginPeapAttempt, &ctx);
 #endif
 }
 

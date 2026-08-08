@@ -2,6 +2,7 @@
 
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +11,6 @@
 #include "button.h"
 #include "config.h"
 #include "setup_screen.h"
-#include "wifi_sta.h"
 
 static WebServer* s_server = nullptr;
 static LGFX* s_portalLcd = nullptr;
@@ -29,6 +29,18 @@ struct PortalNetwork {
 
 static PortalNetwork s_portalNetworks[24];
 static int s_portalNetworkCount = 0;
+
+static void resetPortalWifiRadio() {
+  WiFi.scanDelete();
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.softAPdisconnect(true);
+  delay(120);
+  WiFi.disconnect(true, true);
+  delay(120);
+  WiFi.mode(WIFI_OFF);
+  delay(350);
+}
 
 static AppWifiMode portalModeForAuth(wifi_auth_mode_t auth) {
   if (auth == WIFI_AUTH_OPEN) {
@@ -604,17 +616,15 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
     appConfigSetDefaults(&s_seedCfg);
   }
 
-  wifiDisconnectClean();
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
+  resetPortalWifiRadio();
 
   // scanNetworks() 会打开 STA。扫描必须发生在 SoftAP 启动前，避免设置
   // 热点变成 AP+STA 混合状态，保存后再切企业 WiFi 时继承不干净的射频状态。
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   delay(100);
   scanPortalNetworks();
-  WiFi.mode(WIFI_OFF);
-  delay(200);
+  resetPortalWifiRadio();
 
   // 使用 WPA2 配置热点，保留手机端稳定拿 IP 的改动；但这里明确只进入
   // AP 模式。保存后会完整关闭 AP，再由 wifi_sta.cpp 单独启动 STA/PEAP。
@@ -623,17 +633,21 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   const IPAddress apIP(192, 168, 4, 1);
   const IPAddress gateway(192, 168, 4, 1);
   const IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(apIP, gateway, subnet);
+  const IPAddress leaseStart(192, 168, 4, 20);
+  const bool apConfigOk = WiFi.softAPConfig(apIP, gateway, subnet, leaseStart);
   const bool apOk = WiFi.softAP(SOFTAP_SSID, SOFTAP_PASS, 6, 0, 4);
   WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   delay(250);
 
   const IPAddress ip = WiFi.softAPIP();
   const bool modeOk = (WiFi.getMode() & WIFI_AP) != 0;
   const bool configOk = ip == apIP;
-  Serial.printf("SoftAP %s WPA2 channel=6 mode=%d config=%d ap=%d IP=%s\n",
-                SOFTAP_SSID, (int)modeOk, (int)configOk, (int)apOk,
-                ip.toString().c_str());
+  Serial.printf(
+      "SoftAP %s WPA2 channel=6 mode=%d ip=%d dhcp=%d ap=%d IP=%s "
+      "leaseStart=%s\n",
+      SOFTAP_SSID, (int)modeOk, (int)configOk, (int)apConfigOk, (int)apOk,
+      ip.toString().c_str(), leaseStart.toString().c_str());
 
   WebServer server(80);
   s_server = &server;
@@ -727,10 +741,7 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   delay(50);
   server.stop();
   delay(100);
-  WiFi.softAPdisconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_OFF);
-  delay(200);
+  resetPortalWifiRadio();
 
   if (outCfg) {
     if (result == PortalResult::Saved) {
