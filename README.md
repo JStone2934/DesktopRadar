@@ -1,116 +1,202 @@
 # ESP32-C3 + GC9A01 桌面气象雷达
 
-端上气象雷达摆件固件（见 [`docs/plan.md`](docs/plan.md)）。
+ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。设备通过 SoftAP 网页配网，联网后下载高德底图和 RainViewer 雷达图，端上合成 RGB565 成品帧并缓存到 LittleFS，已缓存缩放档可以秒切。
 
-**当前进度：** SoftAP / Web 配网（PSK + PEAP + 开放/白名单）已落地；高德底图 + RainViewer 静帧；BOOT 短按 z3–10/z12（跳过 z11）；**RGB565 成品全档缓存**（秒切）；空闲按距离铺满；z≥8 雷达双线性上采样。HUD：中心白十字 + 红点、底栏北京时间 `WWW HH:MM`。**按住 BOOT 播放当前档历史动画**（预渲最多 10 帧，5fps，松手停）。
+当前能力：
 
-## 硬件接线
+- SoftAP / Web 配网：普通密码 WiFi、PEAP/MSCHAPv2 企业 WiFi、开放网络 / MAC 白名单。
+- PEAP 连接会扫描同名 SSID，锁定最强 WPA2 Enterprise BSSID 和信道，避免 ESP32-C3 自动选到弱 AP。
+- 上电或 RST 默认先进入 3 分钟配置门户；短按 BOOT 或超时后继续使用已保存配置。
+- 高德底图 + RainViewer 静帧，HUD 包含中心白十字、红点、底栏北京时间。
+- z3-z12 全档 RGB565 成品缓存；已缓存档位 Flash -> SPI 秒切。
+- 后台空闲预取相邻缩放档；进度条单调递增，不回撤。
+
+更完整的路线说明见 [docs/plan.md](docs/plan.md)。
+
+## 硬件
 
 | 屏幕引脚 | ESP32-C3 GPIO |
 |----------|---------------|
 | RST | 0 |
 | CS | 1 |
 | DC | 2 |
-| SDA (MOSI) | 3 |
-| SCL (SCLK) | 4 |
+| SDA / MOSI | 3 |
+| SCL / SCLK | 4 |
 | VCC | 3.3V |
 | GND | GND |
 
 | 按键 | GPIO |
 |------|------|
-| BOOT（短按切缩放；启动门户内短按跳过；≥10s 再进设置） | 9（板载，上拉） |
+| BOOT | 9（板载，上拉） |
 
-## 配网（上电 / RST 先进门户）
+备注：
 
-每次上电或按 **RST** 后，设备开 WPA2 SoftAP **`Radar-Setup-2`**（密码 **`radar1234`**），屏显步骤说明与缩小的网址二维码（约 3 分钟倒计时；**手机连接热点后取消超时**，等点「保存并继续」）。固件不启用强制门户或通配 DNS，因此不会主动弹出“登录网络”页面。
+- 若屏幕无独立 BLK 引脚，背光常亮即可。
+- SPI 写入频率默认 20 MHz，飞线较长时更稳；稳定后可在 [include/config.h](include/config.h) 中调高。
 
-1. 手机「设置 → WLAN」手动连 `Radar-Setup-2`，输入密码 `radar1234`
-2. 手动在浏览器打开 `http://192.168.4.1`，或扫屏上的网址码
-3. 从扫描建议填入或手动输入 SSID，明确选择 **普通密码 WiFi**、**企业 WiFi（PEAP/MSCHAPv2）** 或 **开放网络 / MAC 白名单**；PEAP 需填写用户名和密码，外层 Identity 可留空（留空则使用用户名），再填写经纬度 →「保存并继续」
-4. 或：门户内 **短按 BOOT** / **超时** → 跳过，用 NVS（无则 `config.h` 默认）连网
+## 快速开始
 
-若学校要求智能设备改用 `HKUSTGZ-IOT`，可先在钉钉提交“哑终端 MAC 白名单申请”，当前板卡 MAC 为 `B8:1F:3F:0C:7A:A0`；审批生效后，在门户选择“开放网络 / MAC 白名单”，SSID 填 `HKUSTGZ-IOT`，无需密码。已验证可使用 `HKUSTGZ` 的场景仍可选择 PEAP。
-
-运行中 **超长按 BOOT（≥10s）** 可再次进入同一门户。改经纬度会清空旧 zoom 成品缓存并重造。
-
-## 编译与烧录
-
-需安装 [PlatformIO](https://platformio.org/)。本机若无 `pio` 命令，可用 `py -m platformio`。
-
-macOS 推荐使用仓库内的 Conda 环境：
+推荐使用仓库内的 Conda 环境：
 
 ```bash
-conda env create -f environment.yml  # 首次创建
+conda env create -f environment.yml
 conda activate radar-esp32c3
-pio run                              # 编译
-pio run -t upload                    # 烧录
-pio device monitor                   # 串口监视器（115200）
+pio run
+pio run -t upload
 ```
 
-以后进入项目只需运行 `conda activate radar-esp32c3`。PlatformIO 会自动识别大多数 ESP32-C3 的串口；若同时连接了多个串口设备，可给烧录或监视命令追加 `--upload-port /dev/cu.usbmodem…` 或 `--port /dev/cu.usbmodem…`。
-
-自定义分区（[`partitions.csv`](partitions.csv)）：app ≈**1.69MiB**，LittleFS ≈**2.19MiB**（约 10 档 ×115KB RGB565 + 造片余量）。正常更新直接烧录即可；首次使用新分区时 LittleFS 会自动初始化，NVS 中的 Wi-Fi 配置会保留。
-
-仅在文件系统损坏且无法自动恢复时才全擦；全擦也会清除已保存的 Wi-Fi 配置：
+如果同时接了多个串口设备，指定端口：
 
 ```bash
-pio run -t erase
-pio run -t upload
-pio device monitor      # 串口 115200
+pio run -t upload --upload-port /dev/cu.usbmodem101
+pio device monitor --port /dev/cu.usbmodem101 --baud 115200
 ```
 
-ESP32-C3 Super Mini 若上传失败：按住 **BOOT**，点一下 **RST**，松开 **BOOT** 后再 `upload`。
+ESP32-C3 Super Mini 上传失败时，可按住 BOOT，点一下 RST，松开 BOOT 后再次烧录。
 
-## 配置
+## 配网流程
 
-运行时参数写入 NVS（`Preferences` namespace `radar`）。编译默认仍在 [`include/config.h`](include/config.h)：
+每次上电或按 RST 后，设备先开启 WPA2 SoftAP：
 
-| 宏 | 含义 |
-|----|------|
-| `WIFI_SSID` / `WIFI_PASS` | NVS 未保存时的默认 PSK |
-| `MAP_LAT` / `MAP_LON` | NVS 未保存时的默认地图中心（广州） |
-| `SOFTAP_SSID` / `SOFTAP_PASS` / `CONFIG_PORTAL_*` | 热点名、WPA2 密码、管理 URL、门户超时 |
-| `MAP_ZOOM` | 默认档（7） |
-| `ZOOM_MIN` / `ZOOM_MAX` | 3 / 12（跳过 z11） |
-| `RAINVIEWER_MAX_ZOOM` | 7；更高档双线性放大 z7 雷达瓦片 |
-| `TIMEZONE_OFFSET_SEC` | 雷达帧时间 → 底栏显示（默认 UTC+8 北京时间） |
-| `RADAR_REFRESH_MS` | 全档重拉间隔（默认 5 分钟；失败后 `RADAR_REFRESH_RETRY_MS` 60s 重试） |
-| `FRAME_CACHE_GEN` | 升高后启动清旧成品并重烘焙 |
+| 项 | 值 |
+|----|----|
+| 热点名 | `Radar-Setup-2` |
+| 密码 | `radar1234` |
+| 配置页 | `http://192.168.4.1` |
+| 默认倒计时 | 3 分钟 |
 
-## 显示（对齐 DesktopRadar 静帧 HUD）
+步骤：
 
-| 元素 | 说明 |
+1. 手机或电脑连接 `Radar-Setup-2`。
+2. 浏览器打开 `http://192.168.4.1`，也可以扫屏幕上的网址二维码。
+3. 从扫描建议选择网络，或手动输入 SSID。
+4. 明确选择认证类型：普通密码 WiFi、企业 WiFi（PEAP/MSCHAPv2）、开放网络 / MAC 白名单。
+5. 填写经纬度和显示选项，点击“保存并继续”。
+
+门户行为：
+
+- 打开配置页或手机保持连接热点后，倒计时会暂停，避免填表时自动关闭。
+- 门户内短按 BOOT 可跳过配置，使用 NVS 中已保存的配置；没有保存过则使用 [include/config.h](include/config.h) 默认值。
+- 运行中长按 BOOT 约 10 秒可重新进入配置门户。
+- 修改经纬度后会清空旧位置的成品帧缓存并重新生成。
+
+## PEAP / 校园网说明
+
+PEAP 配置项：
+
+| 字段 | 说明 |
 |------|------|
-| 白十字 | 中心臂长 ±8px，烘焙进成品帧 |
-| 红点 | `(255,60,60)` 实心，半径约 3 |
-| 底栏 | 黑底白字：`WED 14:35`（RainViewer 帧 Unix 时间 + 北京时区）；无时间则 `--- --:--` |
-| 切档提示 | 顶部短暂 `zN`（不进成品帧） |
-| 底图压暗 | 8-bit 域 `tile×0.35 + (15,20,30)×0.65`，减轻 RGB565 偏绿 |
+| SSID | 企业 WiFi 名称，例如 `HKUSTGZ` |
+| PEAP 用户名 | MSCHAPv2 内层用户名 |
+| Password | PEAP 用户密码 |
+| 外层 Identity | 可选；留空则使用 PEAP 用户名 |
 
-HUD 与雷达一并写入 `/frames/zNN.rgb565`，秒切时直接刷缓存，不重画字。
+当前固件不校验 CA 证书，适合“用户名 + 密码”的 PEAP/MSCHAPv2 场景。
+
+ESP32-C3 在企业 WiFi 上容易自动选到弱 BSSID，导致认证阶段 `TIMEOUT` 或 `AUTH_EXPIRE`。固件连接前会扫描同名 SSID 的所有 AP，选择最强的 WPA2 Enterprise AP 并锁定 BSSID/channel 后再认证。串口日志会打印候选 AP、RSSI、选中的 BSSID 和失败 reason。
+
+如果学校要求智能设备走 IoT 白名单网络，可申请设备 MAC 白名单后，在门户选择“开放网络 / MAC 白名单”。当前板卡 MAC：
+
+```text
+B8:1F:3F:0C:7A:A0
+```
 
 ## 操作
 
 | 操作 | 行为 |
 |------|------|
-| 上电 / **RST** | 进入 SoftAP 配置门户（约 3 分钟） |
-| 门户内 BOOT **短按** | 跳过配置，用 NVS / 默认连网 |
-| 运行中 BOOT **短按** | 循环 z3→…→z12；已缓存档 **Flash→SPI 秒切** |
-| 运行中 BOOT **超长按**（≥10s） | 再次进入 SoftAP 配置 |
-| 未缓存 | 下载瓦片 → 烘焙成品（可较慢） |
-| 空闲 | 按距离预取 z3–10/z12（跳过 z11；首次约数分钟） |
-| 约 5 分钟 | 作废其它档成品，先重建当前档，再后台预取其余档；失败约 60s 重试 |
+| 上电 / RST | 进入 3 分钟 SoftAP 配置门户 |
+| 门户内 BOOT 短按 | 跳过门户，用保存配置连网 |
+| 运行中 BOOT 短按 | 切换缩放档 z3 -> z4 -> ... -> z12 |
+| 运行中 BOOT 长按约 10 秒 | 重新进入配置门户 |
+| 已缓存档位 | 直接刷 RGB565 成品帧，秒切 |
+| 未缓存档位 | 下载瓦片、解码、合成、写缓存，耗时较长 |
 
-## 缓存结构
+## 显示与缓存
 
-- 成品：`/frames/zNN.rgb565`（115200 字节）+ `/frames/zNN.ready`
-- 造片：**逐张** PNG→raw→贴图→立刻删除临时文件，避免 LittleFS 峰值撑满
-- 启动 / 造片前：`frameCacheScrubOrphans()` 清失败残留的 png/raw/alpha，保留已 commit 成品
-- 串口心跳含 `fs=used/total`；命中秒切见 `blit zN Xms`
+显示内容：
 
-若出现 `No more free space` 或秒切退化成反复 `Fetching...`，多为临时文件占满；新固件会自动回收，必要时 `erase` 后重烧。
+- 中心白十字和红点。
+- 底栏北京时间，格式如 `WED 14:35`；无雷达帧时间时显示 `--- --:--`。
+- 底图压暗混合，降低 RGB565 下的刺眼和偏色。
+- 底栏上沿显示细进度条；进度条只前进，不回撤，完成后隐藏。
 
-## 性能
+缓存结构：
 
-- 造片瓶颈仍是 HTTPS；烘焙阶段双线性 CPU 可接受
-- 切档命中：行刷 RGB565，目标 &lt;50ms 量级（见串口 `blit zN Xms`）
+- 成品帧：`/frames/zNN.rgb565`，每档 115200 字节。
+- 就绪标记：`/frames/zNN.ready`。
+- 临时文件：下载 PNG 后流式解码为 raw/alpha，贴图后立即删除。
+- 启动和造片前会清理失败残留，保留已 commit 的成品帧。
+
+首次启动或清空缓存后会比较慢。z7 首屏通常要下载 4 张底图和 4 张雷达图，再完成 PNG 解码、合成和写入 Flash。已缓存后切档会快很多。
+
+## 配置项
+
+主要编译期配置在 [include/config.h](include/config.h)：
+
+| 宏 | 含义 |
+|----|------|
+| `WIFI_SSID` / `WIFI_PASS` | NVS 未保存时的默认普通 WiFi |
+| `WIFI_CONNECT_TIMEOUT_MS` | 普通 WiFi 单次连接超时 |
+| `SOFTAP_SSID` / `SOFTAP_PASS` | 配置门户热点名和密码 |
+| `CONFIG_PORTAL_TIMEOUT_MS` | 门户倒计时，当前为 180000 ms |
+| `MAP_LAT` / `MAP_LON` | 默认地图中心 |
+| `MAP_ZOOM` | 默认缩放档 |
+| `ZOOM_MIN` / `ZOOM_MAX` | 缩放档范围，当前 z3-z12 |
+| `RAINVIEWER_MAX_ZOOM` | RainViewer 免费雷达瓦片最大原生 zoom |
+| `RADAR_REFRESH_MS` | 雷达刷新周期，默认 5 分钟 |
+| `RADAR_REFRESH_RETRY_MS` | 刷新失败后的重试间隔 |
+| `FRAME_CACHE_GEN` | 提升后使旧缓存失效并重建 |
+
+运行时配置写入 NVS，namespace 为 `radar`。普通更新固件不会清除 NVS；`pio run -t erase` 会清除已保存 WiFi 和坐标。
+
+## 分区
+
+使用自定义 [partitions.csv](partitions.csv)：
+
+| 区域 | 大小 |
+|------|------|
+| app0 | 0x1B0000，约 1.69 MiB |
+| LittleFS | 0x230000，约 2.19 MiB |
+| coredump | 0x10000 |
+
+正常更新直接烧录即可。只有文件系统损坏或需要清空所有 NVS/缓存时才全擦：
+
+```bash
+pio run -t erase
+pio run -t upload
+```
+
+## 常见问题
+
+**一直 WiFi fail**
+
+先看串口 reason。PEAP 下常见原因：
+
+- `TIMEOUT` / `AUTH_EXPIRE` 且 RSSI 很低：多半选到了弱 AP。新固件会锁定最强 BSSID；如果仍失败，尝试换位置或使用 IoT 白名单网络。
+- `AUTH_FAIL` 且持续失败：用户名、密码、外层 Identity 或账号权限可能不对。
+- 扫描不到企业 AP：确认 SSID 拼写、位置和 2.4 GHz 覆盖。
+
+**加载很慢**
+
+首次造片慢是正常的：ESP32-C3 需要下载、解码、合成并写入 Flash。已缓存档位应明显更快。后台预取时如果连续内存不足，串口可能出现 `frame malloc fail`，固件会冷却后重试。
+
+**进度条回撤**
+
+已修复。显示层会忽略小于当前可见进度的值，避免后台预取或失败重试造成视觉倒退。
+
+**配置页没有自动弹出**
+
+这是预期行为。固件不启用强制门户或通配 DNS，请手动打开 `http://192.168.4.1` 或扫屏幕上的网址码。
+
+**上传失败**
+
+按住 BOOT，点 RST，松开 BOOT 后重新上传；必要时指定 `--upload-port`。
+
+## 开发备注
+
+- 项目使用 Arduino framework，PlatformIO 平台固定为 `platformio/espressif32@6.12.0`。
+- `src/services/wifi_sta.cpp` 是 WiFi/PEAP 连接核心。
+- `src/services/config_portal.cpp` 是 SoftAP 配网页面。
+- `src/render/compose.cpp` 负责下载瓦片、解码和合成 RGB565。
+- `src/storage/frame_cache.cpp` 负责 LittleFS 成品帧缓存。
