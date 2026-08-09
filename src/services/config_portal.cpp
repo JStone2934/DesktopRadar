@@ -222,60 +222,66 @@ static void handleRoot() {
             "<title>风暴眼-桌面雷达设置</title><style>"
             ":root{color-scheme:light}"
             "*{box-sizing:border-box}"
-            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-            "max-width:460px;margin:0 auto;padding:18px 14px 30px;"
-            "background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);"
-            "color:#17212b;line-height:1.45}"
-            ".hero{padding:12px 4px 14px}"
-            "h1{font-size:1.58rem;margin:0 0 6px;letter-spacing:-.03em;color:#102018}"
-            ".lead{margin:0;color:#5b6978;font-size:.94rem}"
-            ".brand{display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;"
-            "padding:5px 10px;border-radius:999px;background:#dcf8e9;color:#167548;"
-            "font-size:.78rem;font-weight:700}"
-            ".dot{width:8px;height:8px;border-radius:50%;background:#23b76d;"
-            "box-shadow:0 0 0 4px #23b76d22}"
-            ".card{background:#fff;border:1px solid #e3e8ef;border-radius:20px;"
-            "padding:17px;margin:12px 0;box-shadow:0 10px 28px rgba(25,42,62,.08)}"
-            ".card h2{font-size:1.02rem;margin:0 0 12px;color:#17212b}"
-            "label{display:block;margin:12px 0 5px;font-size:.88rem;color:#344255;font-weight:650}"
-            "input,select{width:100%;padding:12px;border-radius:13px;"
-            "border:1px solid #d5dde8;background:#fbfcfe;color:#17212b;font-size:1rem}"
-            "input:focus,select:focus{outline:3px solid #23b76d25;border-color:#23b76d;background:#fff}"
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;max-width:460px;margin:0 auto;padding:18px 14px 30px;background:repeating-linear-gradient(0deg,rgba(13,27,42,.035) 0 1px,transparent 1px 6px),radial-gradient(circle at 50% -120px,#e8edf3 0,#d7dde6 360px),linear-gradient(180deg,#cfd6df 0,#e6e9ee 100%);color:#172033;line-height:1.45}"
+            ".hero{position:relative;overflow:hidden;padding:16px 4px 18px}"
+            ".radar{position:absolute;right:4px;top:10px;width:96px;height:96px;border-radius:50%;opacity:.38;background:repeating-radial-gradient(circle,rgba(20,45,72,.24) 0 1px,transparent 1px 18px),conic-gradient(from -28deg,transparent 0 292deg,rgba(20,45,72,.42) 322deg,transparent 348deg);border:1px solid #6f7d8e}"
+            ".radar:before,.radar:after{content:'';position:absolute;background:#243b5a}"
+            ".radar:before{left:47px;top:10px;width:1px;height:76px;opacity:.22}"
+            ".radar:after{left:10px;top:47px;width:76px;height:1px;opacity:.22}"
+            "h1{position:relative;font-family:Georgia,'Times New Roman','Songti SC','STSong','SimSun',serif;font-size:1.72rem;margin:0 0 6px;letter-spacing:.01em;color:#101827;font-weight:850;text-shadow:0 1px 0 rgba(255,255,255,.55)}"
+            ".lead{position:relative;margin:0;max-width:330px;color:#4b596e;font-size:.92rem;letter-spacing:.02em}"
+            ".panelnote{position:relative;display:flex;align-items:center;gap:7px;margin-top:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.68rem;font-weight:800;letter-spacing:.12em;color:#9b3b3b;text-transform:uppercase}"
+            ".tri{display:inline-block;width:0;height:0;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:9px solid #9b3b3b}"
+            ".brand{position:relative;display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;padding:5px 10px;border-radius:1px;background:#101827;color:#e6e9ee;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem;font-weight:800;letter-spacing:.08em;border:1px solid #050814}"
+            ".dot{width:8px;height:8px;border-radius:50%;background:#c8d0dc;box-shadow:0 0 0 4px rgba(16,24,39,.14)}"
+            ".card{background:#f2f4f7;border:1.5px solid #8c96a6;border-left:5px solid #142d48;border-radius:1px;padding:15px;margin:12px 0;box-shadow:4px 4px 0 rgba(16,24,39,.18)}"
+            ".card:before{content:'';display:block;height:3px;margin:-15px -16px 13px;background:linear-gradient(90deg,#142d48 0 64%,transparent 64% 72%,#9b3b3b 72% 82%,transparent 82%);opacity:.82}"
+            ".card h2{display:flex;align-items:center;gap:8px;font-family:Georgia,'Times New Roman','Songti SC','STSong','SimSun',serif;font-size:1.1rem;margin:0 0 12px;color:#101827;font-weight:850;letter-spacing:.01em}"
+            ".card h2:after{content:'VERIFY';margin-left:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.62rem;letter-spacing:.12em;color:#9b3b3b;border-left:7px solid #9b3b3b;padding-left:6px}"
+            ".module{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;letter-spacing:.14em;color:#f2f4f7;background:#142d48;border:1px solid #050814;border-radius:1px;padding:3px 7px;font-weight:800}"
+            "label{display:block;margin:12px 0 5px;font-size:.9rem;color:#253449;font-weight:760;letter-spacing:.01em}"
+            ".card>label:before,.peap-only label:before,.setting label:before{content:'';display:inline-block;width:0;height:0;margin-right:6px;border-top:4px solid transparent;border-bottom:4px solid transparent;border-left:7px solid #9b3b3b}"
+            "input,select{width:100%;padding:12px;border-radius:1px;border:1.5px solid #657184;background:#fbfcfe;color:#101827;font-size:1rem;box-shadow:inset 2px 2px 0 rgba(16,24,39,.08)}"
+            "input:focus,select:focus{outline:3px solid rgba(20,45,72,.18);border-color:#142d48;background:#fff;box-shadow:0 0 0 1px #142d48,inset 2px 2px 0 rgba(16,24,39,.08)}"
+            "input::placeholder{color:#687386}"
             ".row{display:flex;gap:8px;align-items:stretch}"
             ".row select{width:6.6em;flex:0 0 auto}"
             ".row input{flex:1;min-width:0}"
-            ".hint{color:#667789;font-size:.82rem;margin:7px 0 0}"
-            ".mini{color:#7a8795;font-size:.78rem;margin:8px 0 0}"
-            ".pill{display:inline-block;padding:2px 8px;border-radius:999px;"
-            "background:#eef3f8;color:#657386;font-size:.72rem;margin-left:6px}"
-            "button{width:100%;padding:14px;margin-top:16px;border:0;border-radius:15px;"
-            "background:#19a763;color:#fff;font-size:1rem;font-weight:800;"
-            "box-shadow:0 10px 20px rgba(25,167,99,.22)}"
-            "button.btn-geo{margin-top:10px;background:#eef3f8;color:#243447;box-shadow:none;font-size:.95rem}"
+            ".hint{color:#5d6878;font-size:.82rem;margin:7px 0 0;letter-spacing:.01em}"
+            ".mini{color:#6b7482;font-size:.78rem;margin:8px 0 0}"
+            ".pill{display:inline-block;padding:2px 8px;border-radius:1px;background:#e1e5eb;color:#253449;font-size:.72rem;margin-left:6px;border:1px solid #a8b0bd}"
+            "button{width:100%;padding:14px;margin-top:16px;border:0;border-radius:1px;background:#142d48;color:#f2f4f7;font-size:1rem;font-weight:850;letter-spacing:.035em;box-shadow:3px 3px 0 rgba(16,24,39,.24);border:1px solid #050814}"
+            "button.btn-geo{margin-top:10px;background:#e1e5eb;color:#101827;box-shadow:2px 2px 0 rgba(16,24,39,.18);border:1px solid #8c96a6;font-size:.95rem}"
             "button.btn-geo:disabled{opacity:.6}"
-            ".check{display:flex;gap:8px;align-items:center;margin:10px 0 0;color:#5b6978;font-size:.86rem}"
+            ".check{display:flex;gap:8px;align-items:center;margin:10px 0 0;color:#253449;font-size:.86rem}"
             ".check input{width:auto}"
-            "details{margin-top:14px;border-top:1px solid #edf1f5;padding-top:12px}"
-            "summary{cursor:pointer;color:#506174;font-size:.9rem}"
-            ".guide{margin-top:14px;padding:13px;border-radius:16px;background:#f0fbf5;"
-            "border:1px solid #cbeedb;color:#506174;font-size:.82rem}"
-            ".guide b{display:block;color:#163f2b;margin:8px 0 2px}"
+            "details{margin-top:14px;border-top:1px solid #c2c8d2;padding-top:12px}"
+            "summary{cursor:pointer;color:#253449;font-size:.9rem}"
+            ".setting{margin:12px 0;padding:12px;border:1px solid #a8b0bd;border-radius:1px;background:#e8ecf2}"
+            ".setting:before{content:'LAYER';display:block;margin:-2px 0 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.62rem;font-weight:800;letter-spacing:.14em;color:#9b3b3b}"
+            ".setting label{margin:0 0 6px}.setting select{margin-top:0}"
+            ".hintlist{margin:8px 0 0;padding-left:18px;color:#5d6878;font-size:.82rem;line-height:1.5}"
+            ".guide{margin-top:14px;padding:13px;border-radius:1px;background:#e8ecf2;border:1px solid #a8b0bd;color:#4b596e;font-size:.82rem}"
+            ".guide b{display:block;color:#172033;margin:8px 0 2px}"
             ".guide b:first-child{margin-top:0}"
             ".peap-only{display:none}"
             ".actions{padding:0 2px}"
-            ".footerhint{background:#eaf8f1;border:1px solid #cbeedb;color:#35614a;"
-            "border-radius:14px;padding:11px 12px;margin-top:10px}"
-            ".footer{text-align:center;margin:18px 0 0;color:#718092;font-size:.82rem}"
-            ".footer .url{display:block;color:#167548;word-break:break-all;margin-top:4px}"
+            ".footerhint{background:#e8ecf2;border:1px solid #a8b0bd;color:#253449;border-radius:1px;padding:11px 12px;margin-top:10px}"
+            ".footerhint:before{content:'NOTICE';display:block;margin-bottom:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;font-weight:800;letter-spacing:.12em;color:#9b3b3b;border-left:7px solid #9b3b3b;padding-left:6px}"
+            ".footer{text-align:center;margin:18px 0 0;color:#5d6878;font-size:.82rem;letter-spacing:.03em}"
+            ".footer .url{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#142d48;word-break:break-all;margin-top:4px;letter-spacing:0}"
+            "/*retroHard*/"
             "</style></head><body>"
-            "<div class=\"hero\"><div class=\"brand\"><span class=\"dot\"></span>RadarSetup 配置热点</div>"
+            "<div class=\"hero\"><div class=\"radar\" aria-hidden=\"true\"></div>"
+            "<div class=\"brand\"><span class=\"dot\"></span>RadarSetup · LINK ONLINE</div>"
             "<h1>风暴眼-桌面雷达设置</h1>"
-            "<p class=\"lead\">选择要连接的 WiFi，确认雷达中心位置，保存后设备会自动继续运行。</p></div>"
+            "<p class=\"lead\">配置网络接入、雷达中心坐标与显示图层。保存后设备将退出配置热点，并尝试接入目标 WiFi。</p>"
+            "<div class=\"panelnote\"><span class=\"tri\"></span>RADAR CONFIG · FIELD SETUP</div></div>"
             "<form method=\"POST\" action=\"/save\" accept-charset=\"UTF-8\" "
             "autocomplete=\"off\">"
-            "<section class=\"card\"><h2>1. 连接网络</h2>"
-            "<label>附近的 WiFi</label><select id=\"scan\" autocomplete=\"off\" "
-            "onchange=\"pickScan()\"><option value=\"\">手动输入或保持当前网络</option>");
+            "<section class=\"card\"><h2><span class=\"module\">LINK</span>网络接入</h2>"
+            "<label>扫描到的网络</label><select id=\"scan\" autocomplete=\"off\" "
+            "onchange=\"pickScan()\"><option value=\"\">手动填写或保留当前网络</option>");
   for (int i = 0; i < s_portalNetworkCount; ++i) {
     const PortalNetwork& network = s_portalNetworks[i];
     html += F("<option value=\"");
@@ -296,22 +302,22 @@ static void handleRoot() {
     }
     html += F("</option>");
   }
-  html += F("</select><p class=\"hint\">列表按信号强度排列；如果没看到目标网络，可以直接在下面输入名称。</p>"
-            "<label>网络名称 SSID</label><input name=\"ssid\" id=\"ssid\" required maxlength=\"32\" "
+  html += F("</select><p class=\"hint\">列表按信号强度排序；隐藏网络或未扫描到的网络可在下方手动填写 SSID。</p>"
+            "<label>SSID</label><input name=\"ssid\" id=\"ssid\" required maxlength=\"32\" "
             "autocomplete=\"off\" autocapitalize=\"none\" autocorrect=\"off\" "
             "spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.ssid);
   // 密码不回填；留空则保留原密码。new-password 降低浏览器自动填充旧会话密码
-  html += F("\"><label id=\"passLabel\">WiFi 密码</label>"
+  html += F("\"><label id=\"passLabel\">网络密码</label>"
             "<input name=\"pass\" id=\"pass\" type=\"password\" maxlength=\"64\" "
             "value=\"\" autocomplete=\"new-password\" autocapitalize=\"none\" "
             "autocorrect=\"off\" spellcheck=\"false\">"
-            "<p class=\"hint\" id=\"passHint\">如果已保存同一个网络，可以留空继续使用原密码。</p>"
+            "<p class=\"hint\" id=\"passHint\">若同一网络已保存凭据，可留空继续使用原密码；更换网络时需重新填写。</p>"
             "<label class=\"check\"><input type=\"checkbox\" onclick=\""
             "document.getElementById('pass').type=this.checked?'text':'password'\">"
-            "显示密码</label>"
-            "<details id=\"advanced\"><summary>高级网络设置 <span class=\"pill\">若使用企业认证网络</span></summary>"
-            "<label>认证类型</label><select name=\"mode\" id=\"mode\" "
+            "显示明文密码</label>"
+            "<details id=\"advanced\"><summary>企业认证参数 <span class=\"pill\">校园网 / 企业网</span></summary>"
+            "<label>接入方式</label><select name=\"mode\" id=\"mode\" "
             "autocomplete=\"off\" onchange=\"netChanged(true)\">");
   html += s_seedCfg.wifi_mode == APP_WIFI_PSK
               ? F("<option value=\"0\" selected>普通密码 WiFi</option>")
@@ -323,19 +329,19 @@ static void handleRoot() {
               ? F("<option value=\"2\" selected>开放网络</option>")
               : F("<option value=\"2\">开放网络</option>");
   html += F("</select>"
-            "<p class=\"mini\">学校或公司网络通常选择企业 WiFi；家用路由器通常选择普通密码 WiFi。</p>"
-            "<div class=\"peap-only\" id=\"idRow\"><label>PEAP 用户名</label>"
+            "<p class=\"mini\">家用路由器或手机热点通常选择普通密码 WiFi；校园网、企业网通常选择 PEAP。</p>"
+            "<div class=\"peap-only\" id=\"idRow\"><label>PEAP 账户</label>"
             "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
             "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.identity);
-  html += F("\"><label>外层 Identity（可选）</label>"
+  html += F("\"><label>外层身份 Outer Identity（可选）</label>"
             "<input name=\"outer_identity\" id=\"outer_identity\" maxlength=\"63\" "
             "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" "
-            "placeholder=\"留空则使用 PEAP 用户名\" value=\"");
+            "placeholder=\"留空时使用 PEAP 账户\" value=\"");
   appendEscaped(html, s_seedCfg.outer_identity);
   html += F("\"></div></details></section>"
-            "<section class=\"card\"><h2>2. 设备位置</h2>"
-            "<p class=\"hint\">用于决定雷达图中心。中国大陆通常选择北纬、东经；小数点示例：23.12910。</p>"
+            "<section class=\"card\"><h2><span class=\"module\">CENTER</span>雷达中心</h2>"
+            "<p class=\"hint\">用于确定雷达画面的中心点。坐标请使用十进制度小数，例如 23.12910。</p>"
             "<label>纬度</label><div class=\"row\">"
             "<select name=\"lat_hem\" id=\"lat_hem\" autocomplete=\"off\">");
   html += latSouth ? F("<option value=\"N\">北纬</option>"
@@ -356,10 +362,10 @@ static void handleRoot() {
   html += lonBuf;
   html += F("\"></div>"
             "<button type=\"button\" class=\"btn-geo\" id=\"geoBtn\" "
-            "onclick=\"doGeo()\">获取当前位置</button>"
+            "onclick=\"doGeo()\">使用当前定位</button>"
             "<p class=\"hint\" id=\"geoHint\"></p></section>"
-            "<section class=\"card\"><h2>3. 显示选项</h2>"
-            "<label>显示进度条</label><select name=\"show_ring\" "
+            "<section class=\"card\"><h2><span class=\"module\">LAYERS</span>显示图层</h2>"
+            "<div class=\"setting\"><label>更新进度指示</label><select name=\"show_ring\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_progress
               ? F("<option value=\"1\" selected>显示</option>"
@@ -367,8 +373,8 @@ static void handleRoot() {
               : F("<option value=\"1\">显示</option>"
                   "<option value=\"0\" selected>隐藏</option>");
   html += F("</select>"
-            "<p class=\"hint\">它表示设备正在下载、合成并缓存雷达画面；关闭后只是不显示提示，不影响自动更新。</p>"
-            "<label>天气预警环</label><select name=\"show_alert\" "
+            "<p class=\"hint\">显示雷达画面下载、合成与缓存进度。</p></div>"
+            "<div class=\"setting\"><label>边缘天气提示环</label><select name=\"show_alert\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_alert_ring
               ? F("<option value=\"1\" selected>开启</option>"
@@ -376,8 +382,8 @@ static void handleRoot() {
               : F("<option value=\"1\">开启</option>"
                   "<option value=\"0\" selected>关闭</option>");
   html += F("</select>"
-            "<p class=\"hint\">显示你附近的天气情况。</p>"
-            "<label>中心十字</label><select name=\"show_crosshair\" "
+            "<p class=\"hint\">显示附近天气情况。</p></div>"
+            "<div class=\"setting\"><label>中心十字准星</label><select name=\"show_crosshair\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_crosshair
               ? F("<option value=\"1\" selected>显示</option>"
@@ -385,8 +391,8 @@ static void handleRoot() {
               : F("<option value=\"1\">显示</option>"
                   "<option value=\"0\" selected>隐藏</option>");
   html += F("</select>"
-            "<p class=\"hint\">用于标记雷达画面中心位置；隐藏后不影响天气数据更新和缩放切换。</p>"
-            "<label>默认打开的缩放等级</label><select name=\"default_zoom\" "
+            "<p class=\"hint\">标示当前雷达中心位置。</p></div>"
+            "<div class=\"setting\"><label>启动默认缩放等级</label><select name=\"default_zoom\" "
             "autocomplete=\"off\">");
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
     if (!zoomCanCompose(z)) {
@@ -399,12 +405,14 @@ static void handleRoot() {
     html += F("</option>");
   }
   html += F("</select>"
-            "<p class=\"hint\">设备启动后会先打开这个缩放等级；运行中按住 S键 2 秒也会直接跳回这里。z3 视野最大、范围最广；z12 放大最多、细节最多。</p>"
-            "<div class=\"guide\"><b>切换缩放有时卡顿怎么办？</b>"
-            "短按 S键会切换缩放；如果刚好在下载或生成缓存，可能会慢几秒。等进度结束或再短按一次即可，通常不需要重新配置 WiFi。</div>"
-            "</section><div class=\"actions\"><button type=\"submit\">保存设置并连接 WiFi</button>"
-            "<p class=\"hint footerhint\">保存后手机会从 RadarSetup 热点断开，这是正常现象；设备会开始连接你选择的 WiFi。</p></div></form>"
-            "<footer class=\"footer\">项目 GitHub<span class=\"url\">"
+            "<ul class=\"hintlist\"><li>设备启动后优先载入该等级</li>"
+            "<li>运行中长按 S 键 2 秒可返回该等级。</li>"
+            "<li>z3 视野最大、范围最广；z12 放大最多、细节最多。</li></ul></div>"
+            "<div class=\"guide\"><b>缩放切换响应较慢？</b>"
+            "短按 S 键切换缩放。若设备正在下载或生成缓存，响应可能延迟数秒；等待进度完成后会恢复，通常无需重新配置 WiFi。</div>"
+            "</section><div class=\"actions\"><button type=\"submit\">保存并连接目标 WiFi</button>"
+            "<p class=\"hint footerhint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>"
+            "<footer class=\"footer\">项目源码<span class=\"url\">"
             "https://github.com/JStone2934/DesktopRadar/tree/esp32c3</span></footer>"
             "<script>"
             "function pickScan(){var s=document.getElementById('scan'),x=s.options[s.selectedIndex];"
@@ -417,13 +425,13 @@ static void handleRoot() {
             "document.getElementById('identity').required=p;"
             "document.getElementById('outer_identity').disabled=!p;"
             "document.getElementById('pass').disabled=o;"
-            "document.getElementById('passLabel').textContent=o?'WiFi 密码':'WiFi 密码';"
+            "document.getElementById('passLabel').textContent=o?'网络密码':'网络密码';"
             "document.getElementById('passHint').textContent=o?'开放网络无需填写密码。':"
-            "(p?'如果已保存同一个网络和用户名，可以留空继续使用原密码。':'如果已保存同一个网络，可以留空继续使用原密码。');}"
+            "(p?'若同一网络与 PEAP 账户已保存凭据，可留空继续使用原密码。':'若同一网络已保存凭据，可留空继续使用原密码；更换网络时需重新填写。');}"
             "function geoFail(){var h=document.getElementById('geoHint');"
-            "h.textContent='当前浏览器不支持，请手动填写或从地图复制';"
+            "h.textContent='无法读取浏览器定位，请手动输入十进制度坐标';"
             "var b=document.getElementById('geoBtn');b.disabled=false;"
-            "b.textContent='获取当前位置';}"
+            "b.textContent='使用当前定位';}"
             "function doGeo(){"
             "var h=document.getElementById('geoHint');h.textContent='';"
             "if(!navigator.geolocation){geoFail();return;}"
@@ -435,8 +443,8 @@ static void handleRoot() {
             "document.getElementById('lon_hem').value=lo<0?'W':'E';"
             "document.getElementById('lat').value=Math.abs(la).toFixed(5);"
             "document.getElementById('lon').value=Math.abs(lo).toFixed(5);"
-            "h.textContent='已填入当前坐标';"
-            "b.disabled=false;b.textContent='获取当前位置';"
+            "h.textContent='已写入当前坐标';"
+            "b.disabled=false;b.textContent='使用当前定位';"
             "},function(){geoFail();},"
             "{enableHighAccuracy:true,timeout:15000,maximumAge:0});}"
             "netChanged(false);</script>"
@@ -450,17 +458,17 @@ static const char kSavedHtml[] PROGMEM = R"HTML(
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-store">
-<title>设置已保存</title>
+<title>配置已提交</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);color:#17212b;margin:0;padding:28px 16px;text-align:center}
 .card{max-width:420px;margin:36px auto 0;background:#fff;border:1px solid #e3e8ef;border-radius:20px;padding:24px 18px;box-shadow:0 10px 28px rgba(25,42,62,.08)}
 h1{font-size:1.45rem;margin:0 0 10px}.ok{font-size:2rem;margin-bottom:8px;color:#19a763}
 p{color:#5b6978;line-height:1.5;margin:8px 0}.small{font-size:.84rem;color:#7a8795;margin-top:18px}
 </style>
-</head><body><div class="card"><div class="ok">✓</div><h1>设置已保存</h1>
-<p>手机会从 RadarSetup 热点断开，这是正常现象。</p>
-<p>设备正在关闭热点，并连接你选择的 WiFi。</p>
-<p class="small">如果下次需要重新设置，请再次进入配置模式后打开 http://192.168.4.1/。</p>
+</head><body><div class="card"><div class="ok">✓</div><h1>配置已保存</h1>
+<p>RadarSetup 配置热点即将关闭，手机断开属于正常现象。</p>
+<p>设备正在使用新的网络参数连接目标 WiFi；连接成功后将进入雷达显示。</p>
+<p class="small">如需重新配置，请进入配置模式后打开 http://192.168.4.1/。</p>
 </div>
 </body></html>
 )HTML";
@@ -553,14 +561,14 @@ static const char* parseForm(AppConfig* cfg) {
   String id = s_server->arg("identity");
   id.trim();
   if (id.length() > 63) {
-    return "PEAP 用户名过长";
+    return "PEAP 账户过长";
   }
   strncpy(cfg->identity, id.c_str(), sizeof(cfg->identity) - 1);
 
   String outerId = s_server->arg("outer_identity");
   outerId.trim();
   if (outerId.length() > 63) {
-    return "外层 Identity 过长";
+    return "外层身份过长";
   }
   strncpy(cfg->outer_identity, outerId.c_str(),
           sizeof(cfg->outer_identity) - 1);
@@ -571,7 +579,7 @@ static const char* parseForm(AppConfig* cfg) {
   }
 
   if (cfg->wifi_mode == APP_WIFI_PEAP && cfg->identity[0] == '\0') {
-    return "PEAP 需要用户名";
+    return "PEAP 需要填写账户";
   }
 
   const bool sameSavedNetwork =
@@ -677,7 +685,7 @@ static void handleSave() {
     html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
               "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
-              "<title>保存失败</title><style>"
+              "<title>参数校验未通过</title><style>"
               "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
               "background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);"
               "color:#17212b;margin:0;padding:28px 16px}"
@@ -687,11 +695,11 @@ static void handleSave() {
               "color:#a43647;border-radius:14px;padding:12px;margin:14px 0}"
               "p{color:#5b6978;line-height:1.5}a{display:block;text-align:center;text-decoration:none;"
               "background:#19a763;color:#fff;font-weight:700;border-radius:14px;padding:13px;margin-top:18px}"
-              "</style></head><body><div class=\"card\"><h1>保存失败</h1>"
-              "<p>有一项设置需要修改后才能继续。</p><div class=\"reason\">");
+              "</style></head><body><div class=\"card\"><h1>参数校验未通过</h1>"
+              "<p>以下配置项需要修正后才能保存。</p><div class=\"reason\">");
     appendEscaped(html, err);
-    html += F("</div><p>请返回上一页检查输入。纬度/经度请使用英文小数点，例如 23.12910。</p>"
-              "<a href=\"/\">返回修改</a></div></body></html>");
+    html += F("</div><p>请返回配置页核对网络参数与坐标格式。坐标请使用十进制度小数，例如 23.12910。</p>"
+              "<a href=\"/\">返回配置页</a></div></body></html>");
     s_server->send(400, "text/html; charset=utf-8", html);
     return;
   }
