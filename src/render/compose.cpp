@@ -20,9 +20,11 @@
 
 static ComposeProgressFn s_progressFn = nullptr;
 static ComposeDisplayFn s_displayFn = nullptr;
+static bool s_crosshairVisible = true;
 
 void composeSetProgressFn(ComposeProgressFn fn) { s_progressFn = fn; }
 void composeSetDisplayFn(ComposeDisplayFn fn) { s_displayFn = fn; }
+void composeSetCrosshairVisible(bool visible) { s_crosshairVisible = visible; }
 
 static void reportComposeProgress(int zoom, float local01) {
   if (!s_progressFn) {
@@ -682,7 +684,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                 (unsigned)alertColor, (unsigned)centerSample.maxAlpha);
 
   reportComposeProgress(zoom, 0.97f);
-  frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
+  if (s_crosshairVisible) {
+    frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
+  }
   frameCacheDrawOverlayBuf(frame, haveRadarMeta ? meta.time : 0);
   if (haveRadarMeta && meta.time != 0) {
     frameCacheWriteRadarTime(zoom, meta.time);

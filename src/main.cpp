@@ -269,6 +269,10 @@ static void updateLongPressCue() {
   if (s_longCueSuppressUntilRelease) {
     return;
   }
+  if (!s_cfg.show_crosshair) {
+    clearLongPressCue();
+    return;
+  }
   const uint32_t held = buttonHeldMs();
   if (held < BTN_LONG_FEEDBACK_MS || held >= BTN_LONG_MS) {
     if (held < BTN_LONG_FEEDBACK_MS) {
@@ -597,6 +601,7 @@ static void runPortalAndApply() {
 
   const float oldLat = s_cfg.lat;
   const float oldLon = s_cfg.lon;
+  const bool oldCrosshair = s_cfg.show_crosshair;
 
   const PortalResult pr =
       configPortalRun(&lcd, CONFIG_PORTAL_TIMEOUT_MS, &s_cfg);
@@ -606,6 +611,8 @@ static void runPortalAndApply() {
   if (pr == PortalResult::Saved) {
     if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
       clearAllFrameCaches("location change");
+    } else if (oldCrosshair != s_cfg.show_crosshair) {
+      clearAllFrameCaches("crosshair setting change");
     }
   }
 
@@ -620,6 +627,7 @@ static void runPortalAndApply() {
   }
 
   zoomSetDefault(s_cfg.default_zoom);
+  composeSetCrosshairVisible(s_cfg.show_crosshair);
   zoomSetCurrent(zoomDefault());
   tryWifiAndRadar();
 }
@@ -640,6 +648,7 @@ void setup() {
   zoomSetPendingFeedback(onPendingZoomFeedback);
   composeSetProgressFn(onComposeProgress);
   composeSetDisplayFn(onComposeDisplay);
+  composeSetCrosshairVisible(s_cfg.show_crosshair);
 
   showStatus("LittleFS...", "");
   if (!frameCacheBegin()) {

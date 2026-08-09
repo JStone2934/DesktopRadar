@@ -19,6 +19,9 @@ typedef void (*ComposeDisplayFn)(int zoom);
 
 void composeSetDisplayFn(ComposeDisplayFn fn);
 
+/** 是否在合成的雷达画面中绘制中心十字。 */
+void composeSetCrosshairVisible(bool visible);
+
 /**
  * 两阶段造片：HTTPS 瓦片落盘 → 烘焙 RGB565 成品。
  * pushToDisplay 时烘焙后行刷上屏。

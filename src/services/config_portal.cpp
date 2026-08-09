@@ -377,6 +377,15 @@ static void handleRoot() {
                   "<option value=\"0\" selected>关闭</option>");
   html += F("</select>"
             "<p class=\"hint\">显示你附近的天气情况。</p>"
+            "<label>中心十字</label><select name=\"show_crosshair\" "
+            "autocomplete=\"off\">");
+  html += s_seedCfg.show_crosshair
+              ? F("<option value=\"1\" selected>显示</option>"
+                  "<option value=\"0\">隐藏</option>")
+              : F("<option value=\"1\">显示</option>"
+                  "<option value=\"0\" selected>隐藏</option>");
+  html += F("</select>"
+            "<p class=\"hint\">用于标记雷达画面中心位置；隐藏后不影响天气数据更新和缩放切换。</p>"
             "<label>默认打开的缩放等级</label><select name=\"default_zoom\" "
             "autocomplete=\"off\">");
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
@@ -635,6 +644,7 @@ static const char* parseForm(AppConfig* cfg) {
   cfg->lon = lon;
   cfg->show_progress = (s_server->arg("show_ring") != "0");
   cfg->show_alert_ring = (s_server->arg("show_alert") == "1");
+  cfg->show_crosshair = (s_server->arg("show_crosshair") != "0");
 
   String defaultZoomStr = s_server->arg("default_zoom");
   defaultZoomStr.trim();
@@ -691,10 +701,10 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d defZoom=%d\n",
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d defZoom=%d\n",
                 (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
                 (int)cfg.show_progress, (int)cfg.show_alert_ring,
-                cfg.default_zoom);
+                (int)cfg.show_crosshair, cfg.default_zoom);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();
   s_server->sendHeader("Location", "/done", true);

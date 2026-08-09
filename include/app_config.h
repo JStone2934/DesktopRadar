@@ -19,6 +19,7 @@ struct AppConfig {
   float lon;
   bool show_progress;   // 底栏横向进度条
   bool show_alert_ring;  // 中心天气预警环
+  bool show_crosshair;   // 中心十字准星
   int default_zoom;      // 启动默认缩放档；按住 S 键 2 秒跳回此档
 };
 
