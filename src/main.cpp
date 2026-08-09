@@ -203,6 +203,15 @@ static size_t fsFreeBytes() {
   return total > used ? (total - used) : 0;
 }
 
+static void forceWifiReconnectAfterFetchFail(const char* reason) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  Serial.printf("WiFi recovery: disconnect after %s\n",
+                reason && reason[0] ? reason : "fetch failure");
+  WiFi.disconnect(false, false);
+}
+
 static bool buildAndCache(int zoom, bool pushToDisplay);
 static void handlePendingZoom();
 static void pumpPrefetch();
@@ -262,6 +271,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   if (!zoomCanCompose(zoom)) {
     return false;
   }
+  const bool wasFresh = frameCacheIsFresh(zoom);
   s_busyCompose = true;
   composeClearAbort();
   s_bakeZoom = zoom;
@@ -292,6 +302,9 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
       Serial.printf("build z%d fail\n", zoom);
     }
     frameCacheRestoreStale(zoom);
+    if (wasFresh && frameCacheHas(zoom)) {
+      frameCacheMarkFresh(zoom, true);
+    }
     s_statusScreen = false;
     refreshProgressRing();
     return false;
@@ -301,6 +314,9 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
   if (!frameCacheHas(zoom)) {
     Serial.printf("build z%d not cached (display-only)\n", zoom);
     frameCacheRestoreStale(zoom);
+    if (wasFresh && frameCacheHas(zoom)) {
+      frameCacheMarkFresh(zoom, true);
+    }
     if (pushToDisplay && frameCacheHas(zoom)) {
       s_displayedZoom = zoom;
       s_statusScreen = false;
@@ -358,6 +374,7 @@ static void pumpBackgroundPrefetch() {
 
 static void ensureZoomVisible(int zoom, bool userInitiated) {
   if (userInitiated) {
+    noteUserInteraction();
     if (s_busyCompose) {
       composeRequestAbort();
     }
@@ -368,25 +385,24 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
 
   // 已在屏上：不再 blit/呼吸，避免「跳了一下还是同一档」
   if (s_displayedZoom == zoom && frameCacheHas(zoom)) {
-    zoomPrefetchResetAround(zoom);
+    if (!userInitiated) {
+      zoomPrefetchResetAround(zoom);
+    }
     return;
   }
 
   if (frameCacheHas(zoom)) {
-    // 已缓存秒切：不暂停预取，让后台继续铺其它档
+    // 已缓存秒切：用户触发时先让后台预取让路；后台触发时才重建队列。
     if (!showCached(zoom)) {
       if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
         zoomSetCurrent(s_displayedZoom);
       }
       return;
     }
-    zoomPrefetchResetAround(zoom);
+    if (!userInitiated) {
+      zoomPrefetchResetAround(zoom);
+    }
     return;
-  }
-
-  // 未缓存：造片会占满主循环，短暂暂停预取
-  if (userInitiated) {
-    noteUserInteraction();
   }
 
   if (userInitiated && s_busyCompose) {
@@ -579,8 +595,6 @@ void loop() {
       zoomPrefetchClear();
       // 全量同一雷达时刻：标记全部过时（保留旧成品供刷新期间秒切）
       rainviewerInvalidatePin();
-      s_staticFullPassDone = false;
-      frameCacheMarkAllStaleExcept(z);
       frameCacheSetProtectedZoom(s_displayedZoom >= 0 ? s_displayedZoom : z);
       const bool ok = buildAndCache(z, true);
       if (ok) {
@@ -589,6 +603,11 @@ void loop() {
         uint32_t t = 0;
         frameCacheReadRadarTime(z, &t);
         showCached(z);
+        // 当前档确认拿到新雷达后，再让其它档进入本轮重建。这样网络
+        // 抖动不会把已有缓存/进度状态提前打成 stale。
+        s_staticFullPassDone = false;
+        frameCacheMarkAllStaleExcept(z);
+        refreshProgressRing();
         Serial.printf(
             "refresh ok z%d radar_t=%lu fresh=%d/%d free=%u — prefetch others\n", z,
             (unsigned long)t, frameCacheCountFresh(), frameCacheZoomSlots(),
@@ -601,6 +620,7 @@ void loop() {
         Serial.printf("refresh fail, retry in %lus free=%u\n",
                       (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL),
                       (unsigned)fsFreeBytes());
+        forceWifiReconnectAfterFetchFail("scheduled refresh failure");
         handlePendingZoom();
       }
     }
