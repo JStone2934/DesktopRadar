@@ -483,7 +483,7 @@ static bool tryWifiAndRadar() {
   s_wifiOk = wifiConnect(&s_cfg);
   if (!s_wifiOk) {
     showStatus("WiFi fail", s_cfg.ssid);
-    Serial.println("hold BOOT 10s to re-open setup");
+    Serial.println("hold S key 10s to re-open setup");
     return false;
   }
 

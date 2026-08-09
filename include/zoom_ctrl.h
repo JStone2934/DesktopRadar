@@ -50,7 +50,7 @@ typedef void (*ZoomPendingFeedbackFn)(int zoom);
 void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn);
 
 /**
- * 阻塞操作期间调用：轮询 BOOT 短按 → 记 pending 并请求 abort。
+ * 阻塞操作期间调用：轮询 S 键短按 → 记 pending 并请求 abort。
  * HTTP / 造片长循环里应频繁调用。
  */
 void inputServiceDuringBlock();

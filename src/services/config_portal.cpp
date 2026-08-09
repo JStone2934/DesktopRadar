@@ -214,34 +214,67 @@ static void handleRoot() {
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
   String html;
-  html.reserve(11000);
+  html.reserve(16000);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
-            "<title>Radar Setup</title><style>"
-            "body{font-family:sans-serif;max-width:420px;margin:12px auto;padding:0 12px;"
-            "background:#111;color:#eee}h1{font-size:1.2rem}"
-            "label{display:block;margin:10px 0 4px;font-size:.9rem}"
-            "input,select{width:100%;box-sizing:border-box;padding:8px;border-radius:6px;"
-            "border:1px solid #444;background:#222;color:#eee}"
+            "<title>风暴眼-桌面雷达设置</title><style>"
+            ":root{color-scheme:light}"
+            "*{box-sizing:border-box}"
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+            "max-width:460px;margin:0 auto;padding:18px 14px 30px;"
+            "background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);"
+            "color:#17212b;line-height:1.45}"
+            ".hero{padding:12px 4px 14px}"
+            "h1{font-size:1.58rem;margin:0 0 6px;letter-spacing:-.03em;color:#102018}"
+            ".lead{margin:0;color:#5b6978;font-size:.94rem}"
+            ".brand{display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;"
+            "padding:5px 10px;border-radius:999px;background:#dcf8e9;color:#167548;"
+            "font-size:.78rem;font-weight:700}"
+            ".dot{width:8px;height:8px;border-radius:50%;background:#23b76d;"
+            "box-shadow:0 0 0 4px #23b76d22}"
+            ".card{background:#fff;border:1px solid #e3e8ef;border-radius:20px;"
+            "padding:17px;margin:12px 0;box-shadow:0 10px 28px rgba(25,42,62,.08)}"
+            ".card h2{font-size:1.02rem;margin:0 0 12px;color:#17212b}"
+            "label{display:block;margin:12px 0 5px;font-size:.88rem;color:#344255;font-weight:650}"
+            "input,select{width:100%;padding:12px;border-radius:13px;"
+            "border:1px solid #d5dde8;background:#fbfcfe;color:#17212b;font-size:1rem}"
+            "input:focus,select:focus{outline:3px solid #23b76d25;border-color:#23b76d;background:#fff}"
             ".row{display:flex;gap:8px;align-items:stretch}"
-            ".row select{width:7.2em;flex:0 0 auto}"
+            ".row select{width:6.6em;flex:0 0 auto}"
             ".row input{flex:1;min-width:0}"
-            ".hint{color:#aaa;font-size:.8rem;margin:4px 0 12px}"
-            "button{width:100%;padding:12px;margin-top:16px;border:0;border-radius:8px;"
-            "background:#2a7;color:#fff;font-size:1rem}"
-            "button.btn-geo{margin-top:10px;background:#444;font-size:.95rem}"
+            ".hint{color:#667789;font-size:.82rem;margin:7px 0 0}"
+            ".mini{color:#7a8795;font-size:.78rem;margin:8px 0 0}"
+            ".pill{display:inline-block;padding:2px 8px;border-radius:999px;"
+            "background:#eef3f8;color:#657386;font-size:.72rem;margin-left:6px}"
+            "button{width:100%;padding:14px;margin-top:16px;border:0;border-radius:15px;"
+            "background:#19a763;color:#fff;font-size:1rem;font-weight:800;"
+            "box-shadow:0 10px 20px rgba(25,167,99,.22)}"
+            "button.btn-geo{margin-top:10px;background:#eef3f8;color:#243447;box-shadow:none;font-size:.95rem}"
             "button.btn-geo:disabled{opacity:.6}"
-            ".check{display:flex;gap:8px;align-items:center;margin:8px 0 0;color:#aaa;font-size:.85rem}"
+            ".check{display:flex;gap:8px;align-items:center;margin:10px 0 0;color:#5b6978;font-size:.86rem}"
             ".check input{width:auto}"
-            ".peap-only{display:none}</style></head><body>"
-            "<h1>桌面雷达设置</h1>"
-            "<p class=\"hint\">扫描列表只负责填入 SSID；认证类型请手动确认。已保存过的同一网络密码可留空复用。"
-            "坐标填绝对值，再用北纬/南纬、东经/西经；小数点如 23.1291</p>"
+            "details{margin-top:14px;border-top:1px solid #edf1f5;padding-top:12px}"
+            "summary{cursor:pointer;color:#506174;font-size:.9rem}"
+            ".guide{margin-top:14px;padding:13px;border-radius:16px;background:#f0fbf5;"
+            "border:1px solid #cbeedb;color:#506174;font-size:.82rem}"
+            ".guide b{display:block;color:#163f2b;margin:8px 0 2px}"
+            ".guide b:first-child{margin-top:0}"
+            ".peap-only{display:none}"
+            ".actions{padding:0 2px}"
+            ".footerhint{background:#eaf8f1;border:1px solid #cbeedb;color:#35614a;"
+            "border-radius:14px;padding:11px 12px;margin-top:10px}"
+            ".footer{text-align:center;margin:18px 0 0;color:#718092;font-size:.82rem}"
+            ".footer .url{display:block;color:#167548;word-break:break-all;margin-top:4px}"
+            "</style></head><body>"
+            "<div class=\"hero\"><div class=\"brand\"><span class=\"dot\"></span>RadarSetup 配置热点</div>"
+            "<h1>风暴眼-桌面雷达设置</h1>"
+            "<p class=\"lead\">选择要连接的 WiFi，确认雷达中心位置，保存后设备会自动继续运行。</p></div>"
             "<form method=\"POST\" action=\"/save\" accept-charset=\"UTF-8\" "
             "autocomplete=\"off\">"
-            "<label>扫描结果</label><select id=\"scan\" autocomplete=\"off\" "
-            "onchange=\"pickScan()\"><option value=\"\">手动输入 / 保持下方 SSID</option>");
+            "<section class=\"card\"><h2>1. 连接网络</h2>"
+            "<label>附近的 WiFi</label><select id=\"scan\" autocomplete=\"off\" "
+            "onchange=\"pickScan()\"><option value=\"\">手动输入或保持当前网络</option>");
   for (int i = 0; i < s_portalNetworkCount; ++i) {
     const PortalNetwork& network = s_portalNetworks[i];
     html += F("<option value=\"");
@@ -262,23 +295,34 @@ static void handleRoot() {
     }
     html += F("</option>");
   }
-  html += F("</select><p class=\"hint\">列表按信号强度排列；如果学校 WiFi 是 PEAP，请在下面手动选 PEAP。</p>"
-            "<label>SSID</label><input name=\"ssid\" id=\"ssid\" required maxlength=\"32\" "
+  html += F("</select><p class=\"hint\">列表按信号强度排列；如果没看到目标网络，可以直接在下面输入名称。</p>"
+            "<label>网络名称 SSID</label><input name=\"ssid\" id=\"ssid\" required maxlength=\"32\" "
             "autocomplete=\"off\" autocapitalize=\"none\" autocorrect=\"off\" "
             "spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.ssid);
-  html += F("\"><label>认证类型</label><select name=\"mode\" id=\"mode\" "
-            "autocomplete=\"off\" onchange=\"netChanged()\">");
+  // 密码不回填；留空则保留原密码。new-password 降低浏览器自动填充旧会话密码
+  html += F("\"><label id=\"passLabel\">WiFi 密码</label>"
+            "<input name=\"pass\" id=\"pass\" type=\"password\" maxlength=\"64\" "
+            "value=\"\" autocomplete=\"new-password\" autocapitalize=\"none\" "
+            "autocorrect=\"off\" spellcheck=\"false\">"
+            "<p class=\"hint\" id=\"passHint\">如果已保存同一个网络，可以留空继续使用原密码。</p>"
+            "<label class=\"check\"><input type=\"checkbox\" onclick=\""
+            "document.getElementById('pass').type=this.checked?'text':'password'\">"
+            "显示密码</label>"
+            "<details id=\"advanced\"><summary>高级网络设置 <span class=\"pill\">若使用企业认证网络</span></summary>"
+            "<label>认证类型</label><select name=\"mode\" id=\"mode\" "
+            "autocomplete=\"off\" onchange=\"netChanged(true)\">");
   html += s_seedCfg.wifi_mode == APP_WIFI_PSK
-              ? F("<option value=\"0\" selected>普通密码 WiFi (WPA/WPA2/WPA3)</option>")
-              : F("<option value=\"0\">普通密码 WiFi (WPA/WPA2/WPA3)</option>");
+              ? F("<option value=\"0\" selected>普通密码 WiFi</option>")
+              : F("<option value=\"0\">普通密码 WiFi</option>");
   html += s_seedCfg.wifi_mode == APP_WIFI_PEAP
-              ? F("<option value=\"1\" selected>企业 WiFi (PEAP/MSCHAPv2)</option>")
-              : F("<option value=\"1\">企业 WiFi (PEAP/MSCHAPv2)</option>");
+              ? F("<option value=\"1\" selected>企业 WiFi / 校园网 PEAP</option>")
+              : F("<option value=\"1\">企业 WiFi / 校园网 PEAP</option>");
   html += s_seedCfg.wifi_mode == APP_WIFI_OPEN
-              ? F("<option value=\"2\" selected>开放网络 / MAC 白名单</option>")
-              : F("<option value=\"2\">开放网络 / MAC 白名单</option>");
+              ? F("<option value=\"2\" selected>开放网络</option>")
+              : F("<option value=\"2\">开放网络</option>");
   html += F("</select>"
+            "<p class=\"mini\">学校或公司网络通常选择企业 WiFi；家用路由器通常选择普通密码 WiFi。</p>"
             "<div class=\"peap-only\" id=\"idRow\"><label>PEAP 用户名</label>"
             "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
             "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
@@ -288,14 +332,9 @@ static void handleRoot() {
             "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" "
             "placeholder=\"留空则使用 PEAP 用户名\" value=\"");
   appendEscaped(html, s_seedCfg.outer_identity);
-  // 密码不回填；留空则保留原密码。new-password 降低浏览器自动填充旧会话密码
-  html += F("\"></div><label id=\"passLabel\">Password（已保存可留空）</label>"
-            "<input name=\"pass\" id=\"pass\" type=\"password\" maxlength=\"64\" "
-            "value=\"\" autocomplete=\"new-password\" autocapitalize=\"none\" "
-            "autocorrect=\"off\" spellcheck=\"false\">"
-            "<label class=\"check\"><input type=\"checkbox\" onclick=\""
-            "document.getElementById('pass').type=this.checked?'text':'password'\">"
-            "显示密码</label>"
+  html += F("\"></div></details></section>"
+            "<section class=\"card\"><h2>2. 设备位置</h2>"
+            "<p class=\"hint\">用于决定雷达图中心。中国大陆通常选择北纬、东经；小数点示例：23.12910。</p>"
             "<label>纬度</label><div class=\"row\">"
             "<select name=\"lat_hem\" id=\"lat_hem\" autocomplete=\"off\">");
   html += latSouth ? F("<option value=\"N\">北纬</option>"
@@ -317,7 +356,8 @@ static void handleRoot() {
   html += F("\"></div>"
             "<button type=\"button\" class=\"btn-geo\" id=\"geoBtn\" "
             "onclick=\"doGeo()\">获取当前位置</button>"
-            "<p class=\"hint\" id=\"geoHint\"></p>"
+            "<p class=\"hint\" id=\"geoHint\"></p></section>"
+            "<section class=\"card\"><h2>3. 显示选项</h2>"
             "<label>显示进度条</label><select name=\"show_ring\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_progress
@@ -325,26 +365,37 @@ static void handleRoot() {
                   "<option value=\"0\">隐藏</option>")
               : F("<option value=\"1\">显示</option>"
                   "<option value=\"0\" selected>隐藏</option>");
-  html += F("</select><label>天气预警环</label><select name=\"show_alert\" "
+  html += F("</select>"
+            "<p class=\"hint\">它表示设备正在下载、合成并缓存雷达画面；关闭后只是不显示提示，不影响自动更新。</p>"
+            "<label>天气预警环</label><select name=\"show_alert\" "
             "autocomplete=\"off\">");
   html += s_seedCfg.show_alert_ring
               ? F("<option value=\"1\" selected>开启</option>"
                   "<option value=\"0\">关闭</option>")
               : F("<option value=\"1\">开启</option>"
                   "<option value=\"0\" selected>关闭</option>");
-  html += F("</select><p class=\"hint\">开启后：中心有云图时屏缘显示对应颜色圆环</p>"
-            "<button type=\"submit\">保存并继续</button></form>"
+  html += F("</select>"
+            "<p class=\"hint\">显示你附近的天气情况。</p>"
+            "<div class=\"guide\"><b>切换缩放有时卡顿怎么办？</b>"
+            "短按 S键会切换缩放；如果刚好在下载或生成缓存，可能会慢几秒。等进度结束或再短按一次即可，通常不需要重新配置 WiFi。</div>"
+            "</section><div class=\"actions\"><button type=\"submit\">保存设置并连接 WiFi</button>"
+            "<p class=\"hint footerhint\">保存后手机会从 RadarSetup 热点断开，这是正常现象；设备会开始连接你选择的 WiFi。</p></div></form>"
+            "<footer class=\"footer\">项目 GitHub<span class=\"url\">"
+            "https://github.com/JStone2934/DesktopRadar/tree/esp32c3</span></footer>"
             "<script>"
             "function pickScan(){var s=document.getElementById('scan'),x=s.options[s.selectedIndex];"
             "if(!x||!x.value)return;document.getElementById('ssid').value=x.value;"
-            "if(x.dataset.mode)document.getElementById('mode').value=x.dataset.mode;netChanged();}"
-            "function netChanged(){var m=document.getElementById('mode').value;"
+            "if(x.dataset.mode)document.getElementById('mode').value=x.dataset.mode;netChanged(true);}"
+            "function netChanged(openAdvanced){var m=document.getElementById('mode').value;"
             "var p=m==='1',o=m==='2';"
+            "if(p&&openAdvanced)document.getElementById('advanced').open=true;"
             "document.getElementById('idRow').style.display=p?'block':'none';"
             "document.getElementById('identity').required=p;"
             "document.getElementById('outer_identity').disabled=!p;"
             "document.getElementById('pass').disabled=o;"
-            "document.getElementById('passLabel').textContent=o?'Password（开放网络无需填写）':'Password（已保存可留空）';}"
+            "document.getElementById('passLabel').textContent=o?'WiFi 密码':'WiFi 密码';"
+            "document.getElementById('passHint').textContent=o?'开放网络无需填写密码。':"
+            "(p?'如果已保存同一个网络和用户名，可以留空继续使用原密码。':'如果已保存同一个网络，可以留空继续使用原密码。');}"
             "function geoFail(){var h=document.getElementById('geoHint');"
             "h.textContent='当前浏览器不支持，请手动填写或从地图复制';"
             "var b=document.getElementById('geoBtn');b.disabled=false;"
@@ -364,7 +415,7 @@ static void handleRoot() {
             "b.disabled=false;b.textContent='获取当前位置';"
             "},function(){geoFail();},"
             "{enableHighAccuracy:true,timeout:15000,maximumAge:0});}"
-            "netChanged();</script>"
+            "netChanged(false);</script>"
             "</body></html>");
   sendNoStoreHeaders();
   s_server->send(200, "text/html; charset=utf-8", html);
@@ -375,10 +426,18 @@ static const char kSavedHtml[] PROGMEM = R"HTML(
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-store">
-<title>Saved</title>
-<style>body{font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px}</style>
-</head><body><h1>已保存</h1><p>设备将关闭热点并继续运行…</p>
-<p style="color:#888;font-size:.85rem">下次请打开 http://192.168.4.1/ （不要用 /done）</p>
+<title>设置已保存</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);color:#17212b;margin:0;padding:28px 16px;text-align:center}
+.card{max-width:420px;margin:36px auto 0;background:#fff;border:1px solid #e3e8ef;border-radius:20px;padding:24px 18px;box-shadow:0 10px 28px rgba(25,42,62,.08)}
+h1{font-size:1.45rem;margin:0 0 10px}.ok{font-size:2rem;margin-bottom:8px;color:#19a763}
+p{color:#5b6978;line-height:1.5;margin:8px 0}.small{font-size:.84rem;color:#7a8795;margin-top:18px}
+</style>
+</head><body><div class="card"><div class="ok">✓</div><h1>设置已保存</h1>
+<p>手机会从 RadarSetup 热点断开，这是正常现象。</p>
+<p>设备正在关闭热点，并连接你选择的 WiFi。</p>
+<p class="small">如果下次需要重新设置，请再次进入配置模式后打开 http://192.168.4.1/。</p>
+</div>
 </body></html>
 )HTML";
 
@@ -574,9 +633,27 @@ static void handleSave() {
   if (err) {
     Serial.printf("form reject: %s\n", err);
     sendNoStoreHeaders();
-    String msg = String("保存失败: ") + err +
-                 "\n\n请返回重试。纬度/经度请用英文小数点。";
-    s_server->send(400, "text/plain; charset=utf-8", msg);
+    String html;
+    html.reserve(1800);
+    html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+              "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
+              "<title>保存失败</title><style>"
+              "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+              "background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);"
+              "color:#17212b;margin:0;padding:28px 16px}"
+              ".card{max-width:420px;margin:28px auto;background:#fff;border:1px solid #f0c4cb;"
+              "border-radius:20px;padding:22px 18px;box-shadow:0 10px 28px rgba(25,42,62,.08)}"
+              "h1{font-size:1.35rem;margin:0 0 10px}.reason{background:#fff1f3;border:1px solid #f0c4cb;"
+              "color:#a43647;border-radius:14px;padding:12px;margin:14px 0}"
+              "p{color:#5b6978;line-height:1.5}a{display:block;text-align:center;text-decoration:none;"
+              "background:#19a763;color:#fff;font-weight:700;border-radius:14px;padding:13px;margin-top:18px}"
+              "</style></head><body><div class=\"card\"><h1>保存失败</h1>"
+              "<p>有一项设置需要修改后才能继续。</p><div class=\"reason\">");
+    appendEscaped(html, err);
+    html += F("</div><p>请返回上一页检查输入。纬度/经度请使用英文小数点，例如 23.12910。</p>"
+              "<a href=\"/\">返回修改</a></div></body></html>");
+    s_server->send(400, "text/html; charset=utf-8", html);
     return;
   }
   if (!appConfigSave(&cfg)) {
@@ -701,7 +778,7 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
 
     const ButtonEvent ev = buttonPoll();
     if (ev == ButtonEvent::ShortPress) {
-      Serial.println("portal skipped by BOOT");
+      Serial.println("portal skipped by S key");
       result = PortalResult::SkippedByButton;
       break;
     }

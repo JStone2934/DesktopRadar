@@ -42,7 +42,7 @@ void buttonBegin() {
   s_downAt = 0;
   s_latched = 0;
   s_armed = true;
-  // 上电时 BOOT 可能仍被按住（烧录），等释放后再武装
+  // 上电时 S 键可能仍被按住（烧录），等释放后再武装
   if (digitalRead(PIN_BTN_BOOT) == LOW) {
     s_armed = false;
   }

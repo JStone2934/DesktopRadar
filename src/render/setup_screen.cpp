@@ -41,7 +41,7 @@ static int circleInsetX(int y0, int y1, int pad) {
   return a > b ? a : b;
 }
 
-/** 二维码右侧：按下 BOOT 键跳过（竖排三行）。 */
+/** 二维码右侧：按下 S 键跳过（竖排三行）。 */
 static void drawBootHint(LGFX* lcd, int qrRight, int qrTop, int qrSide,
                          int rightLimit) {
   lcd->setTextColor(TFT_WHITE, TFT_BLACK);
@@ -61,8 +61,8 @@ static void drawBootHint(LGFX* lcd, int qrRight, int qrTop, int qrSide,
   }
 
   lcd->drawString("按下", tx, ty);
-  lcd->drawString("BOOT", tx, ty + lineH);
-  lcd->drawString("键跳过", tx, ty + lineH * 2);
+  lcd->drawString("S键", tx, ty + lineH);
+  lcd->drawString("跳过", tx, ty + lineH * 2);
 }
 
 void setupScreenDraw(LGFX* lcd, int remainSec) {
@@ -138,7 +138,7 @@ void setupScreenDraw(LGFX* lcd, int remainSec) {
     rightLimit = LCD_WIDTH - inset;
     const int availW = rightLimit - inset - hintW;
     if (availW >= side) {
-      // 略靠左，右侧留给 BOOT 提示，但不贴圆边
+      // 略靠左，右侧留给 S 键提示，但不贴圆边
       ox = inset;
       if (ox + side + hintW > rightLimit) {
         ox = rightLimit - hintW - side;

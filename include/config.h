@@ -31,7 +31,7 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 
 // SoftAP 配置门户
-#define SOFTAP_SSID "Radar-Setup-2"
+#define SOFTAP_SSID "RadarSetup"
 #define SOFTAP_PASS "radar1234"
 #define CONFIG_PORTAL_URL "http://192.168.4.1"
 #define CONFIG_PORTAL_TIMEOUT_MS 180000
@@ -54,9 +54,9 @@
 #define TILE_SIZE 256
 #define VIEW_HALF (LCD_WIDTH / 2)
 
-// ---- BOOT 按键（GPIO9）----
+// ---- S 键（板载 GPIO9）----
 #define PIN_BTN_BOOT 9
-// BOOT 释放在 1.5s 内都按“短按切缩放”处理；按得稍慢也不吞事件。
+// S 键释放在 1.5s 内都按“短按切缩放”处理；按得稍慢也不吞事件。
 #define BTN_HOLD_PLAY_MS 500
 #define BTN_MED_MS 1500
 #define BTN_SHORT_MS BTN_MED_MS

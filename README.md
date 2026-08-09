@@ -6,7 +6,7 @@ ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。�
 
 - SoftAP / Web 配网：普通密码 WiFi、PEAP/MSCHAPv2 企业 WiFi、开放网络 / MAC 白名单。
 - PEAP 连接会扫描同名 SSID，锁定最强 WPA2 Enterprise BSSID 和信道，避免 ESP32-C3 自动选到弱 AP。
-- 上电或 RST 默认先进入 3 分钟配置门户；短按 BOOT 或超时后继续使用已保存配置。
+- 上电或按下 R键后默认先进入 3 分钟配置门户；短按 S键或超时后继续使用已保存配置。
 - 高德底图 + RainViewer 静帧，HUD 包含中心白十字、红点、底栏北京时间。
 - z3-z12 全档 RGB565 成品缓存；已缓存档位 Flash -> SPI 秒切。
 - 后台空闲预取相邻缩放档；进度条单调递增，不回撤。
@@ -27,7 +27,7 @@ ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。�
 
 | 按键 | GPIO |
 |------|------|
-| BOOT | 9（板载，上拉） |
+| S键 | 9（板载，上拉） |
 
 备注：
 
@@ -52,22 +52,22 @@ pio run -t upload --upload-port /dev/cu.usbmodem101
 pio device monitor --port /dev/cu.usbmodem101 --baud 115200
 ```
 
-ESP32-C3 Super Mini 上传失败时，可按住 BOOT，点一下 RST，松开 BOOT 后再次烧录。
+ESP32-C3 Super Mini 上传失败时，可按住 S键，点一下 R键，松开 S键后再次烧录。
 
 ## 配网流程
 
-每次上电或按 RST 后，设备先开启 WPA2 SoftAP：
+每次上电或按 R键后，设备先开启 WPA2 SoftAP：
 
 | 项 | 值 |
 |----|----|
-| 热点名 | `Radar-Setup-2` |
+| 热点名 | `RadarSetup` |
 | 密码 | `radar1234` |
 | 配置页 | `http://192.168.4.1` |
 | 默认倒计时 | 3 分钟 |
 
 步骤：
 
-1. 手机或电脑连接 `Radar-Setup-2`。
+1. 手机或电脑连接 `RadarSetup`。
 2. 浏览器打开 `http://192.168.4.1`，也可以扫屏幕上的网址二维码。
 3. 从扫描建议选择网络，或手动输入 SSID。
 4. 明确选择认证类型：普通密码 WiFi、企业 WiFi（PEAP/MSCHAPv2）、开放网络 / MAC 白名单。
@@ -76,8 +76,8 @@ ESP32-C3 Super Mini 上传失败时，可按住 BOOT，点一下 RST，松开 BO
 门户行为：
 
 - 打开配置页或手机保持连接热点后，倒计时会暂停，避免填表时自动关闭。
-- 门户内短按 BOOT 可跳过配置，使用 NVS 中已保存的配置；没有保存过则使用 [include/config.h](include/config.h) 默认值。
-- 运行中长按 BOOT 约 10 秒可重新进入配置门户。
+- 门户内短按 S键可跳过配置，使用 NVS 中已保存的配置；没有保存过则使用 [include/config.h](include/config.h) 默认值。
+- 运行中长按 S键约 10 秒可重新进入配置门户。
 - 修改经纬度后会清空旧位置的成品帧缓存并重新生成。
 
 ## PEAP / 校园网说明
@@ -105,10 +105,10 @@ B8:1F:3F:0C:7A:A0
 
 | 操作 | 行为 |
 |------|------|
-| 上电 / RST | 进入 3 分钟 SoftAP 配置门户 |
-| 门户内 BOOT 短按 | 跳过门户，用保存配置连网 |
-| 运行中 BOOT 短按 | 切换缩放档 z3 -> z4 -> ... -> z12 |
-| 运行中 BOOT 长按约 10 秒 | 重新进入配置门户 |
+| 上电 / R键 | 进入 3 分钟 SoftAP 配置门户 |
+| 门户内 S键短按 | 跳过门户，用保存配置连网 |
+| 运行中 S键短按 | 切换缩放档 z3 -> z4 -> ... -> z12 |
+| 运行中 S键长按约 10 秒 | 重新进入配置门户 |
 | 已缓存档位 | 直接刷 RGB565 成品帧，秒切 |
 | 未缓存档位 | 下载瓦片、解码、合成、写缓存，耗时较长 |
 
@@ -191,7 +191,7 @@ pio run -t upload
 
 **上传失败**
 
-按住 BOOT，点 RST，松开 BOOT 后重新上传；必要时指定 `--upload-port`。
+按住 S键，点 R键，松开 S键后重新上传；必要时指定 `--upload-port`。
 
 ## 开发备注
 
