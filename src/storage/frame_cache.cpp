@@ -404,6 +404,95 @@ bool frameCacheRestoreRect(LGFX* lcd, int zoom, int x, int y, int w, int h) {
   return true;
 }
 
+static inline bool crosshairPixelMask(int dx, int dy) {
+  return (dx * dx + dy * dy <= 9) || (dy == 0 && abs(dx) <= 8) ||
+         (dx == 0 && abs(dy) <= 8);
+}
+
+bool frameCacheHideCrosshair(LGFX* lcd, int zoom) {
+  if (!lcd || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  constexpr int kPad = 12;
+  constexpr int kSide = kPad * 2 + 1;
+  const int x0 = cx - kPad;
+  const int y0 = cy - kPad;
+  uint16_t rect[kSide * kSide];
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+  for (int yy = 0; yy < kSide; ++yy) {
+    const size_t ofs = ((size_t)(y0 + yy) * LCD_WIDTH + (size_t)x0) *
+                       sizeof(uint16_t);
+    if (!f.seek(ofs) ||
+        f.read(reinterpret_cast<uint8_t*>(&rect[yy * kSide]),
+               kSide * sizeof(uint16_t)) != kSide * 2) {
+      f.close();
+      return false;
+    }
+  }
+  f.close();
+
+  for (int yy = 0; yy < kSide; ++yy) {
+    for (int xx = 0; xx < kSide; ++xx) {
+      const int dx = xx - kPad;
+      const int dy = yy - kPad;
+      if (!crosshairPixelMask(dx, dy)) {
+        continue;
+      }
+
+      int sx = xx;
+      int sy = yy;
+      if (abs(dx) >= abs(dy)) {
+        sy += dy <= 0 ? -5 : 5;
+      } else {
+        sx += dx <= 0 ? -5 : 5;
+      }
+      if (sx < 0) sx = 0;
+      if (sx >= kSide) sx = kSide - 1;
+      if (sy < 0) sy = 0;
+      if (sy >= kSide) sy = kSide - 1;
+
+      if (crosshairPixelMask(sx - kPad, sy - kPad)) {
+        bool found = false;
+        for (int r = 1; r <= kPad && !found; ++r) {
+          for (int oy = -r; oy <= r && !found; ++oy) {
+            for (int ox = -r; ox <= r; ++ox) {
+              if (abs(ox) != r && abs(oy) != r) {
+                continue;
+              }
+              const int tx = xx + ox;
+              const int ty = yy + oy;
+              if (tx < 0 || tx >= kSide || ty < 0 || ty >= kSide ||
+                  crosshairPixelMask(tx - kPad, ty - kPad)) {
+                continue;
+              }
+              sx = tx;
+              sy = ty;
+              found = true;
+              break;
+            }
+          }
+        }
+      }
+      rect[yy * kSide + xx] = rect[sy * kSide + sx];
+    }
+  }
+
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+  for (int yy = 0; yy < kSide; ++yy) {
+    lcd->pushImage(x0, y0 + yy, kSide, 1, &rect[yy * kSide]);
+  }
+  lcd->setSwapBytes(prevSwap);
+  return true;
+}
+
 bool frameCacheBlitUnderlay(LGFX* lcd, int zoom) {
   if (!lcd || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return false;

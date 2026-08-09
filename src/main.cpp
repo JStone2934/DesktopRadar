@@ -41,7 +41,7 @@ static uint32_t s_cachePauseUntil = 0;
 static bool s_longCueVisible = false;
 static bool s_longCueSuppressUntilRelease = false;
 static uint32_t s_longCueLastDrawMs = 0;
-static int s_longCueLastPct = -1;
+static int s_longCueLastPhase = -1;
 
 static bool refreshIsDue();
 static bool refreshApproaching();
@@ -228,44 +228,19 @@ static bool showCached(int zoom);
 static bool restoreCrosshairCueUnderlay(int zoom) {
   const int cx = LCD_WIDTH / 2;
   const int cy = LCD_HEIGHT / 2;
-  // 十字半径为 8px；进度环外半径 9px、线宽 3px。多留 2px 避免边缘残留。
+  // 十字半径为 8px；高亮闪烁会加粗到 3px。多留 2px 避免边缘残留。
   const int pad = 12;
   return frameCacheRestoreRect(&lcd, zoom, cx - pad, cy - pad, pad * 2 + 1,
                                pad * 2 + 1);
 }
 
-static bool paintLongPressCue(float done01) {
-  if (done01 < 0.0f) {
-    done01 = 0.0f;
-  } else if (done01 > 1.0f) {
-    done01 = 1.0f;
-  }
-
+static bool paintLongPressCue(bool visible) {
   const int under = s_statusScreen ? -1 : s_displayedZoom;
   if (under < ZOOM_MIN || under > ZOOM_MAX) {
     return false;
   }
-  if (!restoreCrosshairCueUnderlay(under)) {
-    return false;
-  }
-
-  const int cx = LCD_WIDTH / 2;
-  const int cy = LCD_HEIGHT / 2;
-  const uint16_t track = lcd.color565(255, 255, 255);
-  const uint16_t fill = lcd.color565(255, 196, 48);
-
-  // 圆环直径与十字直径一致：十字端点半径 8px；外半径略放到 9px，让线宽可见。
-  lcd.fillArc(cx, cy, 9, 6, 0.0f, 360.0f, track);
-  if (done01 > 0.002f) {
-    const float endDeg = 270.0f + done01 * 360.0f;
-    if (endDeg <= 360.0f) {
-      lcd.fillArc(cx, cy, 9, 6, 270.0f, endDeg, fill);
-    } else {
-      lcd.fillArc(cx, cy, 9, 6, 270.0f, 360.0f, fill);
-      lcd.fillArc(cx, cy, 9, 6, 0.0f, endDeg - 360.0f, fill);
-    }
-  }
-  return true;
+  return visible ? restoreCrosshairCueUnderlay(under)
+                 : frameCacheHideCrosshair(&lcd, under);
 }
 
 static void clearLongPressCue() {
@@ -277,7 +252,7 @@ static void clearLongPressCue() {
     restoreCrosshairCueUnderlay(under);
   }
   s_longCueVisible = false;
-  s_longCueLastPct = -1;
+  s_longCueLastPhase = -1;
 }
 
 static void updateLongPressCue() {
@@ -305,17 +280,14 @@ static void updateLongPressCue() {
   if (s_longCueVisible && (now - s_longCueLastDrawMs) < 50) {
     return;
   }
-  const float done =
-      (float)(held - BTN_LONG_FEEDBACK_MS) /
-      (float)(BTN_LONG_MS - BTN_LONG_FEEDBACK_MS);
-  const int pct = (int)lroundf(done * 100.0f);
-  if (s_longCueVisible && pct == s_longCueLastPct) {
+  const int phase = (int)(((held - BTN_LONG_FEEDBACK_MS) / 160UL) % 2UL);
+  if (s_longCueVisible && phase == s_longCueLastPhase) {
     return;
   }
-  if (paintLongPressCue(done)) {
+  if (paintLongPressCue(phase == 0)) {
     s_longCueVisible = true;
     s_longCueLastDrawMs = now;
-    s_longCueLastPct = pct;
+    s_longCueLastPhase = phase;
   }
 }
 
