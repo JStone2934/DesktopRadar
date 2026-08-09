@@ -32,6 +32,9 @@ int frameCacheZoomSlots();
 /** 行刷 RGB565 到 LCD（秒切，需 ready）。 */
 bool frameCacheBlit(LGFX* lcd, int zoom);
 
+/** 从成品 RGB565 恢复一个小矩形区域；用于擦除局部 UI 覆盖层。 */
+bool frameCacheRestoreRect(LGFX* lcd, int zoom, int x, int y, int w, int h);
+
 /**
  * 行刷底图：只要 .rgb565 长度正确即可（含造片中已清 ready 的旧成品）。
  */

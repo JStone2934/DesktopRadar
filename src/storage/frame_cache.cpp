@@ -359,6 +359,51 @@ bool frameCacheBlit(LGFX* lcd, int zoom) {
   return ok;
 }
 
+bool frameCacheRestoreRect(LGFX* lcd, int zoom, int x, int y, int w, int h) {
+  if (!lcd || w <= 0 || h <= 0) {
+    return false;
+  }
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT || w <= 0 || h <= 0) {
+    return false;
+  }
+  if (x + w > LCD_WIDTH) {
+    w = LCD_WIDTH - x;
+  }
+  if (y + h > LCD_HEIGHT) {
+    h = LCD_HEIGHT - y;
+  }
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+  uint16_t row[LCD_WIDTH];
+  for (int yy = 0; yy < h; ++yy) {
+    const size_t ofs = ((size_t)(y + yy) * LCD_WIDTH + (size_t)x) *
+                       sizeof(uint16_t);
+    if (!f.seek(ofs) ||
+        f.read(reinterpret_cast<uint8_t*>(row), (size_t)w * 2) != w * 2) {
+      lcd->setSwapBytes(prevSwap);
+      f.close();
+      return false;
+    }
+    lcd->pushImage(x, y + yy, w, 1, row);
+  }
+  lcd->setSwapBytes(prevSwap);
+  f.close();
+  return true;
+}
+
 bool frameCacheBlitUnderlay(LGFX* lcd, int zoom) {
   if (!lcd || zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return false;

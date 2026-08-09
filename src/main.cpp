@@ -37,9 +37,15 @@ static float s_bakeLocal = 0.0f;
 static bool s_staticFullPassDone = false;
 // 用户交互后暂停后台预取（不挡定时雷达刷新）
 static uint32_t s_cachePauseUntil = 0;
+// S 键长按跳转前的临时视觉反馈（只画 LCD，不改缓存）
+static bool s_longCueVisible = false;
+static bool s_longCueSuppressUntilRelease = false;
+static uint32_t s_longCueLastDrawMs = 0;
+static int s_longCueLastPct = -1;
 
 static bool refreshIsDue();
 static bool refreshApproaching();
+static void updateLongPressCue();
 
 static void noteUserInteraction() {
   const uint32_t until = millis() + CACHE_PAUSE_AFTER_USER_MS;
@@ -134,6 +140,7 @@ static void pumpAlertRingDuringCompose() {
 }
 
 static void onComposeProgress(int zoom, float local01) {
+  updateLongPressCue();
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
   // 邻档预取中若定时刷新已到期：立刻中止，把主循环还给当前档刷新
@@ -217,6 +224,100 @@ static void handlePendingZoom();
 static void pumpPrefetch();
 static void ensureZoomVisible(int zoom, bool userInitiated);
 static bool showCached(int zoom);
+
+static bool restoreCrosshairCueUnderlay(int zoom) {
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  // 十字半径为 8px；进度环外半径 9px、线宽 3px。多留 2px 避免边缘残留。
+  const int pad = 12;
+  return frameCacheRestoreRect(&lcd, zoom, cx - pad, cy - pad, pad * 2 + 1,
+                               pad * 2 + 1);
+}
+
+static bool paintLongPressCue(float done01) {
+  if (done01 < 0.0f) {
+    done01 = 0.0f;
+  } else if (done01 > 1.0f) {
+    done01 = 1.0f;
+  }
+
+  const int under = s_statusScreen ? -1 : s_displayedZoom;
+  if (under < ZOOM_MIN || under > ZOOM_MAX) {
+    return false;
+  }
+  if (!restoreCrosshairCueUnderlay(under)) {
+    return false;
+  }
+
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  const uint16_t track = lcd.color565(255, 255, 255);
+  const uint16_t fill = lcd.color565(255, 196, 48);
+
+  // 圆环直径与十字直径一致：十字端点半径 8px；外半径略放到 9px，让线宽可见。
+  lcd.fillArc(cx, cy, 9, 6, 0.0f, 360.0f, track);
+  if (done01 > 0.002f) {
+    const float endDeg = 270.0f + done01 * 360.0f;
+    if (endDeg <= 360.0f) {
+      lcd.fillArc(cx, cy, 9, 6, 270.0f, endDeg, fill);
+    } else {
+      lcd.fillArc(cx, cy, 9, 6, 270.0f, 360.0f, fill);
+      lcd.fillArc(cx, cy, 9, 6, 0.0f, endDeg - 360.0f, fill);
+    }
+  }
+  return true;
+}
+
+static void clearLongPressCue() {
+  if (!s_longCueVisible) {
+    return;
+  }
+  const int under = s_statusScreen ? -1 : s_displayedZoom;
+  if (under >= ZOOM_MIN && under <= ZOOM_MAX) {
+    restoreCrosshairCueUnderlay(under);
+  }
+  s_longCueVisible = false;
+  s_longCueLastPct = -1;
+}
+
+static void updateLongPressCue() {
+  if (!s_wifiOk) {
+    clearLongPressCue();
+    s_longCueSuppressUntilRelease = false;
+    return;
+  }
+  if (!buttonIsDown()) {
+    clearLongPressCue();
+    s_longCueSuppressUntilRelease = false;
+    return;
+  }
+  if (s_longCueSuppressUntilRelease) {
+    return;
+  }
+  const uint32_t held = buttonHeldMs();
+  if (held < BTN_LONG_FEEDBACK_MS || held >= BTN_LONG_MS) {
+    if (held < BTN_LONG_FEEDBACK_MS) {
+      clearLongPressCue();
+    }
+    return;
+  }
+  const uint32_t now = millis();
+  if (s_longCueVisible && (now - s_longCueLastDrawMs) < 50) {
+    return;
+  }
+  const float done =
+      (float)(held - BTN_LONG_FEEDBACK_MS) /
+      (float)(BTN_LONG_MS - BTN_LONG_FEEDBACK_MS);
+  const int pct = (int)lroundf(done * 100.0f);
+  if (s_longCueVisible && pct == s_longCueLastPct) {
+    return;
+  }
+  if (paintLongPressCue(done)) {
+    s_longCueVisible = true;
+    s_longCueLastDrawMs = now;
+    s_longCueLastPct = pct;
+  }
+}
 
 static bool showCached(int zoom) {
   const uint32_t t0 = millis();
@@ -457,6 +558,8 @@ static void handleLongPress() {
   const int target = zoomDefault();
   Serial.printf("long press -> default z%d (display was z%d)\n", target,
                 s_displayedZoom);
+  s_longCueSuppressUntilRelease = true;
+  clearLongPressCue();
   ensureZoomVisible(target, true);
   handlePendingZoom();
 }
@@ -587,6 +690,8 @@ void loop() {
       handleLongPress();
     }
   }
+
+  updateLongPressCue();
 
   if (!s_wifiOk) {
     delay(50);
