@@ -56,11 +56,10 @@
 
 // ---- S 键（板载 GPIO9）----
 #define PIN_BTN_BOOT 9
-// S 键释放在 1.5s 内都按“短按切缩放”处理；按得稍慢也不吞事件。
-#define BTN_HOLD_PLAY_MS 500
+// S 键释放在 1.5s 内按“短按切缩放”处理；按住满 2s 立刻跳回默认缩放档。
 #define BTN_MED_MS 1500
 #define BTN_SHORT_MS BTN_MED_MS
-#define BTN_LONG_MS 10000
+#define BTN_LONG_MS 2000
 
 // 用户切换后暂停后台预取，避免下载/烘焙任务连续抢占按键响应。
 #define CACHE_PAUSE_AFTER_USER_MS 10000UL

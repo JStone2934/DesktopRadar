@@ -5,6 +5,7 @@
 #include "frame_cache.h"
 
 static int s_zoom = MAP_ZOOM;
+static int s_defaultZoom = MAP_ZOOM;
 static int s_displayedZoom = -1;
 static int s_prefetchQ[ZOOM_MAX - ZOOM_MIN + 1];
 static int s_prefetchLen = 0;
@@ -41,6 +42,15 @@ void zoomPrefetchNoteOk(int zoom) {
 }
 
 int zoomCurrent() { return s_zoom; }
+
+void zoomSetDefault(int zoom) {
+  if (!zoomCanCompose(zoom)) {
+    zoom = MAP_ZOOM;
+  }
+  s_defaultZoom = zoom;
+}
+
+int zoomDefault() { return s_defaultZoom; }
 
 void zoomSetCurrent(int zoom) {
   if (zoom < ZOOM_MIN) {
@@ -157,20 +167,29 @@ void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn) {
 
 void inputServiceDuringBlock() {
   const ButtonEvent ev = buttonPoll();
-  if (ev != ButtonEvent::ShortPress) {
+  if (ev != ButtonEvent::ShortPress && ev != ButtonEvent::LongPress) {
     return;
   }
-  // 以屏上所见档为基准 +1，避免造片失败后逻辑档超前造成跳档
-  if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX &&
-      s_displayedZoom != s_zoom) {
-    Serial.printf("input resync logic=z%d display=z%d\n", s_zoom,
-                  s_displayedZoom);
-    s_zoom = s_displayedZoom;
+
+  int next = s_defaultZoom;
+  if (ev == ButtonEvent::ShortPress) {
+    // 以屏上所见档为基准 +1，避免造片失败后逻辑档超前造成跳档
+    if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX &&
+        s_displayedZoom != s_zoom) {
+      Serial.printf("input resync logic=z%d display=z%d\n", s_zoom,
+                    s_displayedZoom);
+      s_zoom = s_displayedZoom;
+    }
+    next = zoomCycleNext();
+  } else {
+    zoomSetCurrent(next);
   }
-  const int next = zoomCycleNext();
+
   zoomSetPending(next);
   composeRequestAbort();
-  Serial.printf("input: short press -> pending z%d (abort)\n", next);
+  Serial.printf("input: %s -> pending z%d (abort)\n",
+                ev == ButtonEvent::ShortPress ? "short press" : "long press",
+                next);
   if (s_pendingFeedback) {
     s_pendingFeedback(next);
   }

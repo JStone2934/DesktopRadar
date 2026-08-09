@@ -7,6 +7,10 @@ int zoomCurrent();
 
 void zoomSetCurrent(int zoom);
 
+/** 默认/回到的缩放档：启动使用，运行中按住 S 键 2 秒跳回。 */
+void zoomSetDefault(int zoom);
+int zoomDefault();
+
 /** 记录屏上已显示的档（秒切/上屏后调用），供造片中短按对齐基准。 */
 void zoomNoteDisplayed(int zoom);
 int zoomDisplayed();

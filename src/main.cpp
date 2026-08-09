@@ -453,6 +453,14 @@ static void handleShortPress() {
   handlePendingZoom();
 }
 
+static void handleLongPress() {
+  const int target = zoomDefault();
+  Serial.printf("long press -> default z%d (display was z%d)\n", target,
+                s_displayedZoom);
+  ensureZoomVisible(target, true);
+  handlePendingZoom();
+}
+
 static void pumpPrefetch() {
   if (zoomHasPending()) {
     handlePendingZoom();
@@ -477,13 +485,14 @@ static void pumpPrefetch() {
 }
 
 static bool tryWifiAndRadar() {
-  Serial.printf("apply cfg: mode=%u ssid=%s lat=%.5f lon=%.5f\n",
-                (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon);
+  Serial.printf("apply cfg: mode=%u ssid=%s lat=%.5f lon=%.5f defZoom=%d\n",
+                (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon,
+                s_cfg.default_zoom);
   showStatus("Connecting...", s_cfg.ssid);
   s_wifiOk = wifiConnect(&s_cfg);
   if (!s_wifiOk) {
     showStatus("WiFi fail", s_cfg.ssid);
-    Serial.println("hold S key 10s to re-open setup");
+    Serial.println("press R key to re-open setup");
     return false;
   }
 
@@ -535,6 +544,8 @@ static void runPortalAndApply() {
     alertRingHide(&lcd, s_displayedZoom);
   }
 
+  zoomSetDefault(s_cfg.default_zoom);
+  zoomSetCurrent(zoomDefault());
   tryWifiAndRadar();
 }
 
@@ -549,6 +560,7 @@ void setup() {
   lcd.setBrightness(255);
 
   buttonBegin();
+  zoomSetDefault(MAP_ZOOM);
   zoomSetCurrent(MAP_ZOOM);
   zoomSetPendingFeedback(onPendingZoomFeedback);
   composeSetProgressFn(onComposeProgress);
@@ -569,6 +581,10 @@ void loop() {
   if (ev == ButtonEvent::ShortPress) {
     if (s_wifiOk) {
       handleShortPress();
+    }
+  } else if (ev == ButtonEvent::LongPress) {
+    if (s_wifiOk) {
+      handleLongPress();
     }
   }
 

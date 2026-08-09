@@ -16,6 +16,20 @@ static constexpr const char* kKeyLat = "lat";
 static constexpr const char* kKeyLon = "lon";
 static constexpr const char* kKeyShowRing = "show_ring";
 static constexpr const char* kKeyAlertRing = "alert_ring";
+static constexpr const char* kKeyDefaultZoom = "def_zoom";
+
+static int clampZoom(int zoom) {
+  if (zoom < ZOOM_MIN) {
+    return ZOOM_MIN;
+  }
+  if (zoom > ZOOM_MAX) {
+    return ZOOM_MAX;
+  }
+  if (zoom == ZOOM_SKIP) {
+    return MAP_ZOOM;
+  }
+  return zoom;
+}
 
 uint16_t appConfigSecretSig(const char* s) {
   uint16_t sig = 0x4d3b;
@@ -44,6 +58,7 @@ void appConfigSetDefaults(AppConfig* cfg) {
   cfg->lon = MAP_LON;
   cfg->show_progress = true;
   cfg->show_alert_ring = false;
+  cfg->default_zoom = clampZoom(MAP_ZOOM);
 }
 
 bool appConfigHasSaved() {
@@ -87,6 +102,7 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->lon = prefs.getFloat(kKeyLon, MAP_LON);
   cfg->show_progress = prefs.getBool(kKeyShowRing, true);
   cfg->show_alert_ring = prefs.getBool(kKeyAlertRing, false);
+  cfg->default_zoom = clampZoom(prefs.getInt(kKeyDefaultZoom, MAP_ZOOM));
   prefs.end();
 
   strncpy(cfg->ssid, ssid.c_str(), sizeof(cfg->ssid) - 1);
@@ -97,11 +113,11 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->identity[sizeof(cfg->identity) - 1] = '\0';
   strncpy(cfg->outer_identity, outerId.c_str(), sizeof(cfg->outer_identity) - 1);
   cfg->outer_identity[sizeof(cfg->outer_identity) - 1] = '\0';
-  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s\n",
+  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s defZoom=%d\n",
                 (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
-                cfg->outer_identity);
+                cfg->outer_identity, cfg->default_zoom);
 
   if (cfg->ssid[0] == '\0') {
     appConfigSetDefaults(cfg);
@@ -134,11 +150,12 @@ bool appConfigSave(const AppConfig* cfg) {
   prefs.putFloat(kKeyLon, cfg->lon);
   prefs.putBool(kKeyShowRing, cfg->show_progress);
   prefs.putBool(kKeyAlertRing, cfg->show_alert_ring);
+  prefs.putInt(kKeyDefaultZoom, clampZoom(cfg->default_zoom));
   prefs.end();
-  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s\n",
+  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s defZoom=%d\n",
                 (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
-                cfg->outer_identity);
+                cfg->outer_identity, clampZoom(cfg->default_zoom));
   return true;
 }

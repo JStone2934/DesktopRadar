@@ -11,6 +11,7 @@
 #include "button.h"
 #include "config.h"
 #include "setup_screen.h"
+#include "zoom_ctrl.h"
 
 static WebServer* s_server = nullptr;
 static LGFX* s_portalLcd = nullptr;
@@ -376,6 +377,20 @@ static void handleRoot() {
                   "<option value=\"0\" selected>关闭</option>");
   html += F("</select>"
             "<p class=\"hint\">显示你附近的天气情况。</p>"
+            "<label>默认打开的缩放等级</label><select name=\"default_zoom\" "
+            "autocomplete=\"off\">");
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    if (!zoomCanCompose(z)) {
+      continue;
+    }
+    html += F("<option value=\"");
+    html += String(z);
+    html += s_seedCfg.default_zoom == z ? F("\" selected>z") : F("\">z");
+    html += String(z);
+    html += F("</option>");
+  }
+  html += F("</select>"
+            "<p class=\"hint\">设备启动后会先打开这个缩放等级；运行中按住 S键 2 秒也会直接跳回这里。z3 视野最大、范围最广；z12 放大最多、细节最多。</p>"
             "<div class=\"guide\"><b>切换缩放有时卡顿怎么办？</b>"
             "短按 S键会切换缩放；如果刚好在下载或生成缓存，可能会慢几秒。等进度结束或再短按一次即可，通常不需要重新配置 WiFi。</div>"
             "</section><div class=\"actions\"><button type=\"submit\">保存设置并连接 WiFi</button>"
@@ -620,6 +635,20 @@ static const char* parseForm(AppConfig* cfg) {
   cfg->lon = lon;
   cfg->show_progress = (s_server->arg("show_ring") != "0");
   cfg->show_alert_ring = (s_server->arg("show_alert") == "1");
+
+  String defaultZoomStr = s_server->arg("default_zoom");
+  defaultZoomStr.trim();
+  if (defaultZoomStr.length() == 0) {
+    cfg->default_zoom = s_seedCfg.default_zoom;
+  } else {
+    char* end = nullptr;
+    const long z = strtol(defaultZoomStr.c_str(), &end, 10);
+    if (!end || end == defaultZoomStr.c_str() || *end != '\0' ||
+        !zoomCanCompose((int)z)) {
+      return "默认缩放等级无效";
+    }
+    cfg->default_zoom = (int)z;
+  }
   return nullptr;
 }
 
@@ -662,9 +691,10 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d\n",
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d defZoom=%d\n",
                 (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
-                (int)cfg.show_progress, (int)cfg.show_alert_ring);
+                (int)cfg.show_progress, (int)cfg.show_alert_ring,
+                cfg.default_zoom);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();
   s_server->sendHeader("Location", "/done", true);

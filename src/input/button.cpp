@@ -7,6 +7,7 @@
 static volatile bool s_armed = true;
 static volatile uint32_t s_downAt = 0;
 static volatile uint8_t s_latched = 0;  // ButtonEvent
+static volatile bool s_longFired = false;
 static uint32_t s_ignoreUntil = 0;
 static constexpr uint32_t kDebounceMs = 30;
 
@@ -19,6 +20,7 @@ static void IRAM_ATTR bootIsr() {
     // 按下：只记首次边沿，忽略抖动
     if (s_downAt == 0) {
       s_downAt = now == 0 ? 1 : now;
+      s_longFired = false;
     }
     return;
   }
@@ -27,14 +29,15 @@ static void IRAM_ATTR bootIsr() {
     return;
   }
   const uint32_t held = now - s_downAt;
+  const bool longFired = s_longFired;
   s_downAt = 0;
+  s_longFired = false;
   if (held < kDebounceMs) {
     return;
   }
-  if (held < BTN_SHORT_MS) {
+  if (!longFired && held < BTN_SHORT_MS) {
     s_latched = static_cast<uint8_t>(ButtonEvent::ShortPress);
   }
-  // ≥500ms 不锁存：按住播放由 loop 轮询 buttonIsDown 处理
 }
 
 void buttonBegin() {
@@ -58,6 +61,7 @@ ButtonEvent buttonPoll() {
     if (digitalRead(PIN_BTN_BOOT) != LOW) {
       s_armed = true;
       s_downAt = 0;
+      s_longFired = false;
     }
     return ButtonEvent::None;
   }
@@ -66,9 +70,21 @@ ButtonEvent buttonPoll() {
     noInterrupts();
     s_latched = 0;
     s_downAt = 0;
+    s_longFired = false;
     interrupts();
     return ButtonEvent::None;
   }
+
+  const uint32_t now = millis();
+  noInterrupts();
+  const uint32_t downAt = s_downAt;
+  const bool longFired = s_longFired;
+  if (downAt != 0 && !longFired && (now - downAt) >= BTN_LONG_MS) {
+    s_longFired = true;
+    interrupts();
+    return ButtonEvent::LongPress;
+  }
+  interrupts();
 
   noInterrupts();
   const uint8_t ev = s_latched;
