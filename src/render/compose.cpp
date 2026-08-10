@@ -103,17 +103,20 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
     size_t len = 0;
     uint8_t* data =
         httpFetch(url.c_str(), referer, HTTP_MAX_TILE_BYTES, &len, TILE_TIMEOUT_MS);
-    if (!data || len < minBytes) {
+    if (!data || len < 8) {
       Serial.printf("  %s http fail len=%u try=%d\n", tag, (unsigned)len, attempt);
       free(data);
       delay(200 * attempt);
       continue;
     }
-    if (len < 8 || data[0] != 0x89 || data[1] != 0x50 || data[2] != 0x4E ||
+    if (data[0] != 0x89 || data[1] != 0x50 || data[2] != 0x4E ||
         data[3] != 0x47) {
       Serial.printf("  %s not png sig len=%u\n", tag, (unsigned)len);
       free(data);
       return false;
+    }
+    if (len < minBytes) {
+      Serial.printf("  %s small png len=%u accepted\n", tag, (unsigned)len);
     }
     if (!frameCacheSaveTile(zoom, isRadar, tx, ty, data, len)) {
       Serial.printf("  %s save fail len=%u\n", tag, (unsigned)len);
