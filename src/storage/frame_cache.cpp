@@ -1,5 +1,6 @@
 #include "frame_cache.h"
 
+#include "alert_ring.h"
 #include "button.h"
 #include "zoom_ctrl.h"
 
@@ -111,21 +112,25 @@ static bool openRgb565IfValid(int zoom, File* out) {
   return true;
 }
 
-static bool blitRgb565File(LGFX* lcd, File& f) {
+static bool blitRgb565File(LGFX* lcd, File& f, int zoom) {
   const bool prevSwap = lcd->getSwapBytes();
   lcd->setSwapBytes(true);
+  alertRingCaptureUnderlayBegin(zoom);
   for (int y = 0; y < LCD_HEIGHT; y += kBlitBandRows) {
     // 每批前后都采样按键；16 行传输远短于消抖阈值，仍可覆盖快速短按。
     buttonService();
     const int rows = min(kBlitBandRows, LCD_HEIGHT - y);
     const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
     if (f.read(reinterpret_cast<uint8_t*>(s_blitBand), bytes) != (int)bytes) {
+      alertRingCaptureUnderlayEnd(zoom, false);
       lcd->setSwapBytes(prevSwap);
       return false;
     }
+    alertRingCaptureUnderlayBand(zoom, y, rows, s_blitBand);
     lcd->pushImage(0, y, LCD_WIDTH, rows, s_blitBand);
     buttonService();
   }
+  alertRingCaptureUnderlayEnd(zoom, true);
   lcd->setSwapBytes(prevSwap);
   return true;
 }
@@ -386,7 +391,7 @@ bool frameCacheBlit(LGFX* lcd, int zoom) {
   }
   // 缓存内存放 native RGB565（与 color565 一致）；
   // LovyanGFX 默认将 uint16_t* 当作 swap565，必须 setSwapBytes(true)
-  const bool ok = blitRgb565File(lcd, f);
+  const bool ok = blitRgb565File(lcd, f, zoom);
   f.close();
   return ok;
 }
@@ -533,7 +538,7 @@ bool frameCacheBlitUnderlay(LGFX* lcd, int zoom) {
   if (!openRgb565IfValid(zoom, &f)) {
     return false;
   }
-  const bool ok = blitRgb565File(lcd, f);
+  const bool ok = blitRgb565File(lcd, f, zoom);
   f.close();
   return ok;
 }

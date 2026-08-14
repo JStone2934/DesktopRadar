@@ -316,6 +316,8 @@ static void onComposeDisplay(int zoom) {
   s_statusScreen = false;
   zoomNoteDisplayed(zoom);
   windParticlesNotifyBaseRedrawn();
+  // compose 直接 push 分段，没有经过 frameCacheBlit 的同步环带采集。
+  alertRingInvalidateUnderlay();
   applyAlertForZoom(zoom);
 }
 
@@ -678,10 +680,7 @@ static bool showCached(int zoom) {
     return false;
   }
   windParticlesNotifyBaseRedrawn();
-  const uint32_t dt = millis() - t0;
-  if (dt >= 30) {
-    Serial.printf("blit z%d %lums\n", zoom, (unsigned long)dt);
-  }
+  const uint32_t blitMs = millis() - t0;
   const bool switched = (s_displayedZoom != zoom);
   s_displayedZoom = zoom;
   frameCacheSetProtectedZoom(zoom);
@@ -701,6 +700,10 @@ static bool showCached(int zoom) {
   if (s_cfg.show_alert_ring && !switched) {
     alertRingRedraw(&lcd, zoom);
   }
+  const uint32_t totalMs = millis() - t0;
+  Serial.printf("showCached z%d total=%lums blit=%lums overlay=%lums\n", zoom,
+                (unsigned long)totalMs, (unsigned long)blitMs,
+                (unsigned long)(totalMs - blitMs));
   return true;
 }
 

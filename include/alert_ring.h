@@ -18,3 +18,15 @@ void alertRingTick(LGFX* lcd, int underlayZoom);
 void alertRingRedraw(LGFX* lcd, int underlayZoom);
 bool alertRingIsVisible();
 bool alertRingNeedsTick();
+
+/**
+ * 整屏缓存 blit 时直接从已经读入 RAM 的分段采集环带底色，避免切档后
+ * 再次逐行扫描整张 LittleFS 文件。
+ */
+void alertRingCaptureUnderlayBegin(int zoom);
+void alertRingCaptureUnderlayBand(int zoom, int bandY, int bandRows,
+                                  const uint16_t* pixels);
+void alertRingCaptureUnderlayEnd(int zoom, bool complete);
+
+/** 直接上屏的新合成帧未经过缓存 blit 时，作废旧环带底色。 */
+void alertRingInvalidateUnderlay();

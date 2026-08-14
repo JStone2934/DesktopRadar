@@ -31,6 +31,7 @@ static int s_underCount = 0;
 static uint16_t s_underPix[kRingCap];
 static uint8_t s_underX[kRingCap];
 static uint8_t s_underY[kRingCap];
+static bool s_captureActive = false;
 
 static inline int expand5(int v) { return (v << 3) | (v >> 2); }
 static inline int expand6(int v) { return (v << 2) | (v >> 4); }
@@ -124,6 +125,69 @@ static void paintFullRing(LGFX* lcd, uint16_t color) {
 static void clearUnderCache() {
   s_underZoom = -1;
   s_underCount = 0;
+  s_captureActive = false;
+}
+
+void alertRingInvalidateUnderlay() { clearUnderCache(); }
+
+void alertRingCaptureUnderlayBegin(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    clearUnderCache();
+    return;
+  }
+  s_underZoom = zoom;
+  s_underCount = 0;
+  s_captureActive = true;
+}
+
+void alertRingCaptureUnderlayBand(int zoom, int bandY, int bandRows,
+                                  const uint16_t* pixels) {
+  if (!s_captureActive || zoom != s_underZoom || !pixels || bandRows <= 0) {
+    return;
+  }
+  const int cx = LCD_WIDTH / 2;
+  const int cy = LCD_HEIGHT / 2;
+  const int rOuter = (LCD_WIDTH / 2) - 1;
+  const int rInner = rOuter - 3;
+  const int rO2 = rOuter * rOuter;
+  const int rI2 = rInner * rInner;
+  for (int by = 0; by < bandRows; ++by) {
+    const int y = bandY + by;
+    if (y < 0 || y >= LCD_HEIGHT) {
+      continue;
+    }
+    const int dy = y - cy;
+    const int dy2 = dy * dy;
+    if (dy2 > rO2) {
+      continue;
+    }
+    const uint16_t* row = pixels + (size_t)by * LCD_WIDTH;
+    for (int x = 0; x < LCD_WIDTH; ++x) {
+      const int dx = x - cx;
+      const int d2 = dx * dx + dy2;
+      if (d2 > rO2 || d2 < rI2) {
+        continue;
+      }
+      if (s_underCount >= kRingCap) {
+        clearUnderCache();
+        return;
+      }
+      s_underPix[s_underCount] = row[x];
+      s_underX[s_underCount] = (uint8_t)x;
+      s_underY[s_underCount] = (uint8_t)y;
+      ++s_underCount;
+    }
+  }
+}
+
+void alertRingCaptureUnderlayEnd(int zoom, bool complete) {
+  if (!s_captureActive) {
+    return;
+  }
+  s_captureActive = false;
+  if (!complete || zoom != s_underZoom || s_underCount <= 0) {
+    clearUnderCache();
+  }
 }
 
 static bool ensureUnderCache(int zoom) {
@@ -268,8 +332,8 @@ void alertRingSet(uint16_t color565, bool hasCloud) {
   s_lastFade = -1.0f;
   s_lastDrawMs = 0;
   s_visible = false;
-  // 每次重启呼吸都重新采样环带，避免沿用旧底图
-  clearUnderCache();
+  // 环带底色由整屏 blit 同步采集。若当前底色属于其它 zoom，
+  // ensureUnderCache() 会按 zoom 校验并回退读取；这里不能清掉刚采集的数据。
 }
 
 void alertRingClear(LGFX* lcd, int underlayZoom) {
