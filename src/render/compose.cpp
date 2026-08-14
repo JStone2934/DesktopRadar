@@ -119,6 +119,9 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
     if (!fetched || len < 8) {
       Serial.printf("  %s http fail len=%u try=%d\n", tag, (unsigned)len, attempt);
       LittleFS.remove(tilePath);
+      if (composeAbortRequested()) {
+        return false;
+      }
       if (WiFi.status() != WL_CONNECTED) {
         Serial.printf("  %s stop retry: WiFi offline\n", tag);
         return false;
@@ -155,7 +158,7 @@ struct PngDecodeCtx {
 
 static uint32_t pngReadCb(void* user, uint8_t* buf, uint32_t len) {
   auto* ctx = (PngDecodeCtx*)user;
-  if (!ctx || !ctx->in) {
+  if (!ctx || !ctx->in || composeAbortRequested()) {
     return 0;
   }
   if (!buf) {
@@ -196,7 +199,7 @@ static void pngDrawCb(void* user, uint32_t x, uint32_t y, uint_fast8_t div_x,
                       size_t len, const uint8_t* argb) {
   (void)div_x;
   auto* ctx = (PngDecodeCtx*)user;
-  if (!ctx) {
+  if (!ctx || composeAbortRequested()) {
     return;
   }
   if (!ctx->started) {
@@ -344,6 +347,17 @@ static bool decodePngToRawFile(const char* pngPath, const char* rawPath,
   }
 
   const int rc = lgfx_pngle_decomp(pngle, pngDrawCb);
+  if (composeAbortRequested()) {
+    lgfx_pngle_destroy(pngle);
+    in.close();
+    raw.close();
+    LittleFS.remove(rawPath);
+    if (alphaPtr) {
+      alphaPtr->close();
+      LittleFS.remove(alphaPath);
+    }
+    return false;
+  }
   pngFlushRow(&ctx);
   uint32_t rowsWritten = ctx.started ? (ctx.lastY + 1) : 0;
   if (rowsWritten < (uint32_t)TILE_SIZE) {
@@ -383,26 +397,48 @@ static uint16_t backdropColor(LGFX* lcd) {
   return lcd->color565(BASEMAP_BACKDROP_R, BASEMAP_BACKDROP_G, BASEMAP_BACKDROP_B);
 }
 
-bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
-                       bool pushToDisplay) {
+ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
+                                bool pushToDisplay) {
   if (!lcd) {
-    return false;
+    return ComposeResult::Failed;
   }
   if (!zoomCanCompose(zoom)) {
     Serial.printf("compose reject zoom=%d\n", zoom);
-    return false;
+    return ComposeResult::Failed;
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("compose z%d skipped: WiFi offline\n", zoom);
-    return false;
+    return ComposeResult::Failed;
   }
 
   logHeap("compose-start");
   composeClearAbort();
 
+  // 先取时间再动工作区。已有可信成品且时间未变化时，不清临时目录、
+  // 不下载、不写盘，也不触碰屏幕和风场轨迹。
+  RainviewerFrame meta;
+  const bool haveRadarMeta = rainviewerFetchLatest(&meta);
+  if (composeAbortRequested()) {
+    return ComposeResult::Failed;
+  }
+  if (!haveRadarMeta || meta.time == 0) {
+    Serial.printf("compose z%d failed: RainViewer metadata unavailable\n", zoom);
+    return ComposeResult::Failed;
+  }
+  if (frameCacheHas(zoom)) {
+    uint32_t cachedTime = 0;
+    if (frameCacheReadRadarTime(zoom, &cachedTime) &&
+        cachedTime == meta.time) {
+      Serial.printf("compose unchanged z%d radar_t=%lu\n", zoom,
+                    (unsigned long)meta.time);
+      return ComposeResult::Unchanged;
+    }
+  }
+  logHeap("after-meta");
+
   if (!frameCachePrepare(zoom)) {
     Serial.println("frameCachePrepare fail");
-    return false;
+    return ComposeResult::Failed;
   }
 
   const Viewport vp = computeViewport((double)lat, (double)lon, zoom);
@@ -439,15 +475,8 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       HTTP_MAX_TILE_BYTES;
   if (!frameCacheEnsureBakeSpace(kBakeWorkspaceBytes, zoom)) {
     Serial.printf("compose z%d deferred: keep completed zoom caches\n", zoom);
-    return false;
+    return ComposeResult::Failed;
   }
-
-  RainviewerFrame meta;
-  const bool haveRadarMeta = rainviewerFetchLatest(&meta);
-  if (composeAbortRequested()) {
-    return false;
-  }
-  logHeap("after-meta");
   reportComposeProgress(zoom, 0.06f);
 
   const int baseTiles =
@@ -477,7 +506,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
     for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
       if (composeAbortRequested()) {
-        return false;
+        return ComposeResult::Failed;
       }
       bool ok = fetchBasemapOnce(tx, ty);
       if (!ok && WiFi.status() == WL_CONNECTED) {
@@ -491,7 +520,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         Serial.printf("  basemap FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
         if (WiFi.status() != WL_CONNECTED) {
           Serial.println("  basemap pass stopped: WiFi offline");
-          return false;
+          return ComposeResult::Failed;
         }
       }
       afterTile();
@@ -502,14 +531,14 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   // 底图必须齐全：缺 1 张就会在圆屏上留下约 1/4 近黑块，且会进缓存
   if (baseOk < baseTiles) {
     Serial.printf("basemap incomplete %d/%d, skip commit\n", baseOk, baseTiles);
-    return false;
+    return ComposeResult::Failed;
   }
 
   if (haveRadarMeta && !composeAbortRequested()) {
     for (int ty = rty0; ty <= rty1; ++ty) {
       for (int tx = rtx0; tx <= rtx1; ++tx) {
         if (composeAbortRequested()) {
-          return false;
+          return ComposeResult::Failed;
         }
         Serial.printf("  dl radar oz=%d x=%d y=%d\n", overlayZoom, tx, ty);
         if (fetchTileToFs(zoom, true, tx, ty,
@@ -526,7 +555,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   // 元数据成功但瓦片全失败：勿写入「无雷达」成品，否则秒切会一直缺雷达
   if (haveRadarMeta && radarOk == 0) {
     Serial.println("radar tiles missing, skip commit");
-    return false;
+    return ComposeResult::Failed;
   }
   // 元数据失败：允许仅底图上屏但不 commit（由调用方/预取重试）
   const bool allowCommit = haveRadarMeta && radarOk > 0;
@@ -535,7 +564,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   }
 
   if (composeAbortRequested()) {
-    return false;
+    return ComposeResult::Failed;
   }
 
   frameCacheWriteMeta(zoom, vp, radarOk > 0, overlayZoom, scale, rtx0, rty0, rtx1,
@@ -598,7 +627,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   if (!frameBand) {
     Serial.printf("frame band malloc fail need=%u max=%u\n",
                   (unsigned)composeBandBytes, ESP.getMaxAllocHeap());
-    return false;
+    return ComposeResult::Failed;
   }
   Serial.printf("frame band ok bytes=%u bands=%d maxAfter=%u\n",
                 (unsigned)composeBandBytes, composeBandCount,
@@ -607,7 +636,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   if (!frameCacheBeginRgb565New(zoom)) {
     Serial.println("beginRgb565New fail");
     free(frameBand);
-    return false;
+    return ComposeResult::Failed;
   }
 
   const uint16_t bg = backdropColor(lcd);
@@ -668,7 +697,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
             lcd->setSwapBytes(prevSwap);
           }
           free(frameBand);
-          return false;
+          return ComposeResult::Failed;
         }
         const bool decoded = decodeOne(false, tx, ty, false, lastBand);
         if (decoded &&
@@ -689,7 +718,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         lcd->setSwapBytes(prevSwap);
       }
       free(frameBand);
-      return false;
+      return ComposeResult::Failed;
     }
     if (lastBand) {
       baseStamped = baseBandStamped;
@@ -705,7 +734,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
               lcd->setSwapBytes(prevSwap);
             }
             free(frameBand);
-            return false;
+            return ComposeResult::Failed;
           }
           const bool decoded = decodeOne(true, tx, ty, true, lastBand);
           if (decoded &&
@@ -732,7 +761,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         lcd->setSwapBytes(prevSwap);
       }
       free(frameBand);
-      return false;
+      return ComposeResult::Failed;
     }
     if (pushToDisplay) {
       lcd->pushImage(0, bandY, LCD_WIDTH, bandRows, frameBand);
@@ -754,34 +783,37 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                 baseStamped, baseTiles, (unsigned)LittleFS.usedBytes(),
                 (unsigned)LittleFS.totalBytes());
 
-  bool hasCloud = false;
-  uint16_t alertColor = 0;
-  radarCenterSampleFinalize(&centerSample, &hasCloud, &alertColor);
-  frameCacheWriteAlert(zoom, hasCloud, alertColor);
-  Serial.printf("center alert hasCloud=%d color=%04x maxA=%u\n", (int)hasCloud,
-                (unsigned)alertColor, (unsigned)centerSample.maxAlpha);
-
   reportComposeProgress(zoom, 0.97f);
-  if (haveRadarMeta && meta.time != 0) {
-    frameCacheWriteRadarTime(zoom, meta.time);
-  }
 
   if (!allowCommit) {
-    if (pushToDisplay) {
-      // 已分段上屏并写完 .new；替换旧图供进度环，但不标 ready。
-      frameCachePromoteNewNoReady(zoom);
-    }
     Serial.println("compose display-only (no radar cache commit)");
-    return pushToDisplay;
+    return ComposeResult::Failed;
   }
 
   if (!frameCacheCommit(zoom)) {
     Serial.println("commit fail");
-    return false;
+    return ComposeResult::Failed;
+  }
+
+  // 新图 ready 后再提交边车；时间最后写，只有图像和预警均完整时才成为
+  // 下一轮“时间相同可跳过”的可信标记。旧 4B 时间也在此惰性迁移。
+  frameCacheRemoveRadarTime(zoom);
+  frameCacheRemoveAlert(zoom);
+  bool hasCloud = false;
+  uint16_t alertColor = 0;
+  radarCenterSampleFinalize(&centerSample, &hasCloud, &alertColor);
+  const bool alertOk = frameCacheWriteAlert(zoom, hasCloud, alertColor);
+  Serial.printf("center alert hasCloud=%d color=%04x maxA=%u ok=%d\n",
+                (int)hasCloud, (unsigned)alertColor,
+                (unsigned)centerSample.maxAlpha, (int)alertOk);
+  if (alertOk && meta.time != 0 &&
+      !frameCacheWriteRadarTime(zoom, meta.time)) {
+    Serial.printf("radar time commit fail z%d t=%lu\n", zoom,
+                  (unsigned long)meta.time);
   }
 
   reportComposeProgress(zoom, 1.0f);
   logHeap("compose-done");
   Serial.printf("compose done z=%d ok=1\n", zoom);
-  return true;
+  return ComposeResult::Updated;
 }

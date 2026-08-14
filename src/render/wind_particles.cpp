@@ -24,7 +24,10 @@ struct TrailPixel {
   uint16_t key;       // y * LCD_WIDTH + x
   uint16_t base565;   // 对应静态 RGB565 缓存中的原色
   uint8_t strength;   // 255=新轨迹，0=下一次绘制时恢复底色
+  uint8_t flags;      // bit0=本帧粒子头；占用原结构体对齐填充
 };
+
+static_assert(sizeof(TrailPixel) == 6, "TrailPixel must stay compact");
 
 static constexpr int kTrailPixelCapacity = 3072;
 static constexpr int kNewPixelCapacity = 640;
@@ -34,6 +37,7 @@ static Particle s_particles[WIND_PARTICLE_COUNT];
 static TrailPixel s_trails[kTrailPixelCapacity];
 static uint16_t s_newKeys[kNewPixelCapacity];
 static uint16_t s_newBase[kNewPixelCapacity];
+static uint16_t s_spanBuf[LCD_WIDTH];
 static int s_trailCount = 0;
 static int s_newCount = 0;
 static uint32_t s_rng = 0x83a4f19dUL;
@@ -44,6 +48,9 @@ static uint32_t s_statsAt = 0;
 static uint32_t s_statsFrames = 0;
 static uint32_t s_lastCapacityLogAt = 0;
 static uint32_t s_lastSampleFailLogAt = 0;
+static uint32_t s_statsSpans = 0;
+
+static constexpr uint8_t kTrailHead = 0x01;
 
 static uint32_t nextRand() {
   uint32_t x = s_rng;
@@ -107,6 +114,7 @@ static void resetAll(int zoom, uint32_t revision) {
   s_lastFrameAt = 0;
   s_statsAt = 0;
   s_statsFrames = 0;
+  s_statsSpans = 0;
   Serial.printf("wind particles reset z%d count=%d fieldRev=%lu\n", zoom,
                 WIND_PARTICLE_COUNT, (unsigned long)revision);
 }
@@ -149,13 +157,37 @@ static void updateParticle(Particle* p, float dtSec, uint32_t dtMs) {
   }
 }
 
-static int findTrail(uint16_t key) {
-  for (int i = 0; i < s_trailCount; ++i) {
-    if (s_trails[i].key == key) {
-      return i;
+static int trailLowerBound(uint16_t key) {
+  int lo = 0;
+  int hi = s_trailCount;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (s_trails[mid].key < key) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
     }
   }
-  return -1;
+  return lo;
+}
+
+static int findTrail(uint16_t key) {
+  const int i = trailLowerBound(key);
+  return i < s_trailCount && s_trails[i].key == key ? i : -1;
+}
+
+static int newKeyLowerBound(uint16_t key) {
+  int lo = 0;
+  int hi = s_newCount;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (s_newKeys[mid] < key) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
 
 static void queueTrailPixel(int x, int y) {
@@ -168,13 +200,15 @@ static void queueTrailPixel(int x, int y) {
     s_trails[existing].strength = 255;
     return;
   }
-  for (int i = 0; i < s_newCount; ++i) {
-    if (s_newKeys[i] == key) {
-      return;
-    }
+  const int pos = newKeyLowerBound(key);
+  if (pos < s_newCount && s_newKeys[pos] == key) {
+    return;
   }
   if (s_newCount < kNewPixelCapacity) {
-    s_newKeys[s_newCount++] = key;
+    memmove(&s_newKeys[pos + 1], &s_newKeys[pos],
+            (size_t)(s_newCount - pos) * sizeof(s_newKeys[0]));
+    s_newKeys[pos] = key;
+    ++s_newCount;
   }
 }
 
@@ -207,12 +241,6 @@ static void queueNewestSegment(const Particle& p) {
   }
 }
 
-static int compareU16(const void* a, const void* b) {
-  const uint16_t av = *static_cast<const uint16_t*>(a);
-  const uint16_t bv = *static_cast<const uint16_t*>(b);
-  return av < bv ? -1 : (av > bv ? 1 : 0);
-}
-
 static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t alpha) {
   const uint32_t inv = 255U - alpha;
   const uint32_t fr = (fg >> 11) & 0x1F;
@@ -241,32 +269,55 @@ static void decayTrails(uint32_t dtMs) {
   }
 }
 
-static void restoreAndRemoveExpired(LGFX* lcd) {
-  bool writing = false;
-  for (int i = 0; i < s_trailCount;) {
-    if (s_trails[i].strength != 0) {
-      ++i;
+static int restoreAndRemoveExpired(LGFX* lcd) {
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+  lcd->startWrite();
+  int write = 0;
+  int spanX = 0;
+  int spanY = 0;
+  int spanLen = 0;
+  int spans = 0;
+  auto flushSpan = [&]() {
+    if (spanLen <= 0) {
+      return;
+    }
+    if (spanLen == 1) {
+      lcd->drawPixel(spanX, spanY, s_spanBuf[0]);
+    } else {
+      lcd->pushImage(spanX, spanY, spanLen, 1, s_spanBuf);
+    }
+    ++spans;
+    spanLen = 0;
+  };
+
+  // 输入按 key 排序；稳定压缩保留此顺序，同时把相邻过期像素合并恢复。
+  for (int read = 0; read < s_trailCount; ++read) {
+    const TrailPixel trail = s_trails[read];
+    if (trail.strength != 0) {
+      s_trails[write++] = trail;
       continue;
     }
-    if (!writing) {
-      lcd->startWrite();
-      writing = true;
+    const int x = trail.key % LCD_WIDTH;
+    const int y = trail.key / LCD_WIDTH;
+    if (spanLen == 0 || y != spanY || x != spanX + spanLen) {
+      flushSpan();
+      spanX = x;
+      spanY = y;
     }
-    const uint16_t key = s_trails[i].key;
-    lcd->drawPixel(key % LCD_WIDTH, key / LCD_WIDTH, s_trails[i].base565);
-    s_trails[i] = s_trails[s_trailCount - 1];
-    --s_trailCount;
+    s_spanBuf[spanLen++] = trail.base565;
   }
-  if (writing) {
-    lcd->endWrite();
-  }
+  flushSpan();
+  s_trailCount = write;
+  lcd->endWrite();
+  lcd->setSwapBytes(prevSwap);
+  return spans;
 }
 
-static void sampleAndInsertNew(int zoom) {
+static int sampleAndInsertNew(int zoom) {
   if (s_newCount <= 0) {
-    return;
+    return 0;
   }
-  qsort(s_newKeys, (size_t)s_newCount, sizeof(s_newKeys[0]), compareU16);
   if (!frameCacheReadPixelsSorted(zoom, s_newKeys, s_newBase,
                                   (size_t)s_newCount)) {
     const uint32_t now = millis();
@@ -275,36 +326,44 @@ static void sampleAndInsertNew(int zoom) {
       Serial.printf("wind trail base sample fail z%d new=%d\n", zoom,
                     s_newCount);
     }
-    return;
+    return 0;
   }
 
-  for (int i = 0; i < s_newCount; ++i) {
-    if (s_trailCount >= kTrailPixelCapacity) {
-      const uint32_t now = millis();
-      if (now - s_lastCapacityLogAt > 5000UL) {
-        s_lastCapacityLogAt = now;
-        Serial.printf("wind trail pool full active=%d dropped=%d\n",
-                      s_trailCount, s_newCount - i);
-      }
-      break;
+  const int available = kTrailPixelCapacity - s_trailCount;
+  const int accepted = min(s_newCount, available);
+  if (accepted < s_newCount) {
+    const uint32_t now = millis();
+    if (now - s_lastCapacityLogAt > 5000UL) {
+      s_lastCapacityLogAt = now;
+      Serial.printf("wind trail pool full active=%d dropped=%d\n",
+                    s_trailCount, s_newCount - accepted);
     }
-    TrailPixel& trail = s_trails[s_trailCount++];
-    trail.key = s_newKeys[i];
-    trail.base565 = s_newBase[i];
-    trail.strength = 255;
   }
+
+  // 两个输入均有序，从尾部原地合并，已有轨迹永远优先保留。
+  int old = s_trailCount - 1;
+  int fresh = accepted - 1;
+  int out = s_trailCount + accepted - 1;
+  while (old >= 0 && fresh >= 0) {
+    if (s_trails[old].key > s_newKeys[fresh]) {
+      s_trails[out--] = s_trails[old--];
+    } else {
+      s_trails[out--] =
+          TrailPixel{s_newKeys[fresh], s_newBase[fresh], 255, 0};
+      --fresh;
+    }
+  }
+  while (fresh >= 0) {
+    s_trails[out--] = TrailPixel{s_newKeys[fresh], s_newBase[fresh], 255, 0};
+    --fresh;
+  }
+  s_trailCount += accepted;
+  return accepted;
 }
 
-static void drawTrailsAndHeads(LGFX* lcd) {
-  const uint16_t trailColor = lcd->color565(105, 211, 232);
-  const uint16_t headColor = lcd->color565(225, 253, 255);
-  lcd->startWrite();
+static void markParticleHeads() {
   for (int i = 0; i < s_trailCount; ++i) {
-    const TrailPixel& trail = s_trails[i];
-    const int x = trail.key % LCD_WIDTH;
-    const int y = trail.key / LCD_WIDTH;
-    lcd->drawPixel(x, y,
-                   blend565(trailColor, trail.base565, trail.strength));
+    s_trails[i].flags = 0;
   }
   for (int i = 0; i < WIND_PARTICLE_COUNT; ++i) {
     const int x = (int)lroundf(s_particles[i].x[0]);
@@ -312,12 +371,47 @@ static void drawTrailsAndHeads(LGFX* lcd) {
     if (!pointAllowed((float)x, (float)y)) {
       continue;
     }
-    const uint16_t key = (uint16_t)(y * LCD_WIDTH + x);
-    if (findTrail(key) >= 0) {
-      lcd->drawPixel(x, y, headColor);
+    const int found = findTrail((uint16_t)(y * LCD_WIDTH + x));
+    if (found >= 0) {
+      s_trails[found].flags |= kTrailHead;
     }
   }
+}
+
+static int drawTrailsAndHeads(LGFX* lcd) {
+  const uint16_t trailColor = lcd->color565(105, 211, 232);
+  const uint16_t headColor = lcd->color565(225, 253, 255);
+  const bool prevSwap = lcd->getSwapBytes();
+  lcd->setSwapBytes(true);
+  lcd->startWrite();
+  int spans = 0;
+  int i = 0;
+  while (i < s_trailCount) {
+    const uint16_t firstKey = s_trails[i].key;
+    const int x0 = firstKey % LCD_WIDTH;
+    const int y = firstKey / LCD_WIDTH;
+    int j = i;
+    while (j < s_trailCount && s_trails[j].key / LCD_WIDTH == y &&
+           s_trails[j].key == firstKey + (j - i)) {
+      const TrailPixel& trail = s_trails[j];
+      s_spanBuf[j - i] = (trail.flags & kTrailHead)
+                            ? headColor
+                            : blend565(trailColor, trail.base565,
+                                       trail.strength);
+      ++j;
+    }
+    const int len = j - i;
+    if (len == 1) {
+      lcd->drawPixel(x0, y, s_spanBuf[0]);
+    } else {
+      lcd->pushImage(x0, y, len, 1, s_spanBuf);
+    }
+    ++spans;
+    i = j;
+  }
   lcd->endWrite();
+  lcd->setSwapBytes(prevSwap);
+  return spans;
 }
 
 }  // namespace
@@ -332,6 +426,7 @@ void windParticlesReset() {
   s_seenRevision = 0;
   s_lastFrameAt = 0;
   s_statsFrames = 0;
+  s_statsSpans = 0;
 }
 
 void windParticlesNotifyBaseRedrawn() {
@@ -377,20 +472,26 @@ bool windParticlesTick(LGFX* lcd, int displayedZoom, bool busy) {
 
   const uint32_t drawStart = millis();
   // 先让本帧经过的旧像素复活，再恢复真正过期的像素，避免交叉轨迹互擦。
-  restoreAndRemoveExpired(lcd);
+  const int restoreSpans = restoreAndRemoveExpired(lcd);
   sampleAndInsertNew(displayedZoom);
-  drawTrailsAndHeads(lcd);
+  markParticleHeads();
+  const int drawSpans = drawTrailsAndHeads(lcd);
 
   ++s_statsFrames;
+  s_statsSpans += (uint32_t)(restoreSpans + drawSpans);
   if (s_statsAt == 0) {
     s_statsAt = now;
   } else if ((now - s_statsAt) >= 5000UL) {
     const float fps = (float)s_statsFrames * 1000.0f / (float)(now - s_statsAt);
-    Serial.printf("wind anim fps=%.1f draw=%lums busy=%d trails=%d new=%d\n",
-                  fps, (unsigned long)(millis() - drawStart), (int)busy,
-                  s_trailCount, s_newCount);
+    const unsigned avgSpans =
+        s_statsFrames > 0 ? (unsigned)(s_statsSpans / s_statsFrames) : 0;
+    Serial.printf(
+        "wind anim fps=%.1f draw=%lums busy=%d trails=%d new=%d spans=%u\n",
+        fps, (unsigned long)(millis() - drawStart), (int)busy, s_trailCount,
+        s_newCount, avgSpans);
     s_statsAt = now;
     s_statsFrames = 0;
+    s_statsSpans = 0;
   }
   return true;
 }

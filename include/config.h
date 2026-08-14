@@ -22,8 +22,8 @@
 #define OVERLAY_BAR_H 24
 #define PROGRESS_BAR_THICK 2
 
-// 杜邦线/飞线先用较低速率；稳定后再提到 40M
-#define SPI_FREQ_WRITE 20000000
+// 实机按 20 / 26.67 / 40MHz 分档验证；最终保留无花屏、错行或复位的最高档。
+#define SPI_FREQ_WRITE 40000000
 
 // ---- WiFi 默认（NVS 未保存时回退；Web 配网写入 Preferences）----
 #define WIFI_SSID "GL-AXT1800-c11"
@@ -68,6 +68,8 @@
 #define CACHE_PAUSE_AFTER_USER_MS 10000UL
 // 风场模式以全档缓存秒切为最高优先级；用户停止操作一分钟后才恢复静态后台刷新。
 #define WIND_CACHE_PAUSE_AFTER_USER_MS 60000UL
+// 风场模式一次只更新一个静态缩放档；档间留出纯交互窗口。
+#define WIND_BACKGROUND_COMPOSE_GAP_MS (2UL * 60UL * 1000UL)
 
 // ---- 数据源 ----
 #define RAINVIEWER_API "https://api.rainviewer.com/public/weather-maps.json"
@@ -94,7 +96,8 @@
 #define WIND_PARTICLE_COUNT 56
 #define WIND_TRAIL_POINTS 4
 #define WIND_FRAME_MS 167UL       // 正常约 6 FPS
-#define WIND_BUSY_FRAME_MS 500UL  // HTTPS / PNG / 造片期间约 2 FPS
+// 后台造片允许变慢，但不能主动牺牲风场帧率。
+#define WIND_BUSY_FRAME_MS WIND_FRAME_MS
 #define WIND_FIELD_REFRESH_MS (60UL * 60UL * 1000UL)
 #define WIND_FIELD_RETRY_MS (30UL * 1000UL)
 #define WIND_FIELD_SLOW_RETRY_MS (10UL * 60UL * 1000UL)

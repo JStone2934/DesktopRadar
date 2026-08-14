@@ -5,12 +5,51 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "zoom_ctrl.h"
 
 namespace {
+
+struct ResponsiveGetCtx {
+  HTTPClient* http;
+  TaskHandle_t waiter;
+  volatile bool done;
+  int code;
+};
+
+static void httpGetWorker(void* opaque) {
+  auto* ctx = static_cast<ResponsiveGetCtx*>(opaque);
+  ctx->code = ctx->http->GET();
+  ctx->done = true;
+  xTaskNotifyGive(ctx->waiter);
+  vTaskDelete(nullptr);
+}
+
+/**
+ * TLS 建连/响应头可能在 HTTPClient::GET 内阻塞数秒。放到同核低优先级
+ * 任务后，等待方仍持续服务按键和LCD；ESP32-C3虽是单核，也能由调度器
+ * 抢占网络等待，不让秒切依赖服务器响应时间。
+ */
+static int responsiveHttpGet(HTTPClient& http) {
+  ResponsiveGetCtx ctx{&http, xTaskGetCurrentTaskHandle(), false, HTTPC_ERROR_CONNECTION_REFUSED};
+  TaskHandle_t worker = nullptr;
+  const BaseType_t created =
+      xTaskCreate(httpGetWorker, "http-get", 6144, &ctx,
+                  tskIDLE_PRIORITY + 1, &worker);
+  if (created != pdPASS) {
+    Serial.println("HTTP GET worker alloc fail; using direct request");
+    return http.GET();
+  }
+  while (!ctx.done) {
+    inputServiceDuringBlock();
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+  }
+  return ctx.code;
+}
 
 static bool deadlineReached(uint32_t deadline) {
   return (int32_t)(millis() - deadline) >= 0;
@@ -331,14 +370,22 @@ uint8_t* httpFetch(const char* url, const char* referer, size_t maxBytes,
                   (int)WiFi.status());
     return nullptr;
   }
+  if (composeAbortRequested()) {
+    return nullptr;
+  }
 
   WiFiClientSecure client;
   HTTPClient http;
   if (!httpSetup(http, client, url, referer, timeoutMs)) {
     return nullptr;
   }
+  if (composeAbortRequested()) {
+    http.end();
+    client.stop();
+    return nullptr;
+  }
 
-  const int code = http.GET();
+  const int code = responsiveHttpGet(http);
   if (code != HTTP_CODE_OK) {
     char sslError[96]{};
     const int sslCode = client.lastError(sslError, sizeof(sslError));
@@ -390,14 +437,22 @@ bool httpFetchToFile(const char* url, const char* referer, fs::File& out,
                   (int)WiFi.status());
     return false;
   }
+  if (composeAbortRequested()) {
+    return false;
+  }
 
   WiFiClientSecure client;
   HTTPClient http;
   if (!httpSetup(http, client, url, referer, timeoutMs)) {
     return false;
   }
+  if (composeAbortRequested()) {
+    http.end();
+    client.stop();
+    return false;
+  }
 
-  const int code = http.GET();
+  const int code = responsiveHttpGet(http);
   if (code != HTTP_CODE_OK) {
     Serial.printf("HTTP %d\n", code);
     http.end();

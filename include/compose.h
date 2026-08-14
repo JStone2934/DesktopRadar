@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "LGFX_GC9A01.hpp"
 
 /**
@@ -22,9 +24,16 @@ void composeSetDisplayFn(ComposeDisplayFn fn);
 /** 是否在合成的雷达画面中绘制中心十字。 */
 void composeSetCrosshairVisible(bool visible);
 
+enum class ComposeResult : uint8_t {
+  Failed = 0,
+  Unchanged,
+  Updated,
+};
+
 /**
  * 两阶段造片：HTTPS 瓦片落盘 → 烘焙 RGB565 成品。
- * pushToDisplay 时烘焙后行刷上屏。
+ * pushToDisplay 时烘焙后行刷上屏；服务端时间与可信缓存相同时返回
+ * Unchanged，不下载、不写盘也不重绘。
  */
-bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
-                       bool pushToDisplay);
+ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
+                                bool pushToDisplay);

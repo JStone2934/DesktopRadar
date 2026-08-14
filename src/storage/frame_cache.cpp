@@ -15,6 +15,9 @@ static uint16_t s_readyMask = 0;
 static uint16_t s_freshMask = 0;
 static int s_protectedZoom = -1;
 
+static constexpr int kBlitBandRows = 16;
+static uint16_t s_blitBand[LCD_WIDTH * kBlitBandRows];
+
 static inline void freshMaskSet(int zoom, bool on) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return;
@@ -85,6 +88,10 @@ static void radarTimePath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.time", zoom);
 }
 
+static void radarTimeNewPath(int zoom, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d.time.new", zoom);
+}
+
 /** 打开并校验成品长度；成功时返回已打开的 File（调用方关闭）。 */
 static bool openRgb565IfValid(int zoom, File* out) {
   if (!out) {
@@ -106,19 +113,17 @@ static bool openRgb565IfValid(int zoom, File* out) {
 static bool blitRgb565File(LGFX* lcd, File& f) {
   const bool prevSwap = lcd->getSwapBytes();
   lcd->setSwapBytes(true);
-  uint16_t row[LCD_WIDTH];
-  for (int y = 0; y < LCD_HEIGHT; ++y) {
-    // 风场约每 167 ms 整屏重绘；在行刷期间持续采样，避免一个快速短按
-    // 完整落入约 80 ms 的 blit 窗口而被主循环漏掉。事件只锁存，不在此处理。
-    if ((y & 3) == 0) {
-      buttonService();
-    }
-    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
-        (int)FRAME_ROW_BYTES) {
+  for (int y = 0; y < LCD_HEIGHT; y += kBlitBandRows) {
+    // 每批前后都采样按键；16 行传输远短于消抖阈值，仍可覆盖快速短按。
+    buttonService();
+    const int rows = min(kBlitBandRows, LCD_HEIGHT - y);
+    const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
+    if (f.read(reinterpret_cast<uint8_t*>(s_blitBand), bytes) != (int)bytes) {
       lcd->setSwapBytes(prevSwap);
       return false;
     }
-    lcd->pushImage(0, y, LCD_WIDTH, 1, row);
+    lcd->pushImage(0, y, LCD_WIDTH, rows, s_blitBand);
+    buttonService();
   }
   lcd->setSwapBytes(prevSwap);
   return true;
@@ -711,6 +716,8 @@ bool frameCacheRemove(int zoom) {
   LittleFS.remove(path);
   radarTimePath(zoom, path, sizeof(path));
   LittleFS.remove(path);
+  radarTimeNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
   readyMaskSet(zoom, false);
   freshMaskSet(zoom, false);
   return true;
@@ -1017,22 +1024,34 @@ bool frameCacheReadPixelsSorted(int zoom, const uint16_t* keys,
       return false;
     }
     const int y = key / LCD_WIDTH;
-    const size_t offset = (size_t)y * FRAME_ROW_BYTES;
+    const size_t rowBegin = i;
+    size_t rowEnd = i + 1;
+    while (rowEnd < count && keys[rowEnd] / LCD_WIDTH == y) {
+      if (keys[rowEnd] < keys[rowEnd - 1]) {
+        f.close();
+        return false;
+      }
+      ++rowEnd;
+    }
+    const int x0 = keys[rowBegin] % LCD_WIDTH;
+    const int x1 = keys[rowEnd - 1] % LCD_WIDTH;
+    const size_t spanBytes = (size_t)(x1 - x0 + 1) * sizeof(uint16_t);
+    const size_t offset = (size_t)y * FRAME_ROW_BYTES +
+                          (size_t)x0 * sizeof(uint16_t);
     if (!f.seek(offset) ||
-        f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
-            (int)FRAME_ROW_BYTES) {
+        f.read(reinterpret_cast<uint8_t*>(row), spanBytes) != (int)spanBytes) {
       f.close();
       return false;
     }
 
-    while (i < count && keys[i] / LCD_WIDTH == y) {
+    while (i < rowEnd) {
       const uint16_t rowKey = keys[i];
       if (rowKey >= LCD_WIDTH * LCD_HEIGHT ||
           (havePrevious && rowKey < previous)) {
         f.close();
         return false;
       }
-      colors[i] = row[rowKey % LCD_WIDTH];
+      colors[i] = row[rowKey % LCD_WIDTH - x0];
       previous = rowKey;
       havePrevious = true;
       ++i;
@@ -1124,23 +1143,40 @@ bool frameCacheWriteAlert(int zoom, bool hasCloud, uint16_t color565) {
 }
 
 bool frameCacheWriteRadarTime(int zoom, uint32_t timeSec) {
-  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX || timeSec == 0) {
     return false;
   }
   if (!LittleFS.exists("/frames")) {
     LittleFS.mkdir("/frames");
   }
+  // 旧版只有裸 uint32_t。新记录用 magic 作为可信 commit 标记；时间按
+  // little-endian 显式编码，避免结构体填充和半写文件被误判为有效。
+  static constexpr uint8_t kMagic[4] = {'R', 'T', 'M', '2'};
+  uint8_t record[8] = {kMagic[0], kMagic[1], kMagic[2], kMagic[3],
+                       (uint8_t)(timeSec), (uint8_t)(timeSec >> 8),
+                       (uint8_t)(timeSec >> 16), (uint8_t)(timeSec >> 24)};
   char path[40];
+  char newPath[40];
   radarTimePath(zoom, path, sizeof(path));
-  File f = LittleFS.open(path, "w");
+  radarTimeNewPath(zoom, newPath, sizeof(newPath));
+  LittleFS.remove(newPath);
+  File f = LittleFS.open(newPath, "w");
   if (!f) {
     return false;
   }
-  const bool ok =
-      f.write(reinterpret_cast<const uint8_t*>(&timeSec), sizeof(timeSec)) ==
-      sizeof(timeSec);
+  const bool ok = f.write(record, sizeof(record)) == sizeof(record);
+  f.flush();
   f.close();
-  return ok;
+  if (!ok) {
+    LittleFS.remove(newPath);
+    return false;
+  }
+  LittleFS.remove(path);
+  if (!LittleFS.rename(newPath, path)) {
+    LittleFS.remove(newPath);
+    return false;
+  }
+  return true;
 }
 
 bool frameCacheReadRadarTime(int zoom, uint32_t* timeSec) {
@@ -1151,16 +1187,33 @@ bool frameCacheReadRadarTime(int zoom, uint32_t* timeSec) {
   char path[40];
   radarTimePath(zoom, path, sizeof(path));
   File f = LittleFS.open(path, "r");
-  if (!f || f.size() < (int)sizeof(uint32_t)) {
+  if (!f || f.size() != 8) {
     if (f) {
       f.close();
     }
     return false;
   }
-  const size_t n =
-      f.read(reinterpret_cast<uint8_t*>(timeSec), sizeof(uint32_t));
+  uint8_t record[8];
+  const size_t n = f.read(record, sizeof(record));
   f.close();
-  return n == sizeof(uint32_t) && *timeSec != 0;
+  if (n != sizeof(record) || record[0] != 'R' || record[1] != 'T' ||
+      record[2] != 'M' || record[3] != '2') {
+    return false;
+  }
+  *timeSec = (uint32_t)record[4] | ((uint32_t)record[5] << 8) |
+             ((uint32_t)record[6] << 16) | ((uint32_t)record[7] << 24);
+  return *timeSec != 0;
+}
+
+void frameCacheRemoveRadarTime(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  char path[40];
+  radarTimePath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  radarTimeNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
 }
 
 bool frameCacheReadAlert(int zoom, bool* hasCloud, uint16_t* color565) {

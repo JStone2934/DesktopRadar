@@ -150,6 +150,7 @@ bool frameCacheStampTile(int zoom, const uint16_t* tile256, int pasteX,
 /** 静帧对应的雷达 Unix 时间（commit 时写入，供动画积累去重）。 */
 bool frameCacheWriteRadarTime(int zoom, uint32_t timeSec);
 bool frameCacheReadRadarTime(int zoom, uint32_t* timeSec);
+void frameCacheRemoveRadarTime(int zoom);
 
 /** 中心天气采样：与 .rgb565 同级，commit 清临时目录后仍保留。 */
 bool frameCacheWriteAlert(int zoom, bool hasCloud, uint16_t color565);

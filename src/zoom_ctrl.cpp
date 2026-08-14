@@ -154,7 +154,13 @@ bool zoomPrefetchPop(int* outZoom) {
 
 void composeRequestAbort() { s_composeAbort = true; }
 void composeClearAbort() { s_composeAbort = false; }
-bool composeAbortRequested() { return s_composeAbort; }
+bool composeAbortRequested() {
+  // 合成路径直接观察物理按下电平，不必等到松手形成 ShortPress。
+  if (buttonIsDown()) {
+    s_composeAbort = true;
+  }
+  return s_composeAbort;
+}
 
 void zoomSetPending(int zoom) { s_pendingZoom = zoom; }
 

@@ -42,6 +42,8 @@ static float s_bakeLocal = 0.0f;
 static bool s_staticFullPassDone = false;
 // 用户交互后暂停后台预取（不挡定时雷达刷新）
 static uint32_t s_cachePauseUntil = 0;
+// 风场模式后台静态造片的最早启动时刻；避免多个档位无缝连跑。
+static uint32_t s_windBackgroundComposeAt = 0;
 // 每档最近一次成功造片时刻；仅风场模式用来做 5/15/45 分钟分级刷新。
 static uint32_t s_zoomRefreshedAt[ZOOM_MAX - ZOOM_MIN + 1]{};
 // S 键长按跳转前的临时视觉反馈（只画 LCD，不改缓存）。闪烁相位独立
@@ -217,12 +219,20 @@ static void pumpAlertRingDuringCompose() {
   alertRingTick(&lcd, under);
 }
 
+/** 风场模式先补齐所有 ready 成品；完成前不进入按时效分级刷新的阶段。 */
+static bool windCacheBootstrapActive() {
+  return s_cfg.show_wind_particles &&
+         frameCacheCountReady() < frameCacheZoomSlots();
+}
+
 static void onComposeProgress(int zoom, float local01) {
   updateLongPressCue();
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
-  // 邻档预取中若定时刷新已到期：立刻中止，把主循环还给当前档刷新
-  if (zoom != zoomCurrent() && refreshIsDue()) {
+  // 全档已经 ready 后，当前档定时刷新才可抢占邻档刷新。初次补齐阶段
+  // 必须让缺失档完成提交，否则五分钟定时器会让全档缓存长期补不满。
+  if (zoom != zoomCurrent() && refreshIsDue() &&
+      !windCacheBootstrapActive()) {
     Serial.printf("abort prefetch z%d — refresh due\n", zoom);
     composeRequestAbort();
   }
@@ -301,11 +311,12 @@ static size_t fsFreeBytes() {
 }
 
 /**
- * 风场模式只把到期档标为 stale，绝不删除 ready 成品：旧图仍可秒切，
- * 后台队列按当前、±1、±2… 的顺序逐档替换。
+ * 风场模式只允许同时存在一个待更新静态档。切档保护期内完全不改变
+ * fresh 状态；否则用户快速浏览会因“相对中心距离”变化把全档依次标旧，
+ * 在保护期结束后制造一整串后台合成。
  */
 static void scheduleWindStaticRefreshes() {
-  if (!s_cfg.show_wind_particles) {
+  if (!s_cfg.show_wind_particles || cachePaused()) {
     return;
   }
   static uint32_t lastScanAt = 0;
@@ -315,30 +326,48 @@ static void scheduleWindStaticRefreshes() {
   }
   lastScanAt = now;
 
-  const int center = zoomCurrent();
-  int staleCount = 0;
-  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-    if (!zoomCanCompose(z) || z == center || !frameCacheHas(z) ||
-        !frameCacheIsFresh(z)) {
-      continue;
-    }
-    const uint32_t interval =
-        abs(z - center) <= 1 ? WIND_ADJACENT_REFRESH_MS
-                             : WIND_FAR_REFRESH_MS;
-    if (!zoomRefreshDue(z, interval)) {
-      continue;
-    }
-    frameCacheMarkFresh(z, false);
-    ++staleCount;
+  if ((int32_t)(now - s_windBackgroundComposeAt) < 0) {
+    return;
   }
 
-  if (staleCount > 0) {
+  // 已有一个 stale 档就等待它完成；不继续累积后台债务。ready 成品始终
+  // 保留，所以即使 stale 也仍可用于秒切。
+  const int slots = frameCacheZoomSlots();
+  if (frameCacheCountReady() < slots || frameCacheCountFresh() < slots) {
+    return;
+  }
+
+  const int center = zoomCurrent();
+  int candidate = -1;
+  // 以当前档为中心逐层找一个最值得刷新的档；每档仍只按自己的成功刷新
+  // 时间判断到期，切换中心不会改变或清空其它档的状态。
+  for (int delta = 1; delta <= ZOOM_MAX - ZOOM_MIN && candidate < 0;
+       ++delta) {
+    const int choices[2] = {center - delta, center + delta};
+    for (int i = 0; i < 2; ++i) {
+      const int z = choices[i];
+      if (!zoomCanCompose(z) || !frameCacheHas(z)) {
+        continue;
+      }
+      const uint32_t interval = delta == 1 ? WIND_ADJACENT_REFRESH_MS
+                                            : WIND_FAR_REFRESH_MS;
+      if (zoomRefreshDue(z, interval)) {
+        candidate = z;
+        break;
+      }
+    }
+  }
+
+  if (candidate >= 0) {
+    frameCacheMarkFresh(candidate, false);
     s_staticFullPassDone = false;
+    zoomPrefetchClear();
+    // 队列控制器按当前、±1、±2顺序重建，但只有 candidate 为 stale，
+    // 因此实际只会弹出这一档。
     zoomPrefetchResetAround(center);
     refreshProgressRing();
-    Serial.printf("wind static tier: stale=%d center=z%d fresh=%d/%d\n",
-                  staleCount, center, frameCacheCountFresh(),
-                  frameCacheZoomSlots());
+    Serial.printf("wind static tier: queue z%d center=z%d fresh=%d/%d\n",
+                  candidate, center, frameCacheCountFresh(), slots);
   }
 }
 
@@ -351,9 +380,9 @@ static void forceWifiReconnectAfterFetchFail(const char* reason) {
   WiFi.disconnect(false, false);
 }
 
-static bool buildAndCache(int zoom, bool pushToDisplay);
+static ComposeResult buildAndCache(int zoom, bool pushToDisplay);
 static void handlePendingZoom();
-static void pumpPrefetch();
+static bool pumpPrefetch();
 static void ensureZoomVisible(int zoom, bool userInitiated);
 static bool showCached(int zoom);
 
@@ -469,6 +498,11 @@ static void pumpWindDuringBlock() {
   // HTTPS/解码阻塞期间不依赖风场恰好出帧：持续采样按键并独立推进
   // 长按十字反馈，避免慢请求窗口内看起来“按住没有反应”。
   buttonService();
+  // 不等松手判定短按/长按：物理按下先抢占耗时合成。松手后的事件
+  // 仍按原状态机消费，因此不会改变短按/长按语义。
+  if (s_busyCompose && buttonIsDown()) {
+    composeRequestAbort();
+  }
   pumpWindAnimation(true);
   updateLongPressCue();
 }
@@ -546,16 +580,16 @@ static void onPendingZoomFeedback(int zoom) {
   }
 }
 
-static bool buildAndCache(int zoom, bool pushToDisplay) {
+static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
   if (!zoomCanCompose(zoom)) {
-    return false;
+    return ComposeResult::Failed;
   }
   // 静态造片完全依赖在线瓦片。离线时立即失败，避免一次按键被每张瓦片的
   // DNS/TLS 超时拖住几十秒；旧的 ready 帧始终留在屏上。
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("build z%d skipped: WiFi offline (status=%d)\n", zoom,
                   (int)WiFi.status());
-    return false;
+    return ComposeResult::Failed;
   }
   const bool wasFresh = frameCacheIsFresh(zoom);
   s_busyCompose = true;
@@ -575,13 +609,13 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     Serial.printf("prefetch bake z%d (no display)\n", zoom);
   }
 
-  const bool ok =
+  const ComposeResult result =
       composeRadarFrame(&lcd, s_cfg.lat, s_cfg.lon, zoom, pushToDisplay);
   s_busyCompose = false;
   s_bakeZoom = -1;
   s_bakeLocal = 0.0f;
 
-  if (!ok) {
+  if (result == ComposeResult::Failed) {
     if (composeAbortRequested()) {
       Serial.printf("build z%d aborted\n", zoom);
     } else {
@@ -593,7 +627,15 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     }
     s_statusScreen = false;
     refreshProgressRing();
-    return false;
+    return ComposeResult::Failed;
+  }
+
+  if (result == ComposeResult::Unchanged) {
+    frameCacheMarkFresh(zoom, true);
+    noteZoomRefreshed(zoom);
+    Serial.printf("build z%d unchanged; mark fresh without blit\n", zoom);
+    refreshProgressRing();
+    return ComposeResult::Unchanged;
   }
 
   // display-only（无雷达 commit）不算造片成功，避免刷新时钟被空转推进
@@ -609,7 +651,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
       showCached(zoom);
     }
     refreshProgressRing();
-    return false;
+    return ComposeResult::Failed;
   }
 
   noteZoomRefreshed(zoom);
@@ -618,7 +660,7 @@ static bool buildAndCache(int zoom, bool pushToDisplay) {
     // s_displayedZoom / statusScreen / 预警环已由 onComposeDisplay 回调同步
   }
   refreshProgressRing();
-  return true;
+  return ComposeResult::Updated;
 }
 
 static void pumpBackgroundPrefetch() {
@@ -632,10 +674,17 @@ static void pumpBackgroundPrefetch() {
   if (windFieldBlocksPrefetch()) {
     return;
   }
-  if (refreshIsDue() || refreshApproaching()) {
+  const bool bootstrap = windCacheBootstrapActive();
+  // 补齐全档是风场模式的第一阶段；当前档的定时刷新只能在 ready=全档
+  // 后抢占。普通模式及梯队刷新阶段维持原来的时序。
+  if (!bootstrap && (refreshIsDue() || refreshApproaching())) {
     return;
   }
   if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (s_cfg.show_wind_particles && !bootstrap &&
+      (int32_t)(millis() - s_windBackgroundComposeAt) < 0) {
     return;
   }
 
@@ -646,7 +695,12 @@ static void pumpBackgroundPrefetch() {
     return;
   }
 
-  pumpPrefetch();
+  const bool attempted = pumpPrefetch();
+  if (attempted && s_cfg.show_wind_particles && !bootstrap) {
+    s_windBackgroundComposeAt = millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
+    Serial.printf("wind static cooldown %lus; interaction remains primary\n",
+                  (unsigned long)(WIND_BACKGROUND_COMPOSE_GAP_MS / 1000UL));
+  }
   if (s_busyCompose) {
     return;
   }
@@ -714,7 +768,7 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
     zoomPrefetchClear();
   }
 
-  if (!buildAndCache(zoom, true)) {
+  if (buildAndCache(zoom, true) == ComposeResult::Failed) {
     if (!zoomHasPending() && s_displayedZoom < 0) {
       showStatus("Compose fail", "see serial");
     }
@@ -765,27 +819,28 @@ static void handleLongPress() {
   handlePendingZoom();
 }
 
-static void pumpPrefetch() {
+static bool pumpPrefetch() {
   if (zoomHasPending()) {
     handlePendingZoom();
-    return;
+    return false;
   }
   if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
-    return;
+    return false;
   }
   int z = 0;
   if (!zoomPrefetchPop(&z)) {
-    return;
+    return false;
   }
   if (frameCacheIsFresh(z)) {
-    return;
+    return false;
   }
-  if (buildAndCache(z, false)) {
+  if (buildAndCache(z, false) != ComposeResult::Failed) {
     zoomPrefetchNoteOk(z);
   } else if (!composeAbortRequested()) {
     zoomPrefetchNoteFail(z);
   }
   handlePendingZoom();
+  return true;
 }
 
 static bool tryWifiAndRadar() {
@@ -886,7 +941,7 @@ void setup() {
   composeSetDisplayFn(onComposeDisplay);
   composeSetCrosshairVisible(s_cfg.show_crosshair);
 
-  showStatus("LittleFS...", "");
+  showStatus("Storm Eye", "");
   if (!frameCacheBegin()) {
     showStatus("FS fail", "no cache");
   }
@@ -909,6 +964,12 @@ void loop() {
     if (s_wifiOk) {
       handleLongPress();
     }
+  }
+
+  // 阻塞路径为抢占而锁存的 abort 只服务当前任务；任务已经回到主循环、
+  // pending 也已消费后立即释放，不能误伤后续风场 HTTP 请求。
+  if (!s_busyCompose && !zoomHasPending() && !buttonIsDown()) {
+    composeClearAbort();
   }
 
   updateLongPressCue();
@@ -941,7 +1002,9 @@ void loop() {
   const bool due = refreshIsDue();
   // 风场模式下切档先保证旧缓存秒切与新档动画稳定；用户停止操作 60 秒后
   // 才允许启动耗时的当前档静态刷新。关闭风场时维持原来的刷新时序。
-  const bool deferWindRefresh = s_cfg.show_wind_particles && cachePaused();
+  const bool deferWindRefresh =
+      s_cfg.show_wind_particles &&
+      (cachePaused() || windCacheBootstrapActive());
   if (!s_busyCompose && due && !deferWindRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
@@ -952,14 +1015,22 @@ void loop() {
       // 先刷新当前档；成功后再按当前模式决定哪些邻档进入后台队列。
       rainviewerInvalidatePin();
       frameCacheSetProtectedZoom(s_displayedZoom >= 0 ? s_displayedZoom : z);
-      const bool ok = buildAndCache(z, true);
-      if (ok) {
+      // 风场模式后台提交，不在合成分段中碰屏；普通模式保留原路径。
+      const bool composeToDisplay = !s_cfg.show_wind_particles;
+      const ComposeResult result = buildAndCache(z, composeToDisplay);
+      if (result != ComposeResult::Failed) {
         s_lastRefresh = millis();
         s_refreshFailAt = 0;
         uint32_t t = 0;
         frameCacheReadRadarTime(z, &t);
-        showCached(z);
+        if (result == ComposeResult::Updated &&
+            (!s_cfg.show_wind_particles ||
+             (zoomCurrent() == z && s_displayedZoom == z))) {
+          showCached(z);
+        }
         if (s_cfg.show_wind_particles) {
+          s_windBackgroundComposeAt =
+              millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
           // 风场模式：其余档由 15/45 分钟分级计时器负责，旧帧保持 ready。
           s_staticFullPassDone =
               frameCacheCountFresh() >= frameCacheZoomSlots();

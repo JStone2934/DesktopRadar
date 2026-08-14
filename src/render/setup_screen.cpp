@@ -5,6 +5,19 @@
 #include <stdio.h>
 
 #include "config.h"
+#include "radar_font.h"
+
+static bool isPrintableAscii(const char* text) {
+  if (!text || !text[0]) {
+    return false;
+  }
+  for (const uint8_t* p = reinterpret_cast<const uint8_t*>(text); *p; ++p) {
+    if (*p < 0x20 || *p > 0x7e) {
+      return false;
+    }
+  }
+  return true;
+}
 
 static void drawStatusLine(LGFX* lcd, int remainSec) {
   // 底部仅刷新倒计时数字
@@ -46,7 +59,7 @@ static void drawBootHint(LGFX* lcd, int qrRight, int qrTop, int qrSide,
                          int rightLimit) {
   lcd->setTextColor(TFT_WHITE, TFT_BLACK);
   lcd->setTextDatum(TC_DATUM);
-  lcd->setFont(&fonts::efontCN_12);
+  lcd->setFont(&radar_fonts::cn12);
   lcd->setTextSize(1.0f);
 
   int tx = qrRight + (rightLimit - qrRight) / 2;
@@ -73,7 +86,7 @@ void setupScreenDraw(LGFX* lcd, int remainSec) {
   lcd->fillScreen(TFT_BLACK);
   lcd->setTextColor(TFT_WHITE, TFT_BLACK);
   lcd->setTextDatum(TC_DATUM);
-  lcd->setFont(&fonts::efontCN_12);
+  lcd->setFont(&radar_fonts::cn12);
   lcd->setTextSize(1.5f);
 
   char line[48];
@@ -196,14 +209,16 @@ void setupScreenShowSaved(LGFX* lcd, const char* ssid) {
   lcd->fillScreen(TFT_BLACK);
   lcd->setTextColor(TFT_WHITE, TFT_BLACK);
   lcd->setTextDatum(MC_DATUM);
-  lcd->setFont(&fonts::efontCN_12);
+  lcd->setFont(&radar_fonts::cn12);
   lcd->setTextSize(1.6f);
   lcd->drawString("配置已保存", LCD_WIDTH / 2, 92);
 
   lcd->setTextSize(1.25f);
   lcd->drawString("正在连接 WiFi", LCD_WIDTH / 2, 126);
 
-  if (ssid && ssid[0]) {
+  // 子集只覆盖 ASCII SSID。非 ASCII 名称仍完整保存和联网，但设备屏幕不
+  // 尝试用缺字字体显示；上方两行固定中文已足够确认配置成功。
+  if (isPrintableAscii(ssid)) {
     lcd->setTextSize(1.0f);
     lcd->drawString(ssid, LCD_WIDTH / 2, 154);
   }
