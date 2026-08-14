@@ -30,17 +30,28 @@ struct PortalNetwork {
 
 static PortalNetwork s_portalNetworks[24];
 static int s_portalNetworkCount = 0;
+static int s_portalChannel = 1;
+
+static constexpr int kPortalChannels[] = {1, 6, 11};
+static uint32_t s_portalChannelScores[3]{};
 
 static void resetPortalWifiRadio() {
   WiFi.scanDelete();
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
-  WiFi.softAPdisconnect(true);
-  delay(120);
-  WiFi.disconnect(true, true);
-  delay(120);
-  WiFi.mode(WIFI_OFF);
-  delay(350);
+  const wifi_mode_t mode = WiFi.getMode();
+  if ((mode & WIFI_MODE_AP) != 0) {
+    WiFi.softAPdisconnect(true);
+    delay(120);
+  }
+  if ((mode & WIFI_MODE_STA) != 0) {
+    WiFi.disconnect(true, true);
+    delay(120);
+  }
+  if (mode != WIFI_MODE_NULL) {
+    WiFi.mode(WIFI_OFF);
+    delay(350);
+  }
 }
 
 static AppWifiMode portalModeForAuth(wifi_auth_mode_t auth) {
@@ -78,6 +89,7 @@ static const char* portalAuthLabel(AppWifiMode mode) {
 
 static void scanPortalNetworks() {
   s_portalNetworkCount = 0;
+  memset(s_portalChannelScores, 0, sizeof(s_portalChannelScores));
   for (PortalNetwork& network : s_portalNetworks) {
     network.ssid = "";
   }
@@ -86,10 +98,23 @@ static void scanPortalNetworks() {
   const int found = WiFi.scanNetworks(false, true);
   for (int i = 0; i < found; ++i) {
     const String ssid = WiFi.SSID(i);
+    const int32_t rssi = WiFi.RSSI(i);
+    const int channel = WiFi.channel(i);
+
+    // 2.4 GHz 信道相差不足 5 时频谱仍有重叠；强 AP 给予更高权重。
+    const uint32_t strength =
+        rssi <= -95 ? 1U : (uint32_t)(rssi >= -30 ? 65 : rssi + 95);
+    for (size_t c = 0;
+         c < sizeof(kPortalChannels) / sizeof(kPortalChannels[0]); ++c) {
+      const int distance = abs(channel - kPortalChannels[c]);
+      if (distance < 5) {
+        s_portalChannelScores[c] += strength * (uint32_t)(5 - distance);
+      }
+    }
+
     if (ssid.length() == 0 || ssid == SOFTAP_SSID) {
       continue;
     }
-    const int32_t rssi = WiFi.RSSI(i);
     const wifi_auth_mode_t auth = WiFi.encryptionType(i);
     int existing = -1;
     for (int j = 0; j < s_portalNetworkCount; ++j) {
@@ -121,6 +146,19 @@ static void scanPortalNetworks() {
     network.mode = portalModeForAuth(auth);
   }
   WiFi.scanDelete();
+
+  size_t bestChannel = 0;
+  for (size_t c = 1;
+       c < sizeof(kPortalChannels) / sizeof(kPortalChannels[0]); ++c) {
+    if (s_portalChannelScores[c] < s_portalChannelScores[bestChannel]) {
+      bestChannel = c;
+    }
+  }
+  s_portalChannel = kPortalChannels[bestChannel];
+  Serial.printf("portal channel scores: ch1=%lu ch6=%lu ch11=%lu select=%d\n",
+                (unsigned long)s_portalChannelScores[0],
+                (unsigned long)s_portalChannelScores[1],
+                (unsigned long)s_portalChannelScores[2], s_portalChannel);
 
   bool seedFound = false;
   for (int i = 0; i < s_portalNetworkCount; ++i) {
@@ -392,6 +430,15 @@ static void handleRoot() {
                   "<option value=\"0\" selected>隐藏</option>");
   html += F("</select>"
             "<p class=\"hint\">标示当前雷达中心位置。</p></div>"
+            "<div class=\"setting\"><label>动态风场粒子</label><select name=\"show_wind\" "
+            "autocomplete=\"off\">");
+  html += s_seedCfg.show_wind_particles
+              ? F("<option value=\"1\" selected>开启</option>"
+                  "<option value=\"0\">关闭</option>")
+              : F("<option value=\"1\">开启</option>"
+                  "<option value=\"0\" selected>关闭</option>");
+  html += F("</select>"
+            "<p class=\"hint\">持续播放当前 10 米风场；气象数据约每小时更新，雷达更新期间自动降帧。</p></div>"
             "<div class=\"setting\"><label>启动默认缩放等级</label><select name=\"default_zoom\" "
             "autocomplete=\"off\">");
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
@@ -412,7 +459,7 @@ static void handleRoot() {
             "短按 S 键切换缩放。若设备正在下载或生成缓存，响应可能延迟数秒；等待进度完成后会恢复，通常无需重新配置 WiFi。</div>"
             "</section><div class=\"actions\"><button type=\"submit\">保存并连接目标 WiFi</button>"
             "<p class=\"hint footerhint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>"
-            "<footer class=\"footer\">项目源码<span class=\"url\">"
+            "<footer class=\"footer\">风场数据 Open-Meteo / ECMWF<span class=\"url\">https://open-meteo.com/</span><br>项目源码<span class=\"url\">"
             "https://github.com/JStone2934/DesktopRadar/tree/esp32c3</span></footer>"
             "<script>"
             "function pickScan(){var s=document.getElementById('scan'),x=s.options[s.selectedIndex];"
@@ -653,6 +700,7 @@ static const char* parseForm(AppConfig* cfg) {
   cfg->show_progress = (s_server->arg("show_ring") != "0");
   cfg->show_alert_ring = (s_server->arg("show_alert") == "1");
   cfg->show_crosshair = (s_server->arg("show_crosshair") != "0");
+  cfg->show_wind_particles = (s_server->arg("show_wind") == "1");
 
   String defaultZoomStr = s_server->arg("default_zoom");
   defaultZoomStr.trim();
@@ -709,10 +757,11 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d defZoom=%d\n",
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d wind=%d defZoom=%d\n",
                 (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
                 (int)cfg.show_progress, (int)cfg.show_alert_ring,
-                (int)cfg.show_crosshair, cfg.default_zoom);
+                (int)cfg.show_crosshair, (int)cfg.show_wind_particles,
+                cfg.default_zoom);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();
   s_server->sendHeader("Location", "/done", true);
@@ -760,8 +809,10 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   const IPAddress subnet(255, 255, 255, 0);
   const IPAddress leaseStart(192, 168, 4, 20);
   const bool apConfigOk = WiFi.softAPConfig(apIP, gateway, subnet, leaseStart);
-  const bool apOk = WiFi.softAP(SOFTAP_SSID, SOFTAP_PASS, 6, 0, 4);
+  const bool apOk =
+      WiFi.softAP(SOFTAP_SSID, SOFTAP_PASS, s_portalChannel, 0, 4);
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   esp_wifi_set_ps(WIFI_PS_NONE);
   delay(250);
 
@@ -769,10 +820,11 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   const bool modeOk = (WiFi.getMode() & WIFI_AP) != 0;
   const bool configOk = ip == apIP;
   Serial.printf(
-      "SoftAP %s WPA2 channel=6 mode=%d ip=%d dhcp=%d ap=%d IP=%s "
+      "SoftAP %s WPA2 channel=%d mode=%d ip=%d dhcp=%d ap=%d IP=%s "
       "leaseStart=%s\n",
-      SOFTAP_SSID, (int)modeOk, (int)configOk, (int)apConfigOk, (int)apOk,
-      ip.toString().c_str(), leaseStart.toString().c_str());
+      SOFTAP_SSID, s_portalChannel, (int)modeOk, (int)configOk,
+      (int)apConfigOk, (int)apOk, ip.toString().c_str(),
+      leaseStart.toString().c_str());
 
   WebServer server(80);
   s_server = &server;
@@ -799,13 +851,20 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
     setupScreenDraw(lcd, (int)((timeoutMs + 999) / 1000));
   }
 
-  const uint32_t start = millis();
+  uint32_t idleElapsedMs = 0;
+  uint32_t lastTickAt = millis();
+  uint32_t lastStationSeenAt = 0;
+  int lastStationCount = -1;
+  bool everHadStation = false;
   int lastRemain = -1;
   bool waitingDrawn = false;
   PortalResult result = PortalResult::TimedOut;
 
   while (true) {
     server.handleClient();
+    const uint32_t now = millis();
+    const uint32_t tickMs = now - lastTickAt;
+    lastTickAt = now;
 
     // POST 已成功但浏览器未拉 /done：约 1.5s 后仍关闭门户
     if (!s_saved && s_saveRedirectAt != 0 &&
@@ -825,15 +884,47 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
     }
 
     const ButtonEvent ev = buttonPoll();
-    if (ev == ButtonEvent::ShortPress) {
-      Serial.println("portal skipped by S key");
+    bool serialSkip = false;
+    while (Serial.available() > 0) {
+      const int ch = Serial.read();
+      if (ch == 's' || ch == 'S') {
+        serialSkip = true;
+      }
+    }
+    // 配置页只需要确认用户有意按下 S，不必等松手后的短按分类。
+    // 这样即使 GPIO 边沿中断偶发漏报，5ms 轮询也能立即响应。
+    if (ev == ButtonEvent::ShortPress || ev == ButtonEvent::LongPress ||
+        buttonIsDown() || serialSkip) {
+      Serial.printf("portal skipped by S key event=%u down=%d serial=%d\n",
+                    (unsigned)ev, (int)buttonIsDown(), (int)serialSkip);
+      // 等待松手并吃掉锁存事件，防止进入雷达页后紧接着误切一次缩放。
+      const uint32_t releaseDeadline = millis() + BTN_LONG_MS + 500UL;
+      while (buttonIsDown() && millis() < releaseDeadline) {
+        server.handleClient();
+        delay(5);
+      }
+      buttonPoll();
       result = PortalResult::SkippedByButton;
       break;
     }
 
-    // 用户手动打开页面后不再自动关闭；页面未打开时，手机仍连接热点也
-    // 暂停倒计时，避免刚准备输入时被 60 秒超时打断。
-    const bool holdOpen = s_webActive || (WiFi.softAPgetStationNum() > 0);
+    const int stationCount = WiFi.softAPgetStationNum();
+    if (stationCount != lastStationCount) {
+      Serial.printf("portal stations: %d -> %d\n", lastStationCount,
+                    stationCount);
+      lastStationCount = stationCount;
+    }
+    if (stationCount > 0) {
+      everHadStation = true;
+      lastStationSeenAt = now;
+    }
+    const bool reconnectGrace =
+        everHadStation && stationCount == 0 &&
+        (now - lastStationSeenAt) < CONFIG_PORTAL_RECONNECT_GRACE_MS;
+
+    // 只累计真正无人连接且不在重连宽限期的时间。旧实现用启动后的墙钟
+    // 时间，导致手机连接超过 3 分钟后只要瞬断一次就立即关闭热点。
+    const bool holdOpen = s_webActive || stationCount > 0 || reconnectGrace;
     if (holdOpen) {
       if (lcd && !waitingDrawn && s_webActive) {
         waitingDrawn = true;
@@ -843,14 +934,17 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
       continue;
     }
 
-    const uint32_t elapsed = millis() - start;
-    if (elapsed >= timeoutMs) {
-      Serial.println("portal timeout");
+    idleElapsedMs += tickMs;
+    if (idleElapsedMs >= timeoutMs) {
+      Serial.printf("portal timeout idle=%lus everStation=%d\n",
+                    (unsigned long)(idleElapsedMs / 1000UL),
+                    (int)everHadStation);
       result = PortalResult::TimedOut;
       break;
     }
 
-    const int remain = (int)((timeoutMs - elapsed + 999) / 1000);
+    const int remain =
+        (int)((timeoutMs - idleElapsedMs + 999) / 1000);
     if (lcd && remain != lastRemain) {
       lastRemain = remain;
       setupScreenUpdateStatus(lcd, remain);

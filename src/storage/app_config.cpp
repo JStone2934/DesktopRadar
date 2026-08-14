@@ -17,6 +17,7 @@ static constexpr const char* kKeyLon = "lon";
 static constexpr const char* kKeyShowRing = "show_ring";
 static constexpr const char* kKeyAlertRing = "alert_ring";
 static constexpr const char* kKeyCrosshair = "crosshair";
+static constexpr const char* kKeyWindParticles = "wind_particles";
 static constexpr const char* kKeyDefaultZoom = "def_zoom";
 
 static int clampZoom(int zoom) {
@@ -60,6 +61,7 @@ void appConfigSetDefaults(AppConfig* cfg) {
   cfg->show_progress = true;
   cfg->show_alert_ring = false;
   cfg->show_crosshair = true;
+  cfg->show_wind_particles = false;
   cfg->default_zoom = clampZoom(MAP_ZOOM);
 }
 
@@ -105,6 +107,7 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->show_progress = prefs.getBool(kKeyShowRing, true);
   cfg->show_alert_ring = prefs.getBool(kKeyAlertRing, false);
   cfg->show_crosshair = prefs.getBool(kKeyCrosshair, true);
+  cfg->show_wind_particles = prefs.getBool(kKeyWindParticles, false);
   cfg->default_zoom = clampZoom(prefs.getInt(kKeyDefaultZoom, MAP_ZOOM));
   prefs.end();
 
@@ -116,11 +119,12 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->identity[sizeof(cfg->identity) - 1] = '\0';
   strncpy(cfg->outer_identity, outerId.c_str(), sizeof(cfg->outer_identity) - 1);
   cfg->outer_identity[sizeof(cfg->outer_identity) - 1] = '\0';
-  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d defZoom=%d\n",
+  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d defZoom=%d\n",
                 (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
                 cfg->outer_identity, (int)cfg->show_crosshair,
+                (int)cfg->show_wind_particles,
                 cfg->default_zoom);
 
   if (cfg->ssid[0] == '\0') {
@@ -155,13 +159,15 @@ bool appConfigSave(const AppConfig* cfg) {
   prefs.putBool(kKeyShowRing, cfg->show_progress);
   prefs.putBool(kKeyAlertRing, cfg->show_alert_ring);
   prefs.putBool(kKeyCrosshair, cfg->show_crosshair);
+  prefs.putBool(kKeyWindParticles, cfg->show_wind_particles);
   prefs.putInt(kKeyDefaultZoom, clampZoom(cfg->default_zoom));
   prefs.end();
-  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d defZoom=%d\n",
+  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d defZoom=%d\n",
                 (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
                 cfg->outer_identity, (int)cfg->show_crosshair,
+                (int)cfg->show_wind_particles,
                 clampZoom(cfg->default_zoom));
   return true;
 }

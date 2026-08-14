@@ -11,6 +11,9 @@ enum class ButtonEvent : uint8_t {
 
 void buttonBegin();
 
+/** 只采样并锁存事件，不消费；供整屏绘制/网络阻塞路径频繁调用。 */
+void buttonService();
+
 /** 非阻塞取事件；松手时根据按住时长产生一次。
  *  边沿由 GPIO 中断锁存，避免 http.GET 等长时间阻塞丢短按。
  */

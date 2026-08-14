@@ -121,3 +121,12 @@ bool progressRingHide(LGFX* lcd, int underlayZoom) {
   s_lastHalf = 0;
   return true;
 }
+
+void progressRingRedraw(LGFX* lcd) {
+  if (!lcd || !s_barVisible || s_lastDone < 0.0f || s_lastDone >= 0.998f) {
+    return;
+  }
+  s_lastHalf = 0;
+  paintBar(lcd, s_lastDone);
+  s_lastDrawMs = millis();
+}

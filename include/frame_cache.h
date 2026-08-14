@@ -97,6 +97,16 @@ bool frameCacheCreateRgb565(int zoom, uint16_t backdropColor);
 /** 将内存中的 240×240 RGB565 写入 .rgb565.new（不覆盖旧成品）。 */
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame);
 
+/** 清空并创建 .rgb565.new，供低内存分段造片。 */
+bool frameCacheBeginRgb565New(int zoom);
+
+/**
+ * 将连续若干行写入 .rgb565.new；调用前须 frameCacheBeginRgb565New。
+ * frame 只需容纳 rowCount×LCD_WIDTH 个 RGB565 像素。
+ */
+bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
+                               const uint16_t* frame);
+
 /** 读已就绪静帧到内存缓冲（需 FRAME_RGB565_BYTES）。 */
 bool frameCacheLoadRgb565(int zoom, uint16_t* frame);
 
@@ -115,6 +125,14 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
                                 const char* alphaPath, int pasteX, int pasteY,
                                 int scale, bool alphaKey,
                                 RadarCenterSample* centerOut = nullptr);
+
+/**
+ * frameCacheStampRawToBuffer 的分段版本；frame 的第 0 行对应屏幕 bandY。
+ */
+bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
+                              const char* rawPath, const char* alphaPath,
+                              int pasteX, int pasteY, int scale, bool alphaKey,
+                              RadarCenterSample* centerOut = nullptr);
 
 /**
  * 将 256×256 RGB565 瓦片写入成品文件（慢，仅兼容保留）。
@@ -140,6 +158,10 @@ void radarCenterSampleReset(RadarCenterSample* s);
 /** 在内存帧上画十字准星（含中心红点）。 */
 void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color);
 
+/** 在内存帧分段上画十字准星；frame 第 0 行对应屏幕 bandY。 */
+void frameCacheDrawCrosshairBand(uint16_t* frame, int bandY, int bandHeight,
+                                 uint16_t color);
+
 /** 在成品文件上画十字准星（含中心红点）。 */
 bool frameCacheDrawCrosshair(int zoom, uint16_t color);
 
@@ -148,6 +170,10 @@ bool frameCacheDrawCrosshair(int zoom, uint16_t color);
  * frameTs==0 时显示 --- --:--。
  */
 void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs);
+
+/** 在内存帧分段上烘焙信息条；frame 第 0 行对应屏幕 bandY。 */
+void frameCacheDrawOverlayBand(uint16_t* frame, int bandY, int bandHeight,
+                               uint32_t frameTs);
 
 /** 校验 .rgb565.new 后替换正式文件、写 ready，并删除临时 PNG/meta。 */
 bool frameCacheCommit(int zoom);

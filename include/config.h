@@ -35,6 +35,7 @@
 #define SOFTAP_PASS "radar1234"
 #define CONFIG_PORTAL_URL "http://192.168.4.1"
 #define CONFIG_PORTAL_TIMEOUT_MS 180000
+#define CONFIG_PORTAL_RECONNECT_GRACE_MS 60000
 
 // ---- 地图中心：广州市区 ----
 #define MAP_LAT 23.1291f
@@ -56,11 +57,12 @@
 
 // ---- S 键（板载 GPIO9）----
 #define PIN_BTN_BOOT 9
-// S 键释放在 1.5s 内按“短按切缩放”处理；按住满 0.5s 开始反馈，满 2s 立刻跳回默认缩放档。
-#define BTN_MED_MS 1500
+// S 键：18ms 以上即视为有效按压；未达到长按阈值的释放全部切缩放，
+// 不再保留 1.5–2.0s 的无响应死区。按住 350ms 开始十字反馈，1.8s 回默认档。
+#define BTN_MED_MS 1800
 #define BTN_SHORT_MS BTN_MED_MS
-#define BTN_LONG_FEEDBACK_MS 500
-#define BTN_LONG_MS 2000
+#define BTN_LONG_FEEDBACK_MS 350
+#define BTN_LONG_MS 1800
 
 // 用户切换后暂停后台预取，避免下载/烘焙任务连续抢占按键响应。
 #define CACHE_PAUSE_AFTER_USER_MS 10000UL
@@ -82,6 +84,26 @@
 #define TILE_TIMEOUT_MS 10000
 #define HTTP_MAX_JSON_BYTES (32 * 1024)
 #define HTTP_MAX_TILE_BYTES (96 * 1024)
+
+// ---- 当前 10m 风场粒子 ----
+// Open-Meteo ECMWF：7x7 当前视口网格；显示层按屏幕位置双线性插值。
+#define WIND_API "https://api.open-meteo.com/v1/ecmwf"
+#define WIND_GRID_N 7
+#define WIND_PARTICLE_COUNT 56
+#define WIND_TRAIL_POINTS 4
+#define WIND_FRAME_MS 167UL       // 正常约 6 FPS
+#define WIND_BUSY_FRAME_MS 500UL  // HTTPS / PNG / 造片期间约 2 FPS
+#define WIND_FIELD_REFRESH_MS (60UL * 60UL * 1000UL)
+#define WIND_FIELD_RETRY_MS (30UL * 1000UL)
+#define WIND_FIELD_SLOW_RETRY_MS (10UL * 60UL * 1000UL)
+#define WIND_FIELD_FAST_RETRY_LIMIT 3
+#define WIND_FIELD_SETTLE_MS 800UL
+#define WIND_HTTP_TIMEOUT_MS 20000UL
+#define WIND_MAX_JSON_BYTES (28UL * 1024UL)
+
+// 风场模式静态图分级刷新：全档成品一直保留，过时档在后台重建。
+#define WIND_ADJACENT_REFRESH_MS (15UL * 60UL * 1000UL)
+#define WIND_FAR_REFRESH_MS (45UL * 60UL * 1000UL)
 
 #define FRAME_RGB565_BYTES (LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t))
 #define FRAME_ROW_BYTES (LCD_WIDTH * sizeof(uint16_t))

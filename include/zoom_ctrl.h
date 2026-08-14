@@ -24,6 +24,9 @@ bool zoomCanCompose(int zoom);
 /** 清空并按距离排队入队可用档（跳过 ZOOM_SKIP）：当前档优先，再 ±1、±2… */
 void zoomPrefetchResetAround(int centerZoom);
 
+/** 限制 ResetAround 的邻档半径。全档秒切模式使用最大半径。 */
+void zoomSetPrefetchRadius(int radius);
+
 /** 取出下一个预取目标；无则返回 false。 */
 bool zoomPrefetchPop(int* outZoom);
 
@@ -58,3 +61,7 @@ void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn);
  * HTTP / 造片长循环里应频繁调用。
  */
 void inputServiceDuringBlock();
+
+/** 注册阻塞 HTTP/解码循环中的 UI 泵；用于保持风场动画。 */
+typedef void (*BlockingUiServiceFn)();
+void inputSetBlockingUiService(BlockingUiServiceFn fn);

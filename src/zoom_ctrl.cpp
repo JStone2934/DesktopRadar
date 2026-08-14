@@ -13,6 +13,8 @@ static uint32_t s_prefetchCoolUntil[ZOOM_MAX - ZOOM_MIN + 1];
 static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
 static ZoomPendingFeedbackFn s_pendingFeedback = nullptr;
+static BlockingUiServiceFn s_blockingUiService = nullptr;
+static int s_prefetchRadius = ZOOM_MAX - ZOOM_MIN;
 
 static constexpr uint32_t kPrefetchFailCoolMs = 45000UL;
 
@@ -117,11 +119,22 @@ static void enqueueUnique(int zoom) {
 void zoomPrefetchResetAround(int centerZoom) {
   s_prefetchLen = 0;
   enqueueUnique(centerZoom);
-  const int maxDelta = ZOOM_MAX - ZOOM_MIN;
+  const int maxDelta = s_prefetchRadius;
   for (int delta = 1; delta <= maxDelta; ++delta) {
     enqueueUnique(centerZoom - delta);
     enqueueUnique(centerZoom + delta);
   }
+}
+
+void zoomSetPrefetchRadius(int radius) {
+  const int maxRadius = ZOOM_MAX - ZOOM_MIN;
+  if (radius < 0) {
+    radius = 0;
+  } else if (radius > maxRadius) {
+    radius = maxRadius;
+  }
+  s_prefetchRadius = radius;
+  zoomPrefetchClear();
 }
 
 bool zoomPrefetchPop(int* outZoom) {
@@ -165,7 +178,14 @@ void zoomSetPendingFeedback(ZoomPendingFeedbackFn fn) {
   s_pendingFeedback = fn;
 }
 
+void inputSetBlockingUiService(BlockingUiServiceFn fn) {
+  s_blockingUiService = fn;
+}
+
 void inputServiceDuringBlock() {
+  if (s_blockingUiService) {
+    s_blockingUiService();
+  }
   const ButtonEvent ev = buttonPoll();
   if (ev != ButtonEvent::ShortPress && ev != ButtonEvent::LongPress) {
     return;

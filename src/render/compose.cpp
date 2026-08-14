@@ -550,9 +550,15 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   int decoded = 0;
   int baseDecoded = 0;
   const int bakeTiles = baseTiles + (radarOk > 0 ? radarTiles : 0);
-  auto afterBakeStep = [&](int step) {
+  constexpr int kComposeBandRows = LCD_HEIGHT / 2;
+  const int composeBandCount =
+      (LCD_HEIGHT + kComposeBandRows - 1) / kComposeBandRows;
+  const int bakeWorkTotal = bakeTiles * (1 + composeBandCount);
+  int bakeWorkDone = 0;
+  auto afterBakeStep = [&]() {
+    ++bakeWorkDone;
     const float frac =
-        bakeTiles > 0 ? (float)step / (float)(bakeTiles * 2) : 1.0f;
+        bakeWorkTotal > 0 ? (float)bakeWorkDone / (float)bakeWorkTotal : 1.0f;
     reportComposeProgress(zoom, 0.78f + 0.20f * frac);
   };
 
@@ -568,7 +574,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       } else {
         Serial.printf("  basemap decode FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
       }
-      afterBakeStep(decoded);
+      afterBakeStep();
     }
   }
   if (baseDecoded < baseTiles) {
@@ -586,7 +592,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         if (decodeOne(true, tx, ty, true)) {
           ++decoded;
         }
-        afterBakeStep(decoded);
+        afterBakeStep();
       }
     }
   }
@@ -594,19 +600,30 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                 baseTiles);
 
   reportComposeProgress(zoom, 0.90f);
-  logHeap("malloc-frame");
-  uint16_t* frame = (uint16_t*)malloc(FRAME_RGB565_BYTES);
-  if (!frame) {
-    Serial.printf("frame malloc fail max=%u\n", ESP.getMaxAllocHeap());
+  const size_t composeBandBytes =
+      (size_t)LCD_WIDTH * kComposeBandRows * sizeof(uint16_t);
+  logHeap("malloc-frame-band");
+  uint16_t* frameBand = (uint16_t*)malloc(composeBandBytes);
+  if (!frameBand) {
+    Serial.printf("frame band malloc fail need=%u max=%u\n",
+                  (unsigned)composeBandBytes, ESP.getMaxAllocHeap());
     return false;
   }
-  const uint16_t bg = backdropColor(lcd);
-  for (size_t i = 0; i < (size_t)LCD_WIDTH * LCD_HEIGHT; ++i) {
-    frame[i] = bg;
+  Serial.printf("frame band ok bytes=%u bands=%d maxAfter=%u\n",
+                (unsigned)composeBandBytes, composeBandCount,
+                ESP.getMaxAllocHeap());
+
+  if (!frameCacheBeginRgb565New(zoom)) {
+    Serial.println("beginRgb565New fail");
+    free(frameBand);
+    return false;
   }
 
-  auto stampOne = [&](bool isRadar, int tx, int ty, int sc,
-                      bool withAlpha, RadarCenterSample* centerOut) -> bool {
+  const uint16_t bg = backdropColor(lcd);
+
+  auto stampOne = [&](int bandY, int bandRows, bool cleanup, bool isRadar,
+                      int tx, int ty, int sc, bool withAlpha,
+                      RadarCenterSample* centerOut) -> bool {
     snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
              isRadar ? 'r' : 'b', tx, ty);
     if (!LittleFS.exists(rawPath)) {
@@ -622,11 +639,14 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
     const int oy =
         (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
-    const bool ok = frameCacheStampRawToBuffer(frame, rawPath, ap, ox, oy, sc,
-                                               withAlpha, centerOut);
-    LittleFS.remove(rawPath);
-    if (ap) {
-      LittleFS.remove(ap);
+    const bool ok = frameCacheStampRawToBand(
+        frameBand, bandY, bandRows, rawPath, ap, ox, oy, sc, withAlpha,
+        centerOut);
+    if (cleanup) {
+      LittleFS.remove(rawPath);
+      if (ap) {
+        LittleFS.remove(ap);
+      }
     }
     return ok;
   };
@@ -636,44 +656,106 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   int stamped = 0;
   int baseStamped = 0;
-  for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
-    for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
-      pollButtonDuringCompose();
-      if (composeAbortRequested()) {
-        free(frame);
-        return false;
-      }
-      if (stampOne(false, tx, ty, 1, false, nullptr)) {
-        ++stamped;
-        ++baseStamped;
-      } else {
-        Serial.printf("  basemap stamp FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
-      }
-      afterBakeStep(decoded + stamped);
+  const bool prevSwap = lcd->getSwapBytes();
+  if (pushToDisplay) {
+    lcd->setSwapBytes(true);
+  }
+
+  for (int bandY = 0; bandY < LCD_HEIGHT; bandY += kComposeBandRows) {
+    const int bandRows =
+        min(kComposeBandRows, (int)LCD_HEIGHT - bandY);
+    const bool lastBand = bandY + bandRows >= LCD_HEIGHT;
+    const size_t bandPixels = (size_t)LCD_WIDTH * bandRows;
+    for (size_t i = 0; i < bandPixels; ++i) {
+      frameBand[i] = bg;
     }
-  }
-  if (baseStamped < baseTiles) {
-    Serial.printf("basemap stamp incomplete %d/%d — leave black quadrant, "
-                  "abort commit\n",
-                  baseStamped, baseTiles);
-    free(frame);
-    return false;
-  }
-  if (radarOk > 0) {
-    for (int ty = rty0; ty <= rty1; ++ty) {
-      for (int tx = rtx0; tx <= rtx1; ++tx) {
+
+    int baseBandStamped = 0;
+    for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
+      for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
         pollButtonDuringCompose();
         if (composeAbortRequested()) {
-          free(frame);
+          if (pushToDisplay) {
+            lcd->setSwapBytes(prevSwap);
+          }
+          free(frameBand);
           return false;
         }
-        if (stampOne(true, tx, ty, scale, true, &centerSample)) {
-          ++stamped;
+        if (stampOne(bandY, bandRows, lastBand, false, tx, ty, 1, false,
+                     nullptr)) {
+          ++baseBandStamped;
+        } else {
+          Serial.printf("  basemap stamp FAIL z=%d x=%d y=%d bandY=%d\n",
+                        zoom, tx, ty, bandY);
         }
-        afterBakeStep(decoded + stamped);
+        afterBakeStep();
       }
     }
+    if (baseBandStamped < baseTiles) {
+      Serial.printf("basemap band stamp incomplete %d/%d y=%d — abort commit\n",
+                    baseBandStamped, baseTiles, bandY);
+      if (pushToDisplay) {
+        lcd->setSwapBytes(prevSwap);
+      }
+      free(frameBand);
+      return false;
+    }
+    if (lastBand) {
+      baseStamped = baseBandStamped;
+      stamped += baseBandStamped;
+    }
+
+    if (radarOk > 0) {
+      for (int ty = rty0; ty <= rty1; ++ty) {
+        for (int tx = rtx0; tx <= rtx1; ++tx) {
+          pollButtonDuringCompose();
+          if (composeAbortRequested()) {
+            if (pushToDisplay) {
+              lcd->setSwapBytes(prevSwap);
+            }
+            free(frameBand);
+            return false;
+          }
+          if (stampOne(bandY, bandRows, lastBand, true, tx, ty, scale, true,
+                       &centerSample) &&
+              lastBand) {
+            ++stamped;
+          }
+          afterBakeStep();
+        }
+      }
+    }
+
+    if (s_crosshairVisible) {
+      frameCacheDrawCrosshairBand(frameBand, bandY, bandRows,
+                                  lcd->color565(255, 255, 255));
+    }
+    frameCacheDrawOverlayBand(frameBand, bandY, bandRows,
+                              haveRadarMeta ? meta.time : 0);
+
+    if (!frameCacheWriteRgb565Band(zoom, bandY, bandRows, frameBand)) {
+      Serial.printf("writeRgb565 band fail y=%d rows=%d\n", bandY, bandRows);
+      if (pushToDisplay) {
+        lcd->setSwapBytes(prevSwap);
+      }
+      free(frameBand);
+      return false;
+    }
+    if (pushToDisplay) {
+      lcd->pushImage(0, bandY, LCD_WIDTH, bandRows, frameBand);
+    }
+    Serial.printf("frame band done y=%d rows=%d heap=%u max=%u\n", bandY,
+                  bandRows, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   }
+
+  if (pushToDisplay) {
+    lcd->setSwapBytes(prevSwap);
+    // 两个分段均上屏后再同步显示档，避免状态指向半帧。
+    if (s_displayFn) {
+      s_displayFn(zoom);
+    }
+  }
+  free(frameBand);
 
   Serial.printf("Stamped tiles=%d (base=%d/%d) fs used=%u/%u\n", stamped,
                 baseStamped, baseTiles, (unsigned)LittleFS.usedBytes(),
@@ -687,44 +769,18 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                 (unsigned)alertColor, (unsigned)centerSample.maxAlpha);
 
   reportComposeProgress(zoom, 0.97f);
-  if (s_crosshairVisible) {
-    frameCacheDrawCrosshairBuf(frame, lcd->color565(255, 255, 255));
-  }
-  frameCacheDrawOverlayBuf(frame, haveRadarMeta ? meta.time : 0);
   if (haveRadarMeta && meta.time != 0) {
     frameCacheWriteRadarTime(zoom, meta.time);
   }
 
-  if (pushToDisplay) {
-    // 即使不 commit 也先刷一帧，避免接口抖动时黑屏
-    lcd->setSwapBytes(true);
-    lcd->pushImage(0, 0, LCD_WIDTH, LCD_HEIGHT, frame);
-    lcd->setSwapBytes(false);
-    // 立即通知主循环：LCD 已切到本档，同步 s_displayedZoom / 预警环 underlay，
-    // 避免后续 reportComposeProgress → pumpAlertRingDuringCompose 用旧档底图
-    if (s_displayFn) {
-      s_displayFn(zoom);
-    }
-  }
-
   if (!allowCommit) {
     if (pushToDisplay) {
-      // 已上屏；替换 Flash 旧图供进度环，但不标 ready（无雷达不秒切）
-      if (frameCacheWriteRgb565(zoom, frame)) {
-        frameCachePromoteNewNoReady(zoom);
-      }
+      // 已分段上屏并写完 .new；替换旧图供进度环，但不标 ready。
+      frameCachePromoteNewNoReady(zoom);
     }
-    free(frame);
     Serial.println("compose display-only (no radar cache commit)");
     return pushToDisplay;
   }
-
-  if (!frameCacheWriteRgb565(zoom, frame)) {
-    Serial.println("writeRgb565 fail");
-    free(frame);
-    return false;
-  }
-  free(frame);
 
   if (!frameCacheCommit(zoom)) {
     Serial.println("commit fail");

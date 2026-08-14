@@ -1,5 +1,7 @@
 #include "frame_cache.h"
 
+#include "button.h"
+
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <math.h>
@@ -106,6 +108,11 @@ static bool blitRgb565File(LGFX* lcd, File& f) {
   lcd->setSwapBytes(true);
   uint16_t row[LCD_WIDTH];
   for (int y = 0; y < LCD_HEIGHT; ++y) {
+    // 风场约每 167 ms 整屏重绘；在行刷期间持续采样，避免一个快速短按
+    // 完整落入约 80 ms 的 blit 窗口而被主循环漏掉。事件只锁存，不在此处理。
+    if ((y & 3) == 0) {
+      buttonService();
+    }
     if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
         (int)FRAME_ROW_BYTES) {
       lcd->setSwapBytes(prevSwap);
@@ -920,8 +927,8 @@ bool frameCacheCreateRgb565(int zoom, uint16_t backdropColor) {
   return ok;
 }
 
-bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
-  if (!frame) {
+bool frameCacheBeginRgb565New(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     return false;
   }
   char path[40];
@@ -931,11 +938,39 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
   if (!f) {
     return false;
   }
-  const size_t wrote =
-      f.write(reinterpret_cast<const uint8_t*>(frame), FRAME_RGB565_BYTES);
+  f.close();
+  return true;
+}
+
+bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
+                               const uint16_t* frame) {
+  if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX || startRow < 0 ||
+      rowCount < 1 || startRow + rowCount > LCD_HEIGHT) {
+    return false;
+  }
+  char path[40];
+  rgbNewPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "r+");
+  if (!f || !f.seek((size_t)startRow * FRAME_ROW_BYTES)) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+  const size_t bytes = (size_t)rowCount * FRAME_ROW_BYTES;
+  const size_t wrote = f.write(reinterpret_cast<const uint8_t*>(frame), bytes);
   f.flush();
   f.close();
-  if (wrote != FRAME_RGB565_BYTES) {
+  return wrote == bytes;
+}
+
+bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
+  if (!frame || !frameCacheBeginRgb565New(zoom)) {
+    return false;
+  }
+  if (!frameCacheWriteRgb565Band(zoom, 0, LCD_HEIGHT, frame)) {
+    char path[40];
+    rgbNewPath(zoom, path, sizeof(path));
     LittleFS.remove(path);
     return false;
   }
@@ -1131,11 +1166,12 @@ static inline void accumulateCenterSample(RadarCenterSample* centerOut, int x,
   centerOut->sumA += a;
 }
 
-bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
-                                const char* alphaPath, int pasteX, int pasteY,
-                                int scale, bool alphaKey,
-                                RadarCenterSample* centerOut) {
-  if (!frame || !rawPath || scale < 1) {
+bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
+                              const char* rawPath, const char* alphaPath,
+                              int pasteX, int pasteY, int scale, bool alphaKey,
+                              RadarCenterSample* centerOut) {
+  if (!frame || !rawPath || scale < 1 || bandY < 0 || bandHeight < 1 ||
+      bandY + bandHeight > LCD_HEIGHT) {
     return false;
   }
   File raw = LittleFS.open(rawPath, "r");
@@ -1168,7 +1204,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
   if (scale == 1) {
     for (int dy = 0; dy < TILE_SIZE; ++dy) {
       const int y = pasteY + dy;
-      if (y < 0 || y >= LCD_HEIGHT) {
+      if (y < bandY || y >= bandY + bandHeight) {
         if (!raw.seek((size_t)(dy + 1) * TILE_SIZE * 2)) {
           raw.close();
           if (useAlpha) {
@@ -1197,7 +1233,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
         alpha.close();
         return false;
       }
-      uint16_t* dst = frame + y * LCD_WIDTH;
+      uint16_t* dst = frame + (y - bandY) * LCD_WIDTH;
       for (int dx = 0; dx < TILE_SIZE; ++dx) {
         const int x = pasteX + dx;
         if (x < 0 || x >= LCD_WIDTH) {
@@ -1229,7 +1265,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
   int cachedY1 = -2;
   for (int dy = 0; dy < outH; ++dy) {
     const int y = pasteY + dy;
-    if (y < 0 || y >= LCD_HEIGHT) {
+    if (y < bandY || y >= bandY + bandHeight) {
       continue;
     }
     const float sy = ((float)dy + 0.5f) / (float)scale - 0.5f;
@@ -1283,7 +1319,7 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
       cachedY0 = y0;
       cachedY1 = y1;
     }
-    uint16_t* dst = frame + y * LCD_WIDTH;
+    uint16_t* dst = frame + (y - bandY) * LCD_WIDTH;
     const float fy = sy - (float)y0;
     for (int dx = 0; dx < outW; ++dx) {
       const int x = pasteX + dx;
@@ -1362,6 +1398,14 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
     alpha.close();
   }
   return true;
+}
+
+bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
+                                const char* alphaPath, int pasteX, int pasteY,
+                                int scale, bool alphaKey,
+                                RadarCenterSample* centerOut) {
+  return frameCacheStampRawToBand(frame, 0, LCD_HEIGHT, rawPath, alphaPath,
+                                  pasteX, pasteY, scale, alphaKey, centerOut);
 }
 
 static inline uint16_t bilSample(const uint16_t* tile, float sx, float sy) {
@@ -1474,39 +1518,44 @@ static inline uint16_t crosshairRed565() {
   return (uint16_t)(((255 & 0xF8) << 8) | ((60 & 0xFC) << 3) | (60 >> 3));
 }
 
-static void fillCrosshairDotBuf(uint16_t* frame, int cx, int cy,
-                                uint16_t red) {
+static inline void setBandPixel(uint16_t* frame, int bandY, int bandHeight,
+                                int x, int y, uint16_t color) {
+  if (x >= 0 && x < LCD_WIDTH && y >= bandY && y < bandY + bandHeight) {
+    frame[(y - bandY) * LCD_WIDTH + x] = color;
+  }
+}
+
+static void fillCrosshairDotBand(uint16_t* frame, int bandY, int bandHeight,
+                                 int cx, int cy, uint16_t red) {
   for (int dy = -3; dy <= 3; ++dy) {
     for (int dx = -3; dx <= 3; ++dx) {
       if (dx * dx + dy * dy > 9) {
         continue;
       }
-      const int x = cx + dx;
-      const int y = cy + dy;
-      if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
-        frame[y * LCD_WIDTH + x] = red;
-      }
+      setBandPixel(frame, bandY, bandHeight, cx + dx, cy + dy, red);
     }
   }
 }
 
-void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color) {
-  if (!frame) {
+void frameCacheDrawCrosshairBand(uint16_t* frame, int bandY, int bandHeight,
+                                 uint16_t color) {
+  if (!frame || bandY < 0 || bandHeight < 1 ||
+      bandY + bandHeight > LCD_HEIGHT) {
     return;
   }
   const int cx = LCD_WIDTH / 2;
   const int cy = LCD_HEIGHT / 2;
   for (int x = cx - 8; x <= cx + 8; ++x) {
-    if (x >= 0 && x < LCD_WIDTH) {
-      frame[cy * LCD_WIDTH + x] = color;
-    }
+    setBandPixel(frame, bandY, bandHeight, x, cy, color);
   }
   for (int y = cy - 8; y <= cy + 8; ++y) {
-    if (y >= 0 && y < LCD_HEIGHT) {
-      frame[y * LCD_WIDTH + cx] = color;
-    }
+    setBandPixel(frame, bandY, bandHeight, cx, y, color);
   }
-  fillCrosshairDotBuf(frame, cx, cy, crosshairRed565());
+  fillCrosshairDotBand(frame, bandY, bandHeight, cx, cy, crosshairRed565());
+}
+
+void frameCacheDrawCrosshairBuf(uint16_t* frame, uint16_t color) {
+  frameCacheDrawCrosshairBand(frame, 0, LCD_HEIGHT, color);
 }
 
 bool frameCacheDrawCrosshair(int zoom, uint16_t color) {
@@ -1575,8 +1624,12 @@ bool frameCacheDrawCrosshair(int zoom, uint16_t color) {
   return true;
 }
 
-void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
-  if (!frame) {
+void frameCacheDrawOverlayBand(uint16_t* frame, int bandY, int bandHeight,
+                               uint32_t frameTs) {
+  const int overlayTop = LCD_HEIGHT - OVERLAY_BAR_H;
+  if (!frame || bandY < 0 || bandHeight < 1 ||
+      bandY + bandHeight > LCD_HEIGHT || bandY + bandHeight <= overlayTop ||
+      bandY >= LCD_HEIGHT) {
     return;
   }
 
@@ -1593,17 +1646,21 @@ void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
     snprintf(label, sizeof(label), "%s %02d:%02d", wday, tm.tm_hour, tm.tm_min);
   }
 
-  // 复用帧缓冲，避免再堆分配 112KB sprite
+  // 复用分段帧缓冲，不额外分配 sprite 像素内存。
   lgfx::LGFX_Sprite spr;
   spr.setColorDepth(16);
-  spr.setBuffer(frame, LCD_WIDTH, LCD_HEIGHT, 16);
+  spr.setBuffer(frame, LCD_WIDTH, bandHeight, 16);
 
-  spr.fillRect(0, LCD_HEIGHT - OVERLAY_BAR_H, LCD_WIDTH, OVERLAY_BAR_H,
-               TFT_BLACK);
+  spr.fillRect(0, overlayTop - bandY, LCD_WIDTH, OVERLAY_BAR_H, TFT_BLACK);
   spr.setFont(&fonts::Font2);
   spr.setTextDatum(MC_DATUM);
   spr.setTextColor(TFT_WHITE, TFT_BLACK);
-  spr.drawString(label, LCD_WIDTH / 2, LCD_HEIGHT - OVERLAY_BAR_H / 2);
+  spr.drawString(label, LCD_WIDTH / 2,
+                 LCD_HEIGHT - OVERLAY_BAR_H / 2 - bandY);
+}
+
+void frameCacheDrawOverlayBuf(uint16_t* frame, uint32_t frameTs) {
+  frameCacheDrawOverlayBand(frame, 0, LCD_HEIGHT, frameTs);
 }
 
 bool frameCacheCommit(int zoom) {

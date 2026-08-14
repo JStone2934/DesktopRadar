@@ -12,3 +12,6 @@ bool progressRingUpdate(LGFX* lcd, float done01, int underlayZoom);
 
 /** 强制隐藏；若擦除了细条返回 true。 */
 bool progressRingHide(LGFX* lcd, int underlayZoom);
+
+/** 底图被整屏重刷后，按当前状态强制补画进度条。 */
+void progressRingRedraw(LGFX* lcd);
