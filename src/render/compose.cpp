@@ -468,6 +468,9 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   // 先腾出其它档临时文件，再下载，避免后下的底图因 Flash 满失败
   frameCacheScrubOrphansExcept(zoom);
+  if (composeAbortRequested()) {
+    return ComposeResult::Failed;
+  }
   // 只检查逐瓦片解码所需工作区；绝不为刷新删除其它档的已完成缓存。
   // 空间不足时本次刷新失败，旧图仍可秒切。
   constexpr size_t kBakeWorkspaceBytes =
@@ -787,6 +790,13 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   if (!allowCommit) {
     Serial.println("compose display-only (no radar cache commit)");
+    return ComposeResult::Failed;
+  }
+
+  // commit 会替换正式文件；进入这个很短的原子阶段前最后一次让按键抢占。
+  inputServiceDuringBlock();
+  if (composeAbortRequested()) {
+    Serial.printf("compose z%d preempted before commit\n", zoom);
     return ComposeResult::Failed;
   }
 

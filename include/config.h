@@ -97,7 +97,9 @@
 #define WIND_TRAIL_POINTS 4
 #define WIND_FRAME_MS 167UL       // 正常约 6 FPS
 // 后台造片允许变慢，但不能主动牺牲风场帧率。
-#define WIND_BUSY_FRAME_MS WIND_FRAME_MS
+// 下载/合成期间将风场降至约 2 FPS，把 CPU、SPI 和 LittleFS 时间片让给
+// 按键抢占；后台结束后立即恢复正常 6 FPS。
+#define WIND_BUSY_FRAME_MS 500UL
 #define WIND_FIELD_REFRESH_MS (60UL * 60UL * 1000UL)
 #define WIND_FIELD_RETRY_MS (30UL * 1000UL)
 #define WIND_FIELD_SLOW_RETRY_MS (10UL * 60UL * 1000UL)

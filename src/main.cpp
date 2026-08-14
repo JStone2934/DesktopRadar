@@ -19,6 +19,7 @@
 #include "config_portal.h"
 #include "frame_cache.h"
 #include "progress_ring.h"
+#include "radar_font.h"
 #include "rainviewer.h"
 #include "wifi_sta.h"
 #include "wind_field.h"
@@ -36,14 +37,22 @@ static bool s_wifiOk = false;
 static uint32_t s_wifiRetryAt = 0;
 static uint8_t s_wifiRetryStage = 0;
 static bool s_statusScreen = false;  // 首次 Fetching 黑底，不 blit 地图
+// 缺少任一缩放档时，保持黑底初始化画面，直到 ready=全档。
+static bool s_initialCacheScreen = false;
+static uint32_t s_initialPulseDrawAt = 0;
+static int s_initialPulseLevel = -1;
 static int s_bakeZoom = -1;
 static float s_bakeLocal = 0.0f;
 // 全档静帧曾铺满一次后进度条保持满（隐藏）
 static bool s_staticFullPassDone = false;
 // 用户交互后暂停后台预取（不挡定时雷达刷新）
 static uint32_t s_cachePauseUntil = 0;
+// 连续缩放时不逐档读取风场缓存；静止片刻后只加载最终停留档。
+static uint32_t s_windSelectNotBefore = 0;
 // 风场模式后台静态造片的最早启动时刻；避免多个档位无缝连跑。
 static uint32_t s_windBackgroundComposeAt = 0;
+// 风场网络更新和雷达全量合成之间的隔离窗口，禁止两项重活首尾相接。
+static uint32_t s_heavyWorkNotBefore = 0;
 // 每档最近一次成功造片时刻；仅风场模式用来做 5/15/45 分钟分级刷新。
 static uint32_t s_zoomRefreshedAt[ZOOM_MAX - ZOOM_MIN + 1]{};
 // S 键长按跳转前的临时视觉反馈（只画 LCD，不改缓存）。闪烁相位独立
@@ -59,11 +68,28 @@ static bool refreshApproaching();
 static void updateLongPressCue();
 static void pumpWindAnimation(bool busy);
 static void pumpWindDuringBlock();
-static void serviceWindField();
+static bool serviceWindField();
 static uint32_t nonzeroMillis();
+static void initialCacheScreenTick(bool force = false);
+static void finishInitialCacheScreenIfReady();
 
 static constexpr uint32_t kWifiRetryBackoffMs[] = {
     60UL * 1000UL, 3UL * 60UL * 1000UL, 10UL * 60UL * 1000UL};
+// 人工连续点按常见间隔约 0.3--0.6 秒；800ms 可确保整轮只装最终档。
+static constexpr uint32_t kWindSelectSettleAfterZoomMs = 800UL;
+static constexpr uint32_t kHeavyWorkSeparationMs = 30UL * 1000UL;
+
+static bool heavyWorkCooling() {
+  return s_heavyWorkNotBefore != 0 &&
+         (int32_t)(millis() - s_heavyWorkNotBefore) < 0;
+}
+
+static void separateNextHeavyWork() {
+  s_heavyWorkNotBefore = millis() + kHeavyWorkSeparationMs;
+  if (s_heavyWorkNotBefore == 0) {
+    s_heavyWorkNotBefore = 1;
+  }
+}
 
 static void scheduleWifiRetry() {
   const uint8_t last =
@@ -81,16 +107,26 @@ static void scheduleWifiRetry() {
 }
 
 static void noteUserInteraction() {
+  const uint32_t now = millis();
   const uint32_t pauseMs = s_cfg.show_wind_particles
                                ? WIND_CACHE_PAUSE_AFTER_USER_MS
                                : CACHE_PAUSE_AFTER_USER_MS;
-  const uint32_t until = millis() + pauseMs;
+  const uint32_t until = now + pauseMs;
   if (until > s_cachePauseUntil) {
     s_cachePauseUntil = until;
+  }
+  if (s_cfg.show_wind_particles) {
+    s_windSelectNotBefore = now + kWindSelectSettleAfterZoomMs;
+    if (s_windSelectNotBefore == 0) {
+      s_windSelectNotBefore = 1;
+    }
   }
 }
 
 static bool cachePaused() {
+  if (s_initialCacheScreen) {
+    return false;
+  }
   // 松开后才产生短按事件；把实际按下电平也视为暂停，堵住“刚按下但
   // 后台任务抢先一步启动”的偶发竞态。
   return buttonIsDown() ||
@@ -156,7 +192,86 @@ static float globalCacheDone01() {
   return fresh / (float)slots;
 }
 
+/** 初始化只关心“可秒切”的 ready 档位，不把旧图时效纳入首次进度。 */
+static float initialCacheDone01() {
+  const int slots = frameCacheZoomSlots();
+  if (slots <= 0) {
+    return 1.0f;
+  }
+  float ready = (float)frameCacheCountReady();
+  if (s_bakeZoom >= ZOOM_MIN && s_bakeZoom <= ZOOM_MAX &&
+      !frameCacheHas(s_bakeZoom)) {
+    ready += s_bakeLocal;
+  }
+  if (ready > (float)slots) {
+    ready = (float)slots;
+  }
+  return ready / (float)slots;
+}
+
+static void initialCacheScreenTick(bool force) {
+  if (!s_initialCacheScreen) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (!force && (now - s_initialPulseDrawAt) < 55UL) {
+    return;
+  }
+
+  // 2.2 秒一轮的平滑呼吸：最低仍清晰可见，峰值为纯白。
+  constexpr float kTwoPi = 6.28318530718f;
+  const float phase = (float)(now % 2200UL) / 2200.0f;
+  const float breath = 0.5f - 0.5f * cosf(kTwoPi * phase);
+  const int level = 72 + (int)lroundf(183.0f * breath);
+  if (!force && abs(level - s_initialPulseLevel) < 3) {
+    return;
+  }
+
+  // 只重画文字带，底部进度条由独立控件维护，不产生整屏闪烁。
+  lcd.fillRect(28, 77, LCD_WIDTH - 56, 76, TFT_BLACK);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(1.0f);
+  lcd.setFont(&fonts::Font4);
+  const uint16_t titleColor = lcd.color565(level, level, level);
+  lcd.setTextColor(titleColor, TFT_BLACK);
+  lcd.drawString("Storm Eye", LCD_WIDTH / 2, 101);
+
+  lcd.setFont(&radar_fonts::cn12);
+  lcd.setTextSize(1.0f);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString("获取雷达数据中...", LCD_WIDTH / 2, 137);
+
+  progressRingUpdate(&lcd, initialCacheDone01(), -1);
+  s_initialPulseDrawAt = now;
+  s_initialPulseLevel = level;
+}
+
+static void beginInitialCacheScreen() {
+  if (s_initialCacheScreen) {
+    initialCacheScreenTick(true);
+    return;
+  }
+  progressRingHide(&lcd, -1);
+  alertRingHide(&lcd, s_displayedZoom);
+  s_initialCacheScreen = true;
+  inputSetLocked(true);
+  s_statusScreen = true;
+  s_displayedZoom = -1;
+  frameCacheSetProtectedZoom(-1);
+  zoomNoteDisplayed(-1);
+  s_initialPulseDrawAt = 0;
+  s_initialPulseLevel = -1;
+  lcd.fillScreen(TFT_BLACK);
+  initialCacheScreenTick(true);
+  Serial.printf("initial cache screen: ready=%d/%d\n", frameCacheCountReady(),
+                frameCacheZoomSlots());
+}
+
 static void refreshProgressRing() {
+  if (s_initialCacheScreen) {
+    initialCacheScreenTick(false);
+    return;
+  }
   if (!s_cfg.show_progress) {
     return;
   }
@@ -206,7 +321,8 @@ static void onComposeDisplay(int zoom) {
 
 /** 造片/补满阻塞期间也推进预警呼吸，避免冻帧后跳变。 */
 static void pumpAlertRingDuringCompose() {
-  if (!s_cfg.show_alert_ring || !alertRingNeedsTick()) {
+  if (s_initialCacheScreen || !s_cfg.show_alert_ring ||
+      !alertRingNeedsTick()) {
     return;
   }
   static uint32_t s_last = 0;
@@ -219,9 +335,9 @@ static void pumpAlertRingDuringCompose() {
   alertRingTick(&lcd, under);
 }
 
-/** 风场模式先补齐所有 ready 成品；完成前不进入按时效分级刷新的阶段。 */
-static bool windCacheBootstrapActive() {
-  return s_cfg.show_wind_particles &&
+/** 首次初始化先补齐所有 ready 成品；完成前不进入按时效分级刷新。 */
+static bool initialCacheBootstrapActive() {
+  return s_initialCacheScreen &&
          frameCacheCountReady() < frameCacheZoomSlots();
 }
 
@@ -232,7 +348,7 @@ static void onComposeProgress(int zoom, float local01) {
   // 全档已经 ready 后，当前档定时刷新才可抢占邻档刷新。初次补齐阶段
   // 必须让缺失档完成提交，否则五分钟定时器会让全档缓存长期补不满。
   if (zoom != zoomCurrent() && refreshIsDue() &&
-      !windCacheBootstrapActive()) {
+      !initialCacheBootstrapActive()) {
     Serial.printf("abort prefetch z%d — refresh due\n", zoom);
     composeRequestAbort();
   }
@@ -316,7 +432,12 @@ static size_t fsFreeBytes() {
  * 在保护期结束后制造一整串后台合成。
  */
 static void scheduleWindStaticRefreshes() {
-  if (!s_cfg.show_wind_particles || cachePaused()) {
+  if (!s_cfg.show_wind_particles || cachePaused() || heavyWorkCooling()) {
+    return;
+  }
+  // 当前档五分钟刷新到期或即将到期时，不再同时制造一个梯队 stale 档。
+  // 当前档完成后再评估梯队，避免同一轮叠加两项后台工作。
+  if (refreshIsDue() || refreshApproaching()) {
     return;
   }
   static uint32_t lastScanAt = 0;
@@ -476,8 +597,9 @@ static void updateLongPressCue() {
 /** 风场使用局部持久渐隐轨迹；阻塞路径传 busy=true，自动降至约 2 FPS。 */
 static void pumpWindAnimation(bool busy) {
   static bool pumping = false;
-  if (pumping || !s_cfg.show_wind_particles || !s_wifiOk || s_statusScreen ||
-      s_displayedZoom < ZOOM_MIN || s_displayedZoom > ZOOM_MAX) {
+  if (pumping || s_initialCacheScreen || !s_cfg.show_wind_particles ||
+      !s_wifiOk || s_statusScreen || s_displayedZoom < ZOOM_MIN ||
+      s_displayedZoom > ZOOM_MAX) {
     return;
   }
   pumping = true;
@@ -498,32 +620,58 @@ static void pumpWindDuringBlock() {
   // HTTPS/解码阻塞期间不依赖风场恰好出帧：持续采样按键并独立推进
   // 长按十字反馈，避免慢请求窗口内看起来“按住没有反应”。
   buttonService();
+  initialCacheScreenTick(false);
   // 不等松手判定短按/长按：物理按下先抢占耗时合成。松手后的事件
   // 仍按原状态机消费，因此不会改变短按/长按语义。
-  if (s_busyCompose && buttonIsDown()) {
+  if (s_busyCompose && !s_initialCacheScreen && buttonIsDown()) {
     composeRequestAbort();
+  }
+  // 一旦有按键抢占，当前调用只负责尽快退栈；不再补画一帧 30--40ms 的
+  // 风场，避免秒切已经完成后还被同轮 SPI 工作拖住。
+  if (composeAbortRequested() || zoomHasPending()) {
+    updateLongPressCue();
+    return;
   }
   pumpWindAnimation(true);
   updateLongPressCue();
 }
 
-static void serviceWindField() {
-  if (!s_cfg.show_wind_particles || s_displayedZoom < ZOOM_MIN ||
-      s_displayedZoom > ZOOM_MAX) {
-    return;
+static bool serviceWindField() {
+  if (s_initialCacheScreen || !s_cfg.show_wind_particles ||
+      s_displayedZoom < ZOOM_MIN || s_displayedZoom > ZOOM_MAX) {
+    return false;
   }
-  // 先切换视口并装入磁盘旧场，粒子可以立刻恢复；静默期只拦截后面的
-  // HTTPS 更新，避免为了“秒切优先”反而让已有风场空白一分钟。
+  // 连续按 S 时只做静态缓存 blit；等按键停止片刻后，再为最终档读取一次
+  // 风场缓存。否则每档约几十毫秒的 LittleFS 读取会叠在下一次按键前面。
+  if (buttonIsDown() || zoomHasPending()) {
+    return false;
+  }
+  if (s_windSelectNotBefore != 0 &&
+      (int32_t)(millis() - s_windSelectNotBefore) < 0) {
+    return false;
+  }
+  s_windSelectNotBefore = 0;
+  // 装入最终档磁盘旧场后即可恢复粒子；静默期只拦截后面的 HTTPS 更新。
+  // 当前档完全没有风场时绕过 60 秒静默期。
   windFieldSelect(s_cfg.lat, s_cfg.lon, s_displayedZoom);
-  if (cachePaused()) {
-    return;
+  if (heavyWorkCooling()) {
+    return false;
+  }
+  if (cachePaused() && windFieldReadyFor(s_displayedZoom)) {
+    return false;
   }
   if (windFieldService()) {
+    separateNextHeavyWork();
     handlePendingZoom();
+    return true;
   }
+  return false;
 }
 
 static bool showCached(int zoom) {
+  if (s_initialCacheScreen) {
+    return false;
+  }
   const uint32_t t0 = millis();
   if (!frameCacheBlit(&lcd, zoom)) {
     Serial.printf("showCached z%d blit fail\n", zoom);
@@ -556,8 +704,40 @@ static bool showCached(int zoom) {
   return true;
 }
 
+static void finishInitialCacheScreenIfReady() {
+  if (!s_initialCacheScreen ||
+      frameCacheCountReady() < frameCacheZoomSlots()) {
+    return;
+  }
+
+  s_initialCacheScreen = false;
+  inputSetLocked(false);
+  s_staticFullPassDone = true;
+  s_statusScreen = false;
+  s_initialPulseLevel = -1;
+  progressRingHide(&lcd, -1);
+
+  const int target = zoomDefault();
+  zoomSetCurrent(target);
+  if (!showCached(target)) {
+    showStatus("Cache ready", "display fail");
+    Serial.printf("initial cache complete but z%d blit failed\n", target);
+    return;
+  }
+  zoomPrefetchResetAround(target);
+  Serial.printf("initial cache complete: ready=%d/%d display=z%d\n",
+                frameCacheCountReady(), frameCacheZoomSlots(), target);
+}
+
 /** 造片阻塞中短按：已缓存则立刻秒切；未缓存不碰预警环（避免地图未变却像切了档）。 */
 static void onPendingZoomFeedback(int zoom) {
+  if (s_initialCacheScreen) {
+    zoomClearPendingIf(zoom);
+    zoomSetCurrent(zoomDefault());
+    composeClearAbort();
+    Serial.println("input ignored during initial full-cache build");
+    return;
+  }
   noteUserInteraction();
   if (!frameCacheHas(zoom)) {
     // 用户刚好点到正在后台生成的档：沿用当前下载，不中止后从头再来。
@@ -592,6 +772,10 @@ static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
     return ComposeResult::Failed;
   }
   const bool wasFresh = frameCacheIsFresh(zoom);
+  // 初始化期间任何造片都只写缓存；LCD 始终保留黑底呼吸画面。
+  if (s_initialCacheScreen) {
+    pushToDisplay = false;
+  }
   s_busyCompose = true;
   composeClearAbort();
   s_bakeZoom = zoom;
@@ -625,7 +809,7 @@ static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
     if (wasFresh && frameCacheHas(zoom)) {
       frameCacheMarkFresh(zoom, true);
     }
-    s_statusScreen = false;
+    s_statusScreen = s_initialCacheScreen;
     refreshProgressRing();
     return ComposeResult::Failed;
   }
@@ -671,10 +855,10 @@ static void pumpBackgroundPrefetch() {
   if (cachePaused()) {
     return;
   }
-  if (windFieldBlocksPrefetch()) {
+  if (windFieldBlocksPrefetch() || heavyWorkCooling()) {
     return;
   }
-  const bool bootstrap = windCacheBootstrapActive();
+  const bool bootstrap = initialCacheBootstrapActive();
   // 补齐全档是风场模式的第一阶段；当前档的定时刷新只能在 ready=全档
   // 后抢占。普通模式及梯队刷新阶段维持原来的时序。
   if (!bootstrap && (refreshIsDue() || refreshApproaching())) {
@@ -692,10 +876,15 @@ static void pumpBackgroundPrefetch() {
   const int freshBefore = frameCacheCountFresh();
   if (freshBefore >= slots) {
     s_staticFullPassDone = true;
+    finishInitialCacheScreenIfReady();
     return;
   }
 
   const bool attempted = pumpPrefetch();
+  finishInitialCacheScreenIfReady();
+  if (bootstrap && !s_initialCacheScreen) {
+    return;
+  }
   if (attempted && s_cfg.show_wind_particles && !bootstrap) {
     s_windBackgroundComposeAt = millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
     Serial.printf("wind static cooldown %lus; interaction remains primary\n",
@@ -847,10 +1036,17 @@ static bool tryWifiAndRadar() {
   Serial.printf("apply cfg: mode=%u ssid=%s lat=%.5f lon=%.5f defZoom=%d\n",
                 (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon,
                 s_cfg.default_zoom);
-  showStatus("Connecting...", s_cfg.ssid);
+  const bool recoveringInitialCache = s_initialCacheScreen;
+  if (!recoveringInitialCache) {
+    showStatus("Connecting...", s_cfg.ssid);
+  }
   s_wifiOk = wifiConnect(&s_cfg);
   if (!s_wifiOk) {
-    showStatus("WiFi fail", s_cfg.ssid);
+    if (recoveringInitialCache) {
+      initialCacheScreenTick(true);
+    } else {
+      showStatus("WiFi fail", s_cfg.ssid);
+    }
     scheduleWifiRetry();
     return false;
   }
@@ -858,17 +1054,27 @@ static bool tryWifiAndRadar() {
   s_wifiRetryAt = 0;
   s_wifiRetryStage = 0;
 
-  char ipBuf[24];
-  snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
-  showStatus("WiFi OK", ipBuf);
-  delay(600);
+  if (!recoveringInitialCache) {
+    char ipBuf[24];
+    snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
+    showStatus("WiFi OK", ipBuf);
+    delay(600);
+  }
 
-  ensureZoomVisible(zoomCurrent(), true);
-  if (!frameCacheHas(zoomCurrent())) {
-    Serial.printf("compose miss z%d — will retry in loop\n", zoomCurrent());
-  } else {
-    // 首档就绪后立刻铺满邻档预取（不必等 5 分钟刷新）
+  if (frameCacheCountReady() < frameCacheZoomSlots()) {
+    zoomSetCurrent(zoomDefault());
+    beginInitialCacheScreen();
+    s_cachePauseUntil = 0;
     zoomPrefetchResetAround(zoomCurrent());
+  } else if (s_initialCacheScreen) {
+    finishInitialCacheScreenIfReady();
+  } else {
+    ensureZoomVisible(zoomCurrent(), true);
+    if (!frameCacheHas(zoomCurrent())) {
+      Serial.printf("compose miss z%d — will retry in loop\n", zoomCurrent());
+    } else {
+      zoomPrefetchResetAround(zoomCurrent());
+    }
   }
   s_lastRefresh = millis();
   s_refreshFailAt = 0;
@@ -955,12 +1161,13 @@ void setup() {
 void loop() {
   static uint32_t lastBeat = 0;
 
+  initialCacheScreenTick(false);
   const ButtonEvent ev = buttonPoll();
-  if (ev == ButtonEvent::ShortPress) {
+  if (!s_initialCacheScreen && ev == ButtonEvent::ShortPress) {
     if (s_wifiOk) {
       handleShortPress();
     }
-  } else if (ev == ButtonEvent::LongPress) {
+  } else if (!s_initialCacheScreen && ev == ButtonEvent::LongPress) {
     if (s_wifiOk) {
       handleLongPress();
     }
@@ -995,17 +1202,20 @@ void loop() {
   }
 
   // 风场首拉优先于邻档预取；已有旧场时请求期间动画继续播放。
-  serviceWindField();
+  const bool windWorked = serviceWindField();
   pumpWindAnimation(false);
-  scheduleWindStaticRefreshes();
+  if (!windWorked) {
+    scheduleWindStaticRefreshes();
+  }
 
   const bool due = refreshIsDue();
-  // 风场模式下切档先保证旧缓存秒切与新档动画稳定；用户停止操作 60 秒后
-  // 才允许启动耗时的当前档静态刷新。关闭风场时维持原来的刷新时序。
-  const bool deferWindRefresh =
-      s_cfg.show_wind_particles &&
-      (cachePaused() || windCacheBootstrapActive());
-  if (!s_busyCompose && due && !deferWindRefresh) {
+  // 首次全档未完成时，两种模式都禁止定时刷新抢占补档；全档完成后，
+  // 风场模式再额外遵守用户交互保护，普通模式维持原刷新时序。
+  const bool deferScheduledRefresh =
+      initialCacheBootstrapActive() ||
+      (s_cfg.show_wind_particles && cachePaused());
+  if (!s_busyCompose && !windWorked && !heavyWorkCooling() && due &&
+      !deferScheduledRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
       Serial.printf("scheduled refresh focus z%d (%s) free=%u\n", z,
@@ -1018,6 +1228,7 @@ void loop() {
       // 风场模式后台提交，不在合成分段中碰屏；普通模式保留原路径。
       const bool composeToDisplay = !s_cfg.show_wind_particles;
       const ComposeResult result = buildAndCache(z, composeToDisplay);
+      separateNextHeavyWork();
       if (result != ComposeResult::Failed) {
         s_lastRefresh = millis();
         s_refreshFailAt = 0;
@@ -1089,7 +1300,7 @@ void loop() {
 
   // 预警呼吸优先于预取/past 补满，避免秒切后迟迟不闪、环动画卡顿
   const bool alertBreathing =
-      s_cfg.show_alert_ring && alertRingNeedsTick();
+      !s_initialCacheScreen && s_cfg.show_alert_ring && alertRingNeedsTick();
   if (alertBreathing) {
     const int under = s_statusScreen ? -1 : s_displayedZoom;
     alertRingTick(&lcd, under);

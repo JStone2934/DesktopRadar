@@ -9,6 +9,7 @@ static volatile bool s_armed = true;
 static volatile uint32_t s_downAt = 0;
 static volatile uint8_t s_latched = 0;  // ButtonEvent
 static volatile bool s_longFired = false;
+static volatile bool s_priorityRequested = false;
 static uint32_t s_ignoreUntil = 0;
 static constexpr uint32_t kDebounceMs = 18;
 
@@ -22,6 +23,7 @@ static void IRAM_ATTR bootIsr() {
   }
   const uint32_t now = millis();
   if (buttonLevelDown()) {
+    s_priorityRequested = true;
     // 按下：只记首次边沿，忽略抖动
     if (s_downAt == 0) {
       s_downAt = now == 0 ? 1 : now;
@@ -38,6 +40,7 @@ static void IRAM_ATTR bootIsr() {
   s_downAt = 0;
   s_longFired = false;
   if (held < kDebounceMs) {
+    s_priorityRequested = false;
     return;
   }
   if (!longFired && held < BTN_SHORT_MS) {
@@ -57,6 +60,7 @@ void buttonBegin() {
   const esp_err_t configErr = gpio_config(&io);
   s_downAt = 0;
   s_latched = 0;
+  s_priorityRequested = false;
   s_armed = true;
   // 上电时 S 键可能仍被按住（烧录），等释放后再武装
   if (buttonLevelDown()) {
@@ -79,6 +83,7 @@ void buttonService() {
       s_armed = true;
       s_downAt = 0;
       s_longFired = false;
+      s_priorityRequested = false;
     }
     return;
   }
@@ -88,6 +93,7 @@ void buttonService() {
     s_latched = 0;
     s_downAt = 0;
     s_longFired = false;
+    s_priorityRequested = false;
     interrupts();
     return;
   }
@@ -100,6 +106,7 @@ void buttonService() {
   // 门户约每 5ms 调用本函数，因此即使中断漏掉也能可靠捕获按下/松开。
   noInterrupts();
   if (physicalDown && s_downAt == 0) {
+    s_priorityRequested = true;
     s_downAt = now == 0 ? 1 : now;
     s_longFired = false;
   } else if (!physicalDown && s_downAt != 0) {
@@ -109,6 +116,8 @@ void buttonService() {
     s_longFired = false;
     if (held >= kDebounceMs && !longWasFired && held < BTN_SHORT_MS) {
       s_latched = static_cast<uint8_t>(ButtonEvent::ShortPress);
+    } else if (held < kDebounceMs) {
+      s_priorityRequested = false;
     }
   }
   if (s_downAt != 0 && !s_longFired &&
@@ -125,8 +134,18 @@ ButtonEvent buttonPoll() {
   noInterrupts();
   const uint8_t ev = s_latched;
   s_latched = 0;
+  if (ev != static_cast<uint8_t>(ButtonEvent::None)) {
+    s_priorityRequested = false;
+  }
   interrupts();
   return static_cast<ButtonEvent>(ev);
+}
+
+bool buttonPriorityRequested() {
+  if (!s_armed || millis() < s_ignoreUntil) {
+    return false;
+  }
+  return s_priorityRequested;
 }
 
 bool buttonIsDown() {

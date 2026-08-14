@@ -14,6 +14,7 @@ static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
 static ZoomPendingFeedbackFn s_pendingFeedback = nullptr;
 static BlockingUiServiceFn s_blockingUiService = nullptr;
+static bool s_inputLocked = false;
 static int s_prefetchRadius = ZOOM_MAX - ZOOM_MIN;
 
 static constexpr uint32_t kPrefetchFailCoolMs = 45000UL;
@@ -156,7 +157,7 @@ void composeRequestAbort() { s_composeAbort = true; }
 void composeClearAbort() { s_composeAbort = false; }
 bool composeAbortRequested() {
   // 合成路径直接观察物理按下电平，不必等到松手形成 ShortPress。
-  if (buttonIsDown()) {
+  if (!s_inputLocked && (buttonIsDown() || buttonPriorityRequested())) {
     s_composeAbort = true;
   }
   return s_composeAbort;
@@ -188,12 +189,26 @@ void inputSetBlockingUiService(BlockingUiServiceFn fn) {
   s_blockingUiService = fn;
 }
 
-void inputServiceDuringBlock() {
-  if (s_blockingUiService) {
-    s_blockingUiService();
+void inputSetLocked(bool locked) {
+  s_inputLocked = locked;
+  if (locked) {
+    s_pendingZoom = -1;
+    s_composeAbort = false;
   }
+}
+
+void inputServiceDuringBlock() {
   const ButtonEvent ev = buttonPoll();
+  if (s_inputLocked) {
+    if (s_blockingUiService) {
+      s_blockingUiService();
+    }
+    return;
+  }
   if (ev != ButtonEvent::ShortPress && ev != ButtonEvent::LongPress) {
+    if (s_blockingUiService) {
+      s_blockingUiService();
+    }
     return;
   }
 
@@ -218,5 +233,9 @@ void inputServiceDuringBlock() {
                 next);
   if (s_pendingFeedback) {
     s_pendingFeedback(next);
+  }
+  // 缩放反馈已经完成后才推进风场/呼吸 UI，保证同一轮里秒切先占 SPI。
+  if (s_blockingUiService) {
+    s_blockingUiService();
   }
 }

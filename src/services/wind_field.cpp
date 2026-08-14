@@ -360,6 +360,17 @@ bool windFieldService() {
   composeClearAbort();
   const bool ok = fetchField();
   s_fetching = false;
+  if (!ok && composeAbortRequested()) {
+    // 缩放抢占不是网络故障：不累计失败、不触发 WiFi 重连，短延时后只在
+    // 新档仍需要时重试。没有旧场时继续保持“首拉优先于雷达预取”。
+    s_waitingFirstAttempt = !s_valid;
+    s_fetchDueAt = millis() + 300UL;
+    if (s_fetchDueAt == 0) {
+      s_fetchDueAt = 1;
+    }
+    Serial.printf("wind fetch preempted by zoom z%d\n", s_zoom);
+    return true;
+  }
   s_waitingFirstAttempt = false;
   uint32_t wait = WIND_FIELD_REFRESH_MS;
   if (ok) {

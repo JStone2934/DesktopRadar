@@ -65,3 +65,6 @@ void inputServiceDuringBlock();
 /** 注册阻塞 HTTP/解码循环中的 UI 泵；用于保持风场动画。 */
 typedef void (*BlockingUiServiceFn)();
 void inputSetBlockingUiService(BlockingUiServiceFn fn);
+
+/** 初始化全档缓存期间锁住缩放输入，并禁止物理按键中止后台造片。 */
+void inputSetLocked(bool locked);

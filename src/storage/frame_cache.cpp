@@ -1,6 +1,7 @@
 #include "frame_cache.h"
 
 #include "button.h"
+#include "zoom_ctrl.h"
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -140,6 +141,10 @@ static void removeTilesInRange(int zoom, bool isRadar, int tx0, int ty0, int tx1
   char path[48];
   for (int ty = ty0; ty <= ty1; ++ty) {
     for (int tx = tx0; tx <= tx1; ++tx) {
+      inputServiceDuringBlock();
+      if (composeAbortRequested()) {
+        return;
+      }
       frameCacheTilePath(zoom, isRadar, tx, ty, path, sizeof(path));
       LittleFS.remove(path);
     }
@@ -171,6 +176,11 @@ static void scrubTemp(int zoom) {
   if (d && d.isDirectory()) {
     File f = d.openNextFile();
     while (f) {
+      inputServiceDuringBlock();
+      if (composeAbortRequested()) {
+        f.close();
+        break;
+      }
       char child[64];
       snprintf(child, sizeof(child), "%s/%s", dir, f.name());
       f.close();
@@ -195,6 +205,11 @@ static void scrubTempDirKeepReady(int zoom) {
   if (d && d.isDirectory()) {
     File f = d.openNextFile();
     while (f) {
+      inputServiceDuringBlock();
+      if (composeAbortRequested()) {
+        f.close();
+        break;
+      }
       char child[64];
       snprintf(child, sizeof(child), "%s/%s", dir, f.name());
       f.close();
@@ -214,6 +229,11 @@ void frameCacheScrubOrphans() {
 
 void frameCacheScrubOrphansExcept(int keepZoom) {
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      Serial.printf("LittleFS scrub preempted at z%d\n", z);
+      return;
+    }
     if (z == keepZoom) {
       continue;
     }
@@ -727,6 +747,9 @@ bool frameCachePrepare(int zoom) {
   // 清临时瓦片目录与 .new，保留旧 .rgb565 + .ready 供刷新期间秒切
   // （新帧写 .rgb565.new，commit 时原子替换；旧 .rgb565 始终可 blit）
   scrubTempDirKeepReady(zoom);
+  if (composeAbortRequested()) {
+    return false;
+  }
   char path[40];
   rgbNewPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
@@ -964,11 +987,36 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
     }
     return false;
   }
-  const size_t bytes = (size_t)rowCount * FRAME_ROW_BYTES;
-  const size_t wrote = f.write(reinterpret_cast<const uint8_t*>(frame), bytes);
-  f.flush();
+  // 旧实现一次写入并 flush 80 行（38.4KB），遇到 LittleFS 回收时会形成
+  // 数百毫秒甚至更长的不可抢占窗口。8 行一批，把按键检查放在每次
+  // 3.84KB 写入前后；中止时只留下 .new 临时文件，正式缓存不受影响。
+  constexpr int kWriteRows = 8;
+  size_t wrote = 0;
+  for (int row = 0; row < rowCount; row += kWriteRows) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      f.close();
+      return false;
+    }
+    const int rows = min(kWriteRows, rowCount - row);
+    const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(
+        frame + (size_t)row * LCD_WIDTH);
+    const size_t n = f.write(src, bytes);
+    wrote += n;
+    if (n != bytes) {
+      f.close();
+      return false;
+    }
+    f.flush();
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      f.close();
+      return false;
+    }
+  }
   f.close();
-  return wrote == bytes;
+  return wrote == (size_t)rowCount * FRAME_ROW_BYTES;
 }
 
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
@@ -1305,44 +1353,53 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
   uint8_t a0[TILE_SIZE];
   uint8_t a1[TILE_SIZE];
 
+  auto servicePriorityInput = [&](int row) -> bool {
+    if ((row & 3) == 0) {
+      inputServiceDuringBlock();
+    }
+    return composeAbortRequested();
+  };
+
+  auto closeInputs = [&]() {
+    raw.close();
+    if (useAlpha) {
+      alpha.close();
+    }
+  };
+
   if (scale == 1) {
-    for (int dy = 0; dy < TILE_SIZE; ++dy) {
-      const int y = pasteY + dy;
-      if (y < bandY || y >= bandY + bandHeight) {
-        if (!raw.seek((size_t)(dy + 1) * TILE_SIZE * 2)) {
-          raw.close();
-          if (useAlpha) {
-            alpha.close();
-          }
-          return false;
-        }
-        if (useAlpha && !alpha.seek((size_t)(dy + 1) * TILE_SIZE)) {
-          raw.close();
-          alpha.close();
-          return false;
-        }
-        continue;
+    const int dyStart = max(0, bandY - pasteY);
+    const int dyEnd = min(TILE_SIZE, bandY + bandHeight - pasteY);
+    const int dxStart = max(0, -pasteX);
+    const int dxEnd = min(TILE_SIZE, LCD_WIDTH - pasteX);
+    if (dyStart >= dyEnd || dxStart >= dxEnd) {
+      closeInputs();
+      return true;
+    }
+    if (!raw.seek((size_t)dyStart * TILE_SIZE * 2) ||
+        (useAlpha && !alpha.seek((size_t)dyStart * TILE_SIZE))) {
+      closeInputs();
+      return false;
+    }
+    for (int dy = dyStart; dy < dyEnd; ++dy) {
+      if (servicePriorityInput(dy)) {
+        closeInputs();
+        return false;
       }
+      const int y = pasteY + dy;
       if (raw.read(reinterpret_cast<uint8_t*>(row0), TILE_SIZE * 2) !=
           (int)(TILE_SIZE * 2)) {
-        raw.close();
-        if (useAlpha) {
-          alpha.close();
-        }
+        closeInputs();
         return false;
       }
       if (useAlpha &&
           alpha.read(a0, TILE_SIZE) != (int)TILE_SIZE) {
-        raw.close();
-        alpha.close();
+        closeInputs();
         return false;
       }
       uint16_t* dst = frame + (y - bandY) * LCD_WIDTH;
-      for (int dx = 0; dx < TILE_SIZE; ++dx) {
+      for (int dx = dxStart; dx < dxEnd; ++dx) {
         const int x = pasteX + dx;
-        if (x < 0 || x >= LCD_WIDTH) {
-          continue;
-        }
         const uint16_t pix = row0[dx];
         if (useAlpha) {
           accumulateCenterSample(centerOut, x, y, pix, a0[dx]);
@@ -1357,21 +1414,27 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
         }
       }
     }
-    raw.close();
-    if (useAlpha) {
-      alpha.close();
-    }
+    closeInputs();
     return true;
   }
 
   // scale>=2：预乘 alpha 双线性，避免透明邻域拉出黑边
   int cachedY0 = -2;
   int cachedY1 = -2;
-  for (int dy = 0; dy < outH; ++dy) {
-    const int y = pasteY + dy;
-    if (y < bandY || y >= bandY + bandHeight) {
-      continue;
+  const int dyStart = max(0, bandY - pasteY);
+  const int dyEnd = min(outH, bandY + bandHeight - pasteY);
+  const int dxStart = max(0, -pasteX);
+  const int dxEnd = min(outW, LCD_WIDTH - pasteX);
+  if (dyStart >= dyEnd || dxStart >= dxEnd) {
+    closeInputs();
+    return true;
+  }
+  for (int dy = dyStart; dy < dyEnd; ++dy) {
+    if (servicePriorityInput(dy)) {
+      closeInputs();
+      return false;
     }
+    const int y = pasteY + dy;
     const float sy = ((float)dy + 0.5f) / (float)scale - 0.5f;
     int y0 = (int)floorf(sy);
     if (y0 < 0) {
@@ -1425,11 +1488,8 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
     }
     uint16_t* dst = frame + (y - bandY) * LCD_WIDTH;
     const float fy = sy - (float)y0;
-    for (int dx = 0; dx < outW; ++dx) {
+    for (int dx = dxStart; dx < dxEnd; ++dx) {
       const int x = pasteX + dx;
-      if (x < 0 || x >= LCD_WIDTH) {
-        continue;
-      }
       float sxc = ((float)dx + 0.5f) / (float)scale - 0.5f;
       if (sxc < 0) {
         sxc = 0;
@@ -1497,10 +1557,7 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
       }
     }
   }
-  raw.close();
-  if (useAlpha) {
-    alpha.close();
-  }
+  closeInputs();
   return true;
 }
 

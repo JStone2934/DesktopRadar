@@ -22,5 +22,11 @@ ButtonEvent buttonPoll();
 /** 当前是否按下（已武装且忽略窗口外）。 */
 bool buttonIsDown();
 
+/**
+ * 自最近一次消费事件以来是否出现过真实按下边沿。即使按键已经快速松开，
+ * 后台任务也能看到该锁存并立即让路。
+ */
+bool buttonPriorityRequested();
+
 /** 当前按住时长（ms）；未按下返回 0。 */
 uint32_t buttonHeldMs();
