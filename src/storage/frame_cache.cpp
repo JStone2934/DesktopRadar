@@ -991,6 +991,57 @@ bool frameCacheLoadRgb565(int zoom, uint16_t* frame) {
   return n == FRAME_RGB565_BYTES;
 }
 
+bool frameCacheReadPixelsSorted(int zoom, const uint16_t* keys,
+                                uint16_t* colors, size_t count) {
+  if ((!keys && count != 0) || (!colors && count != 0)) {
+    return false;
+  }
+  if (count == 0) {
+    return true;
+  }
+
+  File f;
+  if (!openRgb565IfValid(zoom, &f)) {
+    return false;
+  }
+
+  uint16_t row[LCD_WIDTH];
+  size_t i = 0;
+  uint16_t previous = 0;
+  bool havePrevious = false;
+  while (i < count) {
+    const uint16_t key = keys[i];
+    if (key >= LCD_WIDTH * LCD_HEIGHT ||
+        (havePrevious && key < previous)) {
+      f.close();
+      return false;
+    }
+    const int y = key / LCD_WIDTH;
+    const size_t offset = (size_t)y * FRAME_ROW_BYTES;
+    if (!f.seek(offset) ||
+        f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
+            (int)FRAME_ROW_BYTES) {
+      f.close();
+      return false;
+    }
+
+    while (i < count && keys[i] / LCD_WIDTH == y) {
+      const uint16_t rowKey = keys[i];
+      if (rowKey >= LCD_WIDTH * LCD_HEIGHT ||
+          (havePrevious && rowKey < previous)) {
+        f.close();
+        return false;
+      }
+      colors[i] = row[rowKey % LCD_WIDTH];
+      previous = rowKey;
+      havePrevious = true;
+      ++i;
+    }
+  }
+  f.close();
+  return true;
+}
+
 bool frameCachePromoteNewNoReady(int zoom) {
   char newPath[40];
   char path[40];

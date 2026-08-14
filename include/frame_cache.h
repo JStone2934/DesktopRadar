@@ -111,6 +111,13 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
 bool frameCacheLoadRgb565(int zoom, uint16_t* frame);
 
 /**
+ * 批量读取成品底图像素。keys 为按行主序升序排列的 y*LCD_WIDTH+x，
+ * 同一行只读取一次，供稀疏动态覆盖层保存精确底色。
+ */
+bool frameCacheReadPixelsSorted(int zoom, const uint16_t* keys,
+                                uint16_t* colors, size_t count);
+
+/**
  * 将 .rgb565.new 替换为正式 .rgb565，不写 ready。
  * 用于无雷达时仅上屏、供进度环底图。
  */

@@ -192,6 +192,7 @@ static void onComposeDisplay(int zoom) {
   frameCacheSetProtectedZoom(zoom);
   s_statusScreen = false;
   zoomNoteDisplayed(zoom);
+  windParticlesNotifyBaseRedrawn();
   applyAlertForZoom(zoom);
 }
 
@@ -437,10 +438,7 @@ static void updateLongPressCue() {
   }
 }
 
-/**
- * 风场每帧会从 Flash 恢复干净成品，因此随后补画动态 UI。
- * 阻塞 HTTP/PNG 路径传 busy=true，自动降至约 2 FPS。
- */
+/** 风场使用局部持久渐隐轨迹；阻塞路径传 busy=true，自动降至约 2 FPS。 */
 static void pumpWindAnimation(bool busy) {
   static bool pumping = false;
   if (pumping || !s_cfg.show_wind_particles || !s_wifiOk || s_statusScreen ||
@@ -453,8 +451,7 @@ static void pumpWindAnimation(bool busy) {
     if (s_cfg.show_alert_ring) {
       alertRingRedraw(&lcd, s_displayedZoom);
     }
-    // 整屏恢复会把十字恢复成显示状态。若状态机当前要求隐藏，仅重画
-    // 这一相位；绝不重置闪烁时钟，避免与约 6 FPS 风场刷新发生拍频。
+    // 若长按状态机当前要求隐藏，继续维持该相位；不重置闪烁时钟。
     s_longCueNeedsRedraw =
         s_longCueActive && !s_longCueShowCrosshair;
     updateLongPressCue();
@@ -487,6 +484,7 @@ static bool showCached(int zoom) {
     Serial.printf("showCached z%d blit fail\n", zoom);
     return false;
   }
+  windParticlesNotifyBaseRedrawn();
   const uint32_t dt = millis() - t0;
   if (dt >= 30) {
     Serial.printf("blit z%d %lums\n", zoom, (unsigned long)dt);
