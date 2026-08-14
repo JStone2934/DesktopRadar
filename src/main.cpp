@@ -517,6 +517,13 @@ static bool showCached(int zoom) {
 static void onPendingZoomFeedback(int zoom) {
   noteUserInteraction();
   if (!frameCacheHas(zoom)) {
+    // 用户刚好点到正在后台生成的档：沿用当前下载，不中止后从头再来。
+    // 完成后 pending 会在主循环中用新缓存立即上屏。
+    if (s_busyCompose && s_bakeZoom == zoom) {
+      composeClearAbort();
+      Serial.printf("pending z%d joins active compose\n", zoom);
+      return;
+    }
     Serial.printf("pending z%d not cached — wait for compose\n", zoom);
     return;
   }
@@ -532,6 +539,13 @@ static void onPendingZoomFeedback(int zoom) {
 
 static bool buildAndCache(int zoom, bool pushToDisplay) {
   if (!zoomCanCompose(zoom)) {
+    return false;
+  }
+  // 静态造片完全依赖在线瓦片。离线时立即失败，避免一次按键被每张瓦片的
+  // DNS/TLS 超时拖住几十秒；旧的 ready 帧始终留在屏上。
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("build z%d skipped: WiFi offline (status=%d)\n", zoom,
+                  (int)WiFi.status());
     return false;
   }
   const bool wasFresh = frameCacheIsFresh(zoom);
@@ -669,6 +683,17 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
     }
     if (!userInitiated) {
       zoomPrefetchResetAround(zoom);
+    }
+    return;
+  }
+
+  // 没有该档缓存且当前离线：保持屏上旧档并立即恢复逻辑档。不能在这里
+  // 进入同步 compose，否则一次短按会依次等待所有瓦片的网络超时。
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("z%d unavailable offline — keep display z%d\n", zoom,
+                  s_displayedZoom);
+    if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
+      zoomSetCurrent(s_displayedZoom);
     }
     return;
   }

@@ -1765,51 +1765,11 @@ bool frameCacheEnsureBakeSpace(size_t needBytes, int keepZoom) {
     return total > used ? (total - used) : 0;
   };
 
-  if (freeBytes() >= needBytes) {
-    return true;
-  }
-
-  // 按与 keepZoom 距离从远到近，丢弃「过时(!fresh)且已就绪」的档成品。
-  // 新鲜档受保护（避免初始预取抖动）；keepZoom 与受保护(显示)档不丢。
-  while (freeBytes() < needBytes) {
-    int bestZ = -1;
-    int bestDist = -1;
-    for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-      if (z == keepZoom || z == s_protectedZoom || z == ZOOM_SKIP) {
-        continue;
-      }
-      if (!frameCacheHas(z) || freshMaskGet(z)) {
-        continue;  // 仅丢过时且已就绪的
-      }
-      const int dist = abs(z - keepZoom);
-      if (dist > bestDist) {
-        bestDist = dist;
-        bestZ = z;
-      }
-    }
-    if (bestZ < 0) {
-      break;
-    }
-    Serial.printf("bake space: drop stale z%d (need=%u free=%u)\n", bestZ,
-                  (unsigned)needBytes, (unsigned)freeBytes());
-    scrubTemp(bestZ);
-    char path[40];
-    rgbPath(bestZ, path, sizeof(path));
-    LittleFS.remove(path);
-    rgbNewPath(bestZ, path, sizeof(path));
-    LittleFS.remove(path);
-    readyPath(bestZ, path, sizeof(path));
-    LittleFS.remove(path);
-    alertPath(bestZ, path, sizeof(path));
-    LittleFS.remove(path);
-    radarTimePath(bestZ, path, sizeof(path));
-    LittleFS.remove(path);
-    readyMaskSet(bestZ, false);
-    // fresh 已是 false（过时），无需改
-  }
-
   const bool ok = freeBytes() >= needBytes;
-  Serial.printf("bake ensureSpace need=%u free=%u ok=%d\n", (unsigned)needBytes,
-                (unsigned)freeBytes(), (int)ok);
+  if (!ok) {
+    Serial.printf(
+        "bake workspace short z%d protected=%d need=%u free=%u; keep all ready frames\n",
+        keepZoom, s_protectedZoom, (unsigned)needBytes, (unsigned)freeBytes());
+  }
   return ok;
 }

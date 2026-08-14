@@ -199,15 +199,11 @@ void frameCacheMarkAllStaleExcept(int keepZoom);
 /** 当前 fresh 档数。 */
 int frameCacheCountFresh();
 
-/**
- * 设置受保护档（屏上正在显示），ensureBakeSpace 不会丢弃它。
- * -1 表示无保护。显示档变化时调用。
- */
+/** 设置受保护档（屏上正在显示）；保留接口供缓存状态跟踪。 */
 void frameCacheSetProtectedZoom(int zoom);
 
 /**
- * 造片前腐空间：若可用空间 < needBytes，按与 keepZoom 距离从远到近
- * 丢弃「过时且已就绪」的档成品（保留 keepZoom 与受保护档）。
- * 新鲜档不会被丢弃，避免初始预取抖动。被丢档仍是 !fresh，会被预取重建。
+ * 造片前检查临时工作区。不会删除任何已完成缓存；空间不足时返回 false，
+ * 由调用方延后刷新，从而保证过时的远档仍可秒切。
  */
 bool frameCacheEnsureBakeSpace(size_t needBytes, int keepZoom);

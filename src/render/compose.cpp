@@ -100,30 +100,40 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
   logHeap(tag);
 
   for (int attempt = 1; attempt <= 2; ++attempt) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("  %s stop: WiFi offline\n", tag);
+      return false;
+    }
     size_t len = 0;
-    uint8_t* data =
-        httpFetch(url.c_str(), referer, HTTP_MAX_TILE_BYTES, &len, TILE_TIMEOUT_MS);
-    if (!data || len < 8) {
+    File tileOut;
+    if (!frameCacheOpenTileWrite(zoom, isRadar, tx, ty, &tileOut)) {
+      Serial.printf("  %s open tile file fail try=%d\n", tag, attempt);
+      return false;
+    }
+    const bool fetched = httpFetchToFile(url.c_str(), referer, tileOut,
+                                         HTTP_MAX_TILE_BYTES, &len,
+                                         TILE_TIMEOUT_MS);
+    tileOut.close();
+    char tilePath[48];
+    frameCacheTilePath(zoom, isRadar, tx, ty, tilePath, sizeof(tilePath));
+    if (!fetched || len < 8) {
       Serial.printf("  %s http fail len=%u try=%d\n", tag, (unsigned)len, attempt);
-      free(data);
+      LittleFS.remove(tilePath);
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("  %s stop retry: WiFi offline\n", tag);
+        return false;
+      }
       delay(200 * attempt);
       continue;
     }
-    if (data[0] != 0x89 || data[1] != 0x50 || data[2] != 0x4E ||
-        data[3] != 0x47) {
-      Serial.printf("  %s not png sig len=%u\n", tag, (unsigned)len);
-      free(data);
+    if (!pngPathLooksComplete(tilePath)) {
+      Serial.printf("  %s invalid png len=%u\n", tag, (unsigned)len);
+      LittleFS.remove(tilePath);
       return false;
     }
     if (len < minBytes) {
       Serial.printf("  %s small png len=%u accepted\n", tag, (unsigned)len);
     }
-    if (!frameCacheSaveTile(zoom, isRadar, tx, ty, data, len)) {
-      Serial.printf("  %s save fail len=%u\n", tag, (unsigned)len);
-      free(data);
-      return false;
-    }
-    free(data);
     Serial.printf("  %s saved %u bytes\n", tag, (unsigned)len);
     delay(40);
     return true;
@@ -382,6 +392,10 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     Serial.printf("compose reject zoom=%d\n", zoom);
     return false;
   }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("compose z%d skipped: WiFi offline\n", zoom);
+    return false;
+  }
 
   logHeap("compose-start");
   composeClearAbort();
@@ -418,8 +432,15 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   // 先腾出其它档临时文件，再下载，避免后下的底图因 Flash 满失败
   frameCacheScrubOrphansExcept(zoom);
-  // 腾空间：丢弃过时且已就绪的远档成品（保留 keepZoom 与受保护显示档）
-  frameCacheEnsureBakeSpace(FRAME_RGB565_BYTES + 96UL * 1024UL, zoom);
+  // 只检查逐瓦片解码所需工作区；绝不为刷新删除其它档的已完成缓存。
+  // 空间不足时本次刷新失败，旧图仍可秒切。
+  constexpr size_t kBakeWorkspaceBytes =
+      FRAME_RGB565_BYTES + (size_t)TILE_SIZE * TILE_SIZE * 3U +
+      HTTP_MAX_TILE_BYTES;
+  if (!frameCacheEnsureBakeSpace(kBakeWorkspaceBytes, zoom)) {
+    Serial.printf("compose z%d deferred: keep completed zoom caches\n", zoom);
+    return false;
+  }
 
   RainviewerFrame meta;
   const bool haveRadarMeta = rainviewerFetchLatest(&meta);
@@ -459,7 +480,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         return false;
       }
       bool ok = fetchBasemapOnce(tx, ty);
-      if (!ok) {
+      if (!ok && WiFi.status() == WL_CONNECTED) {
         // 单瓦失败再试一次（网络/Flash 抖动）
         Serial.printf("  retry basemap z=%d x=%d y=%d\n", zoom, tx, ty);
         ok = fetchBasemapOnce(tx, ty);
@@ -468,6 +489,10 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         ++baseOk;
       } else {
         Serial.printf("  basemap FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println("  basemap pass stopped: WiFi offline");
+          return false;
+        }
       }
       afterTile();
     }
@@ -523,9 +548,11 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   char rawPath[48];
   char alphaPathBuf[48];
 
-  // 关键：先 PNG→raw（需要 pngle≈45KB），此时不要占 112KB 帧缓冲，
-  // 否则 maxAlloc 碎掉导致 pngle_new 失败（秒切成品帧仍写 Flash，逻辑不变）。
-  auto decodeOne = [&](bool isRadar, int tx, int ty, bool withAlpha) -> bool {
+  // 每个屏幕分段只解码当前要贴的一张瓦片，贴完立即删除 raw/alpha。
+  // PNG 留到最后一个分段才删除。这样 Flash 中最多只有一张展开瓦片，
+  // 不会因同时保留 8 份 raw/alpha 耗尽空间，也无需牺牲其它档成品。
+  auto decodeOne = [&](bool isRadar, int tx, int ty, bool withAlpha,
+                       bool cleanupPng) -> bool {
     frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
     if (!LittleFS.exists(pngPath)) {
       Serial.printf("  missing png %s\n", pngPath);
@@ -543,17 +570,19 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     if (!decodePngToRawFile(pngPath, rawPath, ap)) {
       return false;
     }
-    LittleFS.remove(pngPath);
+    if (cleanupPng) {
+      LittleFS.remove(pngPath);
+    }
     return true;
   };
 
-  int decoded = 0;
-  int baseDecoded = 0;
   const int bakeTiles = baseTiles + (radarOk > 0 ? radarTiles : 0);
-  constexpr int kComposeBandRows = LCD_HEIGHT / 2;
+  // 80 行仅占 38.4KB，给 pngle 留足连续堆；代价是每张 PNG 解码三次，
+  // 但这是后台刷新路径，且每次解码都继续轮询按键。
+  constexpr int kComposeBandRows = LCD_HEIGHT / 3;
   const int composeBandCount =
       (LCD_HEIGHT + kComposeBandRows - 1) / kComposeBandRows;
-  const int bakeWorkTotal = bakeTiles * (1 + composeBandCount);
+  const int bakeWorkTotal = bakeTiles * composeBandCount;
   int bakeWorkDone = 0;
   auto afterBakeStep = [&]() {
     ++bakeWorkDone;
@@ -562,44 +591,6 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     reportComposeProgress(zoom, 0.78f + 0.20f * frac);
   };
 
-  for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
-    for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
-      pollButtonDuringCompose();
-      if (composeAbortRequested()) {
-        return false;
-      }
-      if (decodeOne(false, tx, ty, false)) {
-        ++decoded;
-        ++baseDecoded;
-      } else {
-        Serial.printf("  basemap decode FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
-      }
-      afterBakeStep();
-    }
-  }
-  if (baseDecoded < baseTiles) {
-    Serial.printf("basemap decode incomplete %d/%d, skip commit\n", baseDecoded,
-                  baseTiles);
-    return false;
-  }
-  if (radarOk > 0) {
-    for (int ty = rty0; ty <= rty1; ++ty) {
-      for (int tx = rtx0; tx <= rtx1; ++tx) {
-        pollButtonDuringCompose();
-        if (composeAbortRequested()) {
-          return false;
-        }
-        if (decodeOne(true, tx, ty, true)) {
-          ++decoded;
-        }
-        afterBakeStep();
-      }
-    }
-  }
-  Serial.printf("Decoded tiles=%d (base=%d/%d)\n", decoded, baseDecoded,
-                baseTiles);
-
-  reportComposeProgress(zoom, 0.90f);
   const size_t composeBandBytes =
       (size_t)LCD_WIDTH * kComposeBandRows * sizeof(uint16_t);
   logHeap("malloc-frame-band");
@@ -621,7 +612,7 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   const uint16_t bg = backdropColor(lcd);
 
-  auto stampOne = [&](int bandY, int bandRows, bool cleanup, bool isRadar,
+  auto stampOne = [&](int bandY, int bandRows, bool isRadar,
                       int tx, int ty, int sc, bool withAlpha,
                       RadarCenterSample* centerOut) -> bool {
     snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
@@ -642,11 +633,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     const bool ok = frameCacheStampRawToBand(
         frameBand, bandY, bandRows, rawPath, ap, ox, oy, sc, withAlpha,
         centerOut);
-    if (cleanup) {
-      LittleFS.remove(rawPath);
-      if (ap) {
-        LittleFS.remove(ap);
-      }
+    LittleFS.remove(rawPath);
+    if (ap) {
+      LittleFS.remove(ap);
     }
     return ok;
   };
@@ -681,12 +670,14 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
           free(frameBand);
           return false;
         }
-        if (stampOne(bandY, bandRows, lastBand, false, tx, ty, 1, false,
-                     nullptr)) {
+        const bool decoded = decodeOne(false, tx, ty, false, lastBand);
+        if (decoded &&
+            stampOne(bandY, bandRows, false, tx, ty, 1, false, nullptr)) {
           ++baseBandStamped;
         } else {
-          Serial.printf("  basemap stamp FAIL z=%d x=%d y=%d bandY=%d\n",
-                        zoom, tx, ty, bandY);
+          Serial.printf(
+              "  basemap decode/stamp FAIL z=%d x=%d y=%d bandY=%d\n",
+              zoom, tx, ty, bandY);
         }
         afterBakeStep();
       }
@@ -716,7 +707,9 @@ bool composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
             free(frameBand);
             return false;
           }
-          if (stampOne(bandY, bandRows, lastBand, true, tx, ty, scale, true,
+          const bool decoded = decodeOne(true, tx, ty, true, lastBand);
+          if (decoded &&
+              stampOne(bandY, bandRows, true, tx, ty, scale, true,
                        &centerSample) &&
               lastBand) {
             ++stamped;

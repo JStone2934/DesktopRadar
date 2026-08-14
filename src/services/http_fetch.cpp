@@ -296,7 +296,10 @@ static int readHttpBody(HTTPClient& http, Stream& sink, int contentLength,
 static bool httpSetup(HTTPClient& http, WiFiClientSecure& client, const char* url,
                       const char* referer, uint32_t timeoutMs) {
   client.setInsecure();
-  client.setTimeout(timeoutMs / 1000);
+  // Arduino-ESP32 3.x 的 NetworkClientSecure 继承 Stream，单位是毫秒。
+  // 旧写法除以 1000 后实际只有 10–15ms，较大的 PNG 常在约 65KB 处被
+  // 一次正常的网络间隙截断。
+  client.setTimeout(timeoutMs);
   http.setTimeout(timeoutMs);
   http.setConnectTimeout(timeoutMs);
   http.setReuse(false);
@@ -321,6 +324,11 @@ uint8_t* httpFetch(const char* url, const char* referer, size_t maxBytes,
     *outLen = 0;
   }
   if (!url || !outLen || maxBytes == 0) {
+    return nullptr;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("HTTP skipped: WiFi offline (status=%d)\n",
+                  (int)WiFi.status());
     return nullptr;
   }
 
@@ -375,6 +383,11 @@ bool httpFetchToFile(const char* url, const char* referer, fs::File& out,
     *outLen = 0;
   }
   if (!url || !out) {
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("HTTP file skipped: WiFi offline (status=%d)\n",
+                  (int)WiFi.status());
     return false;
   }
 
