@@ -79,14 +79,20 @@ static void scheduleWifiRetry() {
 }
 
 static void noteUserInteraction() {
-  const uint32_t until = millis() + CACHE_PAUSE_AFTER_USER_MS;
+  const uint32_t pauseMs = s_cfg.show_wind_particles
+                               ? WIND_CACHE_PAUSE_AFTER_USER_MS
+                               : CACHE_PAUSE_AFTER_USER_MS;
+  const uint32_t until = millis() + pauseMs;
   if (until > s_cachePauseUntil) {
     s_cachePauseUntil = until;
   }
 }
 
 static bool cachePaused() {
-  return (int32_t)(millis() - s_cachePauseUntil) < 0;
+  // 松开后才产生短按事件；把实际按下电平也视为暂停，堵住“刚按下但
+  // 后台任务抢先一步启动”的偶发竞态。
+  return buttonIsDown() ||
+         (int32_t)(millis() - s_cachePauseUntil) < 0;
 }
 
 static inline int zoomRefreshSlot(int zoom) { return zoom - ZOOM_MIN; }
@@ -472,7 +478,12 @@ static void serviceWindField() {
       s_displayedZoom > ZOOM_MAX) {
     return;
   }
+  // 先切换视口并装入磁盘旧场，粒子可以立刻恢复；静默期只拦截后面的
+  // HTTPS 更新，避免为了“秒切优先”反而让已有风场空白一分钟。
   windFieldSelect(s_cfg.lat, s_cfg.lon, s_displayedZoom);
+  if (cachePaused()) {
+    return;
+  }
   if (windFieldService()) {
     handlePendingZoom();
   }
@@ -928,7 +939,10 @@ void loop() {
   scheduleWindStaticRefreshes();
 
   const bool due = refreshIsDue();
-  if (!s_busyCompose && due) {
+  // 风场模式下切档先保证旧缓存秒切与新档动画稳定；用户停止操作 60 秒后
+  // 才允许启动耗时的当前档静态刷新。关闭风场时维持原来的刷新时序。
+  const bool deferWindRefresh = s_cfg.show_wind_particles && cachePaused();
+  if (!s_busyCompose && due && !deferWindRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
       Serial.printf("scheduled refresh focus z%d (%s) free=%u\n", z,
@@ -964,6 +978,23 @@ void loop() {
         handlePendingZoom();
         zoomPrefetchResetAround(zoomCurrent());
       } else {
+        const bool userInterrupted =
+            s_cfg.show_wind_particles &&
+            (composeAbortRequested() || zoomCurrent() != z ||
+             (s_displayedZoom >= ZOOM_MIN && s_displayedZoom != z));
+        if (userInterrupted) {
+          // 切档中止刷新不是网络故障：保留连接与旧缓存，并重新给用户完整的
+          // 静默窗口。否则会误触发断网重连，再立刻刷新下一档，形成卡顿循环。
+          s_refreshFailAt = 0;
+          zoomPrefetchClear();
+          noteUserInteraction();
+          Serial.printf(
+              "scheduled refresh z%d interrupted by zoom switch; keep WiFi and cache\n",
+              z);
+          handlePendingZoom();
+          zoomPrefetchResetAround(zoomCurrent());
+          return;
+        }
         s_refreshFailAt = millis() == 0 ? 1 : millis();
         zoomPrefetchClear();
         Serial.printf("refresh fail, retry in %lus free=%u\n",

@@ -66,6 +66,8 @@
 
 // 用户切换后暂停后台预取，避免下载/烘焙任务连续抢占按键响应。
 #define CACHE_PAUSE_AFTER_USER_MS 10000UL
+// 风场模式以全档缓存秒切为最高优先级；用户停止操作一分钟后才恢复静态后台刷新。
+#define WIND_CACHE_PAUSE_AFTER_USER_MS 60000UL
 
 // ---- 数据源 ----
 #define RAINVIEWER_API "https://api.rainviewer.com/public/weather-maps.json"
@@ -97,7 +99,7 @@
 #define WIND_FIELD_RETRY_MS (30UL * 1000UL)
 #define WIND_FIELD_SLOW_RETRY_MS (10UL * 60UL * 1000UL)
 #define WIND_FIELD_FAST_RETRY_LIMIT 3
-#define WIND_FIELD_SETTLE_MS 800UL
+#define WIND_FIELD_SETTLE_MS 2500UL
 #define WIND_HTTP_TIMEOUT_MS 20000UL
 #define WIND_MAX_JSON_BYTES (28UL * 1024UL)
 
