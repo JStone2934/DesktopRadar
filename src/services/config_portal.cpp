@@ -7,17 +7,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "button.h"
 #include "config.h"
 #include "setup_screen.h"
+#include "update_manager.h"
 #include "zoom_ctrl.h"
 
 static WebServer* s_server = nullptr;
 static LGFX* s_portalLcd = nullptr;
 static volatile bool s_saved = false;
+static volatile bool s_updateRequested = false;
 static volatile bool s_webActive = false;
 static uint32_t s_saveRedirectAt = 0;  // POST 成功后等待 /done；超时兜底关门户
+static uint32_t s_updateRedirectAt = 0;
 static AppConfig s_formCfg;
 static AppConfig s_seedCfg;
 
@@ -207,6 +211,19 @@ static void floatToBuf(float v, char* buf, size_t n) {
   }
 }
 
+static void formatPortalTime(uint64_t epoch, char* out, size_t capacity) {
+  if (!out || capacity == 0) return;
+  if (epoch < 1700000000ULL) {
+    snprintf(out, capacity, "尚未完成");
+    return;
+  }
+  const time_t local = static_cast<time_t>(epoch + TIMEZONE_OFFSET_SEC);
+  struct tm value{};
+  gmtime_r(&local, &value);
+  snprintf(out, capacity, "%04d-%02d-%02d %02d:%02d", value.tm_year + 1900,
+           value.tm_mon + 1, value.tm_mday, value.tm_hour, value.tm_min);
+}
+
 static void appendEscaped(String& out, const char* s) {
   if (!s) {
     return;
@@ -252,8 +269,20 @@ static void handleRoot() {
   const bool latSouth = s_seedCfg.lat < 0.0f;
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
+  UpdatePortalInfo updateInfo{};
+  updateManagerGetPortalInfo(&updateInfo);
+  char lastSuccess[32];
+  formatPortalTime(updateInfo.lastSuccess, lastSuccess, sizeof(lastSuccess));
+  char lastAttempt[32];
+  formatPortalTime(updateInfo.lastAttempt, lastAttempt, sizeof(lastAttempt));
+  char lastErrorAt[32];
+  formatPortalTime(updateInfo.lastErrorAt, lastErrorAt, sizeof(lastErrorAt));
+  char publishedAt[32];
+  formatPortalTime(updateInfo.manifest.publishedAt, publishedAt,
+                   sizeof(publishedAt));
+
   String html;
-  html.reserve(16000);
+  html.reserve(20000);
   html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Cache-Control\" content=\"no-store\">"
@@ -306,6 +335,10 @@ static void handleRoot() {
             ".actions{padding:0 2px}"
             ".footerhint{background:#e8ecf2;border:1px solid #a8b0bd;color:#253449;border-radius:1px;padding:11px 12px;margin-top:10px}"
             ".footerhint:before{content:'NOTICE';display:block;margin-bottom:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;font-weight:800;letter-spacing:.12em;color:#9b3b3b;border-left:7px solid #9b3b3b;padding-left:6px}"
+            ".update-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin:10px 0;font-size:.84rem}.update-meta b{color:#172033}.update-meta span{color:#5d6878;word-break:break-word}"
+            ".warning{padding:10px 11px;background:#fff3df;border:1px solid #d8af6c;color:#6d4a16;font-size:.82rem;margin-top:10px}"
+            ".error{padding:10px 11px;background:#fff1f3;border:1px solid #d99aa4;color:#8b2f3e;font-size:.82rem;margin-top:10px}"
+            "button:disabled{opacity:.5;box-shadow:none}"
             ".footer{text-align:center;margin:18px 0 0;color:#5d6878;font-size:.82rem;letter-spacing:.03em}"
             ".footer .url{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#142d48;word-break:break-all;margin-top:4px;letter-spacing:0}"
             "/*retroHard*/"
@@ -459,8 +492,60 @@ static void handleRoot() {
             "<div class=\"guide\"><b>缩放切换响应较慢？</b>"
             "短按 S 键切换缩放。若设备正在下载或生成缓存，响应可能延迟数秒；等待进度完成后会恢复，通常无需重新配置 WiFi。</div>"
             "</section><div class=\"actions\"><button type=\"submit\">保存并连接目标 WiFi</button>"
-            "<p class=\"hint footerhint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>"
-            "<footer class=\"footer\">风场数据 Open-Meteo / ECMWF<span class=\"url\">https://open-meteo.com/</span><br>项目源码<span class=\"url\">"
+            "<p class=\"hint footerhint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>");
+
+  html += F("<section class=\"card\"><h2><span class=\"module\">FIRMWARE</span>固件更新</h2>"
+            "<div class=\"update-meta\"><b>当前版本</b><span>");
+  appendEscaped(html, updateInfo.currentVersion);
+  html += F(" · ");
+  appendEscaped(html, updateInfo.currentBuild);
+  html += F("</span><b>最近尝试检查</b><span>");
+  appendEscaped(html, lastAttempt);
+  html += F("</span><b>最近成功检查</b><span>");
+  appendEscaped(html, lastSuccess);
+  html += F("</span>");
+  if (updateInfo.haveManifest) {
+    html += F("<b>GitHub 最新版</b><span>");
+    appendEscaped(html, updateInfo.manifest.version);
+    html += F(" · ");
+    html += String(updateInfo.manifest.size / 1024U);
+    html += F(" KiB</span><b>发布日期</b><span>");
+    appendEscaped(html, publishedAt);
+    html += F("</span></div>");
+    if (updateInfo.manifest.notes[0]) {
+      html += F("<p class=\"hint\">");
+      appendEscaped(html, updateInfo.manifest.notes);
+      html += F("</p>");
+    }
+  } else {
+    html += F("</div><p class=\"hint\">设备尚未取得已签名的更新信息。请先退出配置页，让设备正常联网运行；设备每天检查一次。</p>");
+  }
+  if (updateInfo.lastError != UpdateError::None) {
+    html += F("<div class=\"error\">上次更新操作：");
+    appendEscaped(html, updateErrorName(updateInfo.lastError));
+    html += F("（");
+    appendEscaped(html, lastErrorAt);
+    html += F("）。本次确认前会再次联网核对，不会直接使用失效下载。</div>");
+  }
+  if (!updateInfo.factoryCompatible) {
+    html += F("<div class=\"warning\">当前设备尚未安装 recovery-v1 factory 基础环境，只能通过 USB 完成首次迁移。</div>"
+              "<button type=\"button\" disabled>当前需要 USB 升级</button>");
+  } else if (updateInfo.available) {
+    html += F("<div class=\"warning\">确认后热点会关闭；设备将重新联网核对版本，核对成功后才会清空雷达缓存并下载固件。未保存的本页配置修改不会带入升级。</div>"
+              "<form method=\"POST\" action=\"/update/confirm\">"
+              "<input type=\"hidden\" name=\"nonce\" value=\"");
+    html += String(updateInfo.nonce);
+    html += F("\"><input type=\"hidden\" name=\"version_code\" value=\"");
+    html += String(updateInfo.manifest.versionCode);
+    html += F("\"><label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\" required>"
+              "我了解缓存将被清除，升级期间热点会断开</label>"
+              "<button type=\"submit\">升级到 ");
+    appendEscaped(html, updateInfo.manifest.version);
+    html += F("</button></form>");
+  } else if (updateInfo.haveManifest) {
+    html += F("<p class=\"hint\">当前已是最新版。</p><button type=\"button\" disabled>暂无可用更新</button>");
+  }
+  html += F("</section><footer class=\"footer\">风场数据 Open-Meteo / ECMWF<span class=\"url\">https://open-meteo.com/</span><br>项目源码<span class=\"url\">"
             "https://github.com/JStone2934/DesktopRadar/tree/esp32c3</span></footer>"
             "<script>"
             "function pickScan(){var s=document.getElementById('scan'),x=s.options[s.selectedIndex];"
@@ -522,6 +607,17 @@ p{color:#5b6978;line-height:1.5;margin:8px 0}.small{font-size:.84rem;color:#7a87
 </body></html>
 )HTML";
 
+static const char kUpdateAcceptedHtml[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store"><title>升级已确认</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#edf0f4;color:#17212b;margin:0;padding:28px 16px;text-align:center}.card{max-width:420px;margin:36px auto;background:#fff;border:1px solid #a8b0bd;padding:24px 18px;box-shadow:4px 4px 0 rgba(16,24,39,.18)}h1{font-size:1.4rem}p{color:#5b6978;line-height:1.6}.ok{font-size:2rem;color:#19a763}</style>
+</head><body><div class="card"><div class="ok">✓</div><h1>固件升级已确认</h1>
+<p>RadarSetup 热点即将关闭，手机断开属于正常现象。</p>
+<p>设备会先重新联网核对版本；只有核对成功才会清空缓存并下载。后续进度请查看设备屏幕，请勿主动断电。</p>
+</div></body></html>
+)HTML";
+
 static void handleDone() {
   if (!s_server) {
     return;
@@ -543,6 +639,40 @@ static void handleDone() {
   // 浏览器跟完 PRG 拿到完成页后再关热点，避免历史记录卡在 POST
   s_saved = true;
   Serial.println("portal: /done served, closing soon");
+}
+
+static void handleUpdateAccepted() {
+  if (!s_server) return;
+  s_webActive = true;
+  sendNoStoreHeaders();
+  if (s_updateRedirectAt == 0) {
+    s_server->sendHeader("Location", "/", true);
+    s_server->send(302, "text/plain", "");
+    return;
+  }
+  s_server->sendHeader("Clear-Site-Data", "\"cache\"");
+  s_server->send_P(200, "text/html; charset=utf-8", kUpdateAcceptedHtml);
+  s_updateRequested = true;
+  Serial.println("portal: update accepted page served, closing soon");
+}
+
+static void handleUpdateConfirm() {
+  if (!s_server) return;
+  s_webActive = true;
+  const bool acknowledged = s_server->arg("ack") == "1";
+  const uint32_t nonce = strtoul(s_server->arg("nonce").c_str(), nullptr, 10);
+  const uint32_t version =
+      strtoul(s_server->arg("version_code").c_str(), nullptr, 10);
+  if (!acknowledged || !updateManagerRequestFromPortal(version, nonce)) {
+    sendNoStoreHeaders();
+    s_server->send(409, "text/plain; charset=utf-8",
+                   "更新信息已变化或设备不兼容，请返回后重试");
+    return;
+  }
+  sendNoStoreHeaders();
+  s_server->sendHeader("Location", "/update/accepted", true);
+  s_server->send(303, "text/plain", "");
+  s_updateRedirectAt = millis() == 0 ? 1 : millis();
 }
 static float parseCoord(String s, bool* ok) {
   s.trim();
@@ -785,8 +915,10 @@ static void handleNotFound() {
 PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   s_portalLcd = lcd;
   s_saved = false;
+  s_updateRequested = false;
   s_webActive = false;
   s_saveRedirectAt = 0;
+  s_updateRedirectAt = 0;
   memset(&s_formCfg, 0, sizeof(s_formCfg));
   if (!appConfigLoad(&s_seedCfg)) {
     appConfigSetDefaults(&s_seedCfg);
@@ -833,6 +965,8 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/done", HTTP_GET, handleDone);
+  server.on("/update/confirm", HTTP_POST, handleUpdateConfirm);
+  server.on("/update/accepted", HTTP_GET, handleUpdateAccepted);
   // 误用 GET /save（历史/刷新）时回到表单，不要当成已保存
   server.on("/save", HTTP_GET, []() {
     if (!s_server) {
@@ -873,6 +1007,21 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
         (millis() - s_saveRedirectAt) >= 1500) {
       Serial.println("portal: save redirect timeout, closing");
       s_saved = true;
+    }
+
+    if (!s_updateRequested && s_updateRedirectAt != 0 &&
+        (millis() - s_updateRedirectAt) >= 1500) {
+      Serial.println("portal: update redirect timeout, closing");
+      s_updateRequested = true;
+    }
+
+    if (s_updateRequested) {
+      result = PortalResult::UpdateRequested;
+      for (int i = 0; i < 30; ++i) {
+        server.handleClient();
+        delay(20);
+      }
+      break;
     }
 
     if (s_saved) {

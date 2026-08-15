@@ -23,6 +23,7 @@
 #include "progress_ring.h"
 #include "radar_font.h"
 #include "rainviewer.h"
+#include "update_manager.h"
 #include "wifi_sta.h"
 #include "wind_field.h"
 #include "wind_particles.h"
@@ -1231,6 +1232,17 @@ static void runPortalAndApply() {
 
   Serial.printf("portal result=%u ssid=%s\n", (unsigned)pr, s_cfg.ssid);
 
+  if (pr == PortalResult::UpdateRequested) {
+    if (!updateManagerExecuteConfirmed(&lcd, &s_cfg)) {
+      showStatus("Update cancelled", "See Web details");
+      delay(1200);
+      if (updateManagerConsumeFilesystemReset()) {
+        frameCacheBegin();
+        seedZoomRefreshTimesFromCache();
+      }
+    }
+  }
+
   if (pr == PortalResult::Saved) {
     if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
       clearAllFrameCaches("location change");
@@ -1287,10 +1299,19 @@ void setup() {
   composeSetCrosshairVisible(s_cfg.show_crosshair);
 
   showStatus("Storm Eye", "");
-  if (!frameCacheBegin()) {
+  updateManagerBegin();
+  const bool filesystemReady = frameCacheBegin();
+  if (!filesystemReady) {
     showStatus("FS fail", "no cache");
   }
-  startRadarWorker();
+  const bool workerReady = startRadarWorker();
+  if (!updateManagerConfirmFirstBoot(&lcd, filesystemReady, workerReady)) {
+    return;
+  }
+  if (!appConfigLoad(&s_cfg)) {
+    appConfigSetDefaults(&s_cfg);
+  }
+  updateManagerHandleBootResume(&lcd, &s_cfg);
   seedZoomRefreshTimesFromCache();
   windFieldBegin();
   windParticlesBegin();
@@ -1345,6 +1366,17 @@ void loop() {
       composeRequestAbort();
     }
     delay(50);
+    return;
+  }
+
+  const bool updateCheckMayStart =
+      !s_radarWorkActive && !initialCacheBootstrapActive() &&
+      frameCacheCountReady() >= frameCacheZoomSlots() && !cachePaused() &&
+      !heavyWorkCooling() && !buttonIsDown() && !zoomHasPending();
+  updateManagerServiceDailyCheck(updateCheckMayStart);
+  if (updateManagerBusy()) {
+    pumpWindAnimation(false);
+    delay(10);
     return;
   }
 

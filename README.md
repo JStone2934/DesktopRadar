@@ -11,8 +11,11 @@ ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。�
 - 可选 Open-Meteo / ECMWF 当前 10 米风场粒子；Web 开启后持续循环播放。
 - z3-z12 全档 RGB565 成品缓存；已缓存档位 Flash -> SPI 秒切。
 - 后台空闲预取相邻缩放档；进度条单调递增，不回撤。
+- 每日只检查 GitHub 更新信息；Reset 后由用户在 Web 页明确确认，使用
+  LittleFS 暂存和独立 factory 安装器完成断电可恢复升级。
 
-更完整的路线说明见 [docs/plan.md](docs/plan.md)。
+更完整的路线说明见 [docs/plan.md](docs/plan.md)，固件升级与首次 USB 迁移见
+[docs/ota-recovery.md](docs/ota-recovery.md)。
 
 ## 硬件
 
@@ -36,6 +39,11 @@ ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。�
 - SPI 写入频率默认 20 MHz，飞线较长时更稳；稳定后可在 [include/config.h](include/config.h) 中调高。
 
 ## 快速开始
+
+> **分区迁移提示：** `v0.1.x` 设备不能直接使用下面的普通 `pio upload`
+> 安装本版本，否则设备中不会有 factory 恢复器。首次升级到新布局必须按照
+> [OTA 恢复说明](docs/ota-recovery.md) 使用 `tools/install_base.py`；完成一次
+> 基础迁移后，日常开发才可继续使用普通上传命令。
 
 推荐使用仓库内的 Conda 环境：
 
@@ -164,15 +172,18 @@ B8:1F:3F:0C:7A:A0
 
 | 区域 | 大小 |
 |------|------|
+| factory | 0x80000，512 KiB |
 | app0 | 0x1B0000，约 1.69 MiB |
-| LittleFS | 0x230000，约 2.19 MiB |
+| LittleFS | 0x1B0000，约 1.69 MiB |
 | coredump | 0x10000 |
 
-正常更新直接烧录即可。只有文件系统损坏或需要清空所有 NVS/缓存时才全擦：
+旧 `v0.1.x` 必须先通过 USB 迁移到 recovery 布局，不能直接在线升级；迁移脚本
+会备份并保留 NVS。之后的正常更新在 Web 页确认即可：
 
 ```bash
-pio run -t erase
-pio run -t upload
+python3 tools/install_base.py --port /dev/cu.usbmodem101 \
+  --app dist/v0.2.0/DesktopRadar-v0.2.0-esp32c3.bin \
+  --factory dist/v0.2.0/factory-recovery-1.bin
 ```
 
 ## 常见问题
@@ -203,7 +214,8 @@ pio run -t upload
 
 ## 开发备注
 
-- 项目使用 Arduino framework，PlatformIO 平台固定为 `platformio/espressif32@6.12.0`。
+- 主程序使用 Arduino-ESP32 3.3.11 / ESP-IDF 5.5.5；factory 是独立的
+  ESP-IDF 5.5.5 工程。
 - `src/services/wifi_sta.cpp` 是 WiFi/PEAP 连接核心。
 - `src/services/config_portal.cpp` 是 SoftAP 配网页面。
 - `src/render/compose.cpp` 负责下载瓦片、解码和合成 RGB565。

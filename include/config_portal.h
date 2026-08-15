@@ -9,6 +9,7 @@ enum class PortalResult : uint8_t {
   TimedOut = 0,
   SkippedByButton,
   Saved,
+  UpdateRequested,
 };
 
 /**

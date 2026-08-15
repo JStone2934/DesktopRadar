@@ -5,6 +5,9 @@
 .vscode/ipch
 *.pyc
 __pycache__/
+factory/managed_components/
+factory/sdkconfig.*
+dist/
 serial_*.txt
 serial_btn.txt
 src/idf_component.yml.orig
