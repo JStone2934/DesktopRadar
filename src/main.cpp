@@ -229,37 +229,46 @@ static float initialCacheDone01() {
   return ready / (float)slots;
 }
 
+static void drawInitialCacheStaticLabels() {
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setFont(&radar_fonts::cn12);
+  lcd.setTextSize(1.25f);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString("雷达数据加载中...", LCD_WIDTH / 2, 137);
+}
+
 static void initialCacheScreenTick(bool force) {
   if (!s_initialCacheScreen) {
     return;
   }
   const uint32_t now = millis();
-  if (!force && (now - s_initialPulseDrawAt) < 55UL) {
+  if (!force && (now - s_initialPulseDrawAt) < 33UL) {
     return;
   }
 
-  // 2.2 秒一轮的平滑呼吸：最低仍清晰可见，峰值为纯白。
+  // 2.2 秒一轮的平滑呼吸。再做一层时间域低通，模拟屏幕余辉，
+  // 避免亮度量化在相邻帧间产生明显台阶。
   constexpr float kTwoPi = 6.28318530718f;
   const float phase = (float)(now % 2200UL) / 2200.0f;
   const float breath = 0.5f - 0.5f * cosf(kTwoPi * phase);
-  const int level = 72 + (int)lroundf(183.0f * breath);
-  if (!force && abs(level - s_initialPulseLevel) < 3) {
-    return;
+  const int targetLevel = 72 + (int)lroundf(183.0f * breath);
+  int level = targetLevel;
+  if (!force && s_initialPulseLevel >= 0) {
+    const int delta = targetLevel - s_initialPulseLevel;
+    level = s_initialPulseLevel + (int)lroundf((float)delta * 0.38f);
+    if (level == s_initialPulseLevel && delta != 0) {
+      level += delta > 0 ? 1 : -1;
+    }
   }
 
-  // 只重画文字带，底部进度条由独立控件维护，不产生整屏闪烁。
-  lcd.fillRect(28, 77, LCD_WIDTH - 56, 76, TFT_BLACK);
+  // 静态中文只在进页面时绘制一次；动画帧仅覆盖标题自身的字形框。
+  // 不再先清空 184x76 的整块区域，消除黑底擦除造成的整体闪烁。
   lcd.setTextDatum(MC_DATUM);
   lcd.setTextSize(1.0f);
   lcd.setFont(&fonts::Font4);
   const uint16_t titleColor = lcd.color565(level, level, level);
   lcd.setTextColor(titleColor, TFT_BLACK);
   lcd.drawString("Storm Eye", LCD_WIDTH / 2, 101);
-
-  lcd.setFont(&radar_fonts::cn12);
-  lcd.setTextSize(1.25f);
-  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.drawString("雷达数据加载中...", LCD_WIDTH / 2, 137);
 
   progressRingUpdate(&lcd, initialCacheDone01(), -1);
   s_initialPulseDrawAt = now;
@@ -282,6 +291,7 @@ static void beginInitialCacheScreen() {
   s_initialPulseDrawAt = 0;
   s_initialPulseLevel = -1;
   lcd.fillScreen(TFT_BLACK);
+  drawInitialCacheStaticLabels();
   initialCacheScreenTick(true);
   Serial.printf("initial cache screen: ready=%d/%d\n", frameCacheCountReady(),
                 frameCacheZoomSlots());
