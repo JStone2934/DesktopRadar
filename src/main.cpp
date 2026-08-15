@@ -29,11 +29,6 @@
 #include "wind_particles.h"
 #include "zoom_ctrl.h"
 
-// Web rendering and the recovery/update path use formatting and TLS routines
-// whose call chains can exceed Arduino's default 8 KiB loopTask stack. The
-// device still retains ample heap with a 16 KiB UI task stack.
-SET_LOOP_TASK_STACK_SIZE(16 * 1024);
-
 static LGFX lcd;
 static AppConfig s_cfg;
 
