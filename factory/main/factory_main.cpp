@@ -31,6 +31,7 @@ constexpr char kPackagePath[] = "/littlefs/update/firmware.bin";
 spi_device_handle_t s_lcd = nullptr;
 bool s_littlefsMounted = false;
 UpdateManifestRecord s_manifestRecord{};
+uint8_t s_ioBuffer[kIoBlock]{};
 
 // 5x7 glyphs: A-Z, 0-9, then space, %, -, /, ., :.
 constexpr uint8_t kGlyphs[][5] = {
@@ -223,15 +224,14 @@ bool hashFile(const char* path, uint8_t digest[32], size_t* outSize) {
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
   bool ok = mbedtls_sha256_starts(&sha, 0) == 0;
-  uint8_t buffer[kIoBlock];
   size_t total = 0;
   while (ok) {
-    const size_t count = fread(buffer, 1, sizeof(buffer), file);
+    const size_t count = fread(s_ioBuffer, 1, sizeof(s_ioBuffer), file);
     if (count > 0) {
       total += count;
-      ok = mbedtls_sha256_update(&sha, buffer, count) == 0;
+      ok = mbedtls_sha256_update(&sha, s_ioBuffer, count) == 0;
     }
-    if (count < sizeof(buffer)) {
+    if (count < sizeof(s_ioBuffer)) {
       if (ferror(file)) ok = false;
       break;
     }
@@ -305,18 +305,19 @@ UpdateError installOnce(UpdateJournal* journal,
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
   bool ok = mbedtls_sha256_starts(&sha, 0) == 0;
-  uint8_t buffer[kIoBlock];
   size_t total = 0;
   int shown = -10;
   while (ok && total < manifest.manifest.size) {
-    const size_t want = manifest.manifest.size - total < sizeof(buffer)
-                            ? manifest.manifest.size - total : sizeof(buffer);
-    const size_t count = fread(buffer, 1, want, file);
-    if (count != want || mbedtls_sha256_update(&sha, buffer, count) != 0) {
+    const size_t want = manifest.manifest.size - total < sizeof(s_ioBuffer)
+                            ? manifest.manifest.size - total
+                            : sizeof(s_ioBuffer);
+    const size_t count = fread(s_ioBuffer, 1, want, file);
+    if (count != want ||
+        mbedtls_sha256_update(&sha, s_ioBuffer, count) != 0) {
       ok = false;
       break;
     }
-    result = esp_ota_write(handle, buffer, count);
+    result = esp_ota_write(handle, s_ioBuffer, count);
     if (result != ESP_OK) {
       ok = false;
       break;
@@ -348,10 +349,11 @@ UpdateError installOnce(UpdateJournal* journal,
   ok = mbedtls_sha256_starts(&sha, 0) == 0;
   total = 0;
   while (ok && total < manifest.manifest.size) {
-    const size_t count = manifest.manifest.size - total < sizeof(buffer)
-                             ? manifest.manifest.size - total : sizeof(buffer);
-    if (esp_partition_read(app, total, buffer, count) != ESP_OK ||
-        mbedtls_sha256_update(&sha, buffer, count) != 0) {
+    const size_t count = manifest.manifest.size - total < sizeof(s_ioBuffer)
+                             ? manifest.manifest.size - total
+                             : sizeof(s_ioBuffer);
+    if (esp_partition_read(app, total, s_ioBuffer, count) != ESP_OK ||
+        mbedtls_sha256_update(&sha, s_ioBuffer, count) != 0) {
       ok = false;
       break;
     }

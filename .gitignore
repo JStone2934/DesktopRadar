@@ -7,6 +7,7 @@
 __pycache__/
 factory/managed_components/
 factory/sdkconfig.*
+!factory/sdkconfig.defaults
 dist/
 serial_*.txt
 serial_btn.txt
