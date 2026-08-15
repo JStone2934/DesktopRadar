@@ -95,6 +95,14 @@ static void alertPath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.alert", zoom);
 }
 
+static void radarColorGridPath(int zoom, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d.rgrid", zoom);
+}
+
+static void radarColorGridNewPath(int zoom, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d.rgrid.new", zoom);
+}
+
 static void radarTimePath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.time", zoom);
 }
@@ -802,6 +810,10 @@ bool frameCacheRemove(int zoom) {
   LittleFS.remove(path);
   alertPath(zoom, path, sizeof(path));
   LittleFS.remove(path);
+  radarColorGridPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  radarColorGridNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
   radarTimePath(zoom, path, sizeof(path));
   LittleFS.remove(path);
   radarTimeNewPath(zoom, path, sizeof(path));
@@ -1390,6 +1402,135 @@ void frameCacheRemoveAlert(int zoom) {
   LittleFS.remove(path);
 }
 
+bool frameCacheWriteRadarColorGrid(int zoom, const RadarColorGrid* grid,
+                                   uint32_t radarTime) {
+  if (!grid || zoom < ZOOM_MIN || zoom > ZOOM_MAX || radarTime == 0) {
+    return false;
+  }
+  static_assert(RADAR_COLOR_GRID_COLS * RADAR_COLOR_GRID_CELL == LCD_WIDTH,
+                "radar color grid must cover LCD width exactly");
+  static_assert(RADAR_COLOR_GRID_ROWS * RADAR_COLOR_GRID_CELL == LCD_HEIGHT,
+                "radar color grid must cover LCD height exactly");
+  if (!LittleFS.exists("/frames")) {
+    LittleFS.mkdir("/frames");
+  }
+
+  // 12B header: magic, dimensions/version, radar Unix time. Payload is all
+  // native RGB565 cells followed by all alpha cells (2700B at 30x30).
+  const uint8_t header[12] = {
+      'R', 'C', 'G', '1',
+      (uint8_t)RADAR_COLOR_GRID_COLS,
+      (uint8_t)RADAR_COLOR_GRID_ROWS,
+      (uint8_t)RADAR_COLOR_GRID_CELL,
+      1,
+      (uint8_t)radarTime,
+      (uint8_t)(radarTime >> 8),
+      (uint8_t)(radarTime >> 16),
+      (uint8_t)(radarTime >> 24),
+  };
+  char path[40];
+  char newPath[40];
+  radarColorGridPath(zoom, path, sizeof(path));
+  radarColorGridNewPath(zoom, newPath, sizeof(newPath));
+  LittleFS.remove(newPath);
+  File f = LittleFS.open(newPath, "w");
+  if (!f) {
+    return false;
+  }
+  const size_t colorBytes = sizeof(grid->color565);
+  const size_t alphaBytes = sizeof(grid->alpha);
+  const bool ok = f.write(header, sizeof(header)) == sizeof(header) &&
+                  f.write(reinterpret_cast<const uint8_t*>(grid->color565),
+                          colorBytes) == colorBytes &&
+                  f.write(grid->alpha, alphaBytes) == alphaBytes;
+  f.flush();
+  f.close();
+  if (!ok) {
+    LittleFS.remove(newPath);
+    return false;
+  }
+  LittleFS.remove(path);
+  if (!LittleFS.rename(newPath, path)) {
+    LittleFS.remove(newPath);
+    return false;
+  }
+  return true;
+}
+
+bool frameCacheSampleRadarColor(int zoom, int x, int y, bool* hasCloud,
+                                uint16_t* color565) {
+  if (!hasCloud || !color565 || zoom < ZOOM_MIN || zoom > ZOOM_MAX || x < 0 ||
+      x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) {
+    return false;
+  }
+  *hasCloud = false;
+  *color565 = 0;
+  uint32_t committedTime = 0;
+  if (!frameCacheReadRadarTime(zoom, &committedTime)) {
+    return false;
+  }
+
+  char path[40];
+  radarColorGridPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  constexpr size_t kHeaderBytes = 12;
+  constexpr size_t kColorBytes =
+      (size_t)RADAR_COLOR_GRID_COUNT * sizeof(uint16_t);
+  constexpr size_t kExpectedBytes =
+      kHeaderBytes + kColorBytes + (size_t)RADAR_COLOR_GRID_COUNT;
+  if (!f || f.size() != kExpectedBytes) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+  uint8_t header[kHeaderBytes];
+  if (f.read(header, sizeof(header)) != sizeof(header) || header[0] != 'R' ||
+      header[1] != 'C' || header[2] != 'G' || header[3] != '1' ||
+      header[4] != RADAR_COLOR_GRID_COLS ||
+      header[5] != RADAR_COLOR_GRID_ROWS ||
+      header[6] != RADAR_COLOR_GRID_CELL || header[7] != 1) {
+    f.close();
+    return false;
+  }
+  const uint32_t gridTime =
+      (uint32_t)header[8] | ((uint32_t)header[9] << 8) |
+      ((uint32_t)header[10] << 16) | ((uint32_t)header[11] << 24);
+  if (gridTime == 0 || gridTime != committedTime) {
+    f.close();
+    return false;
+  }
+
+  const int gx = x / RADAR_COLOR_GRID_CELL;
+  const int gy = y / RADAR_COLOR_GRID_CELL;
+  const size_t index = (size_t)gy * RADAR_COLOR_GRID_COLS + gx;
+  uint16_t color = 0;
+  uint8_t alpha = 0;
+  if (!f.seek(kHeaderBytes + index * sizeof(uint16_t)) ||
+      f.read(reinterpret_cast<uint8_t*>(&color), sizeof(color)) !=
+          sizeof(color) ||
+      !f.seek(kHeaderBytes + kColorBytes + index) ||
+      f.read(&alpha, 1) != 1) {
+    f.close();
+    return false;
+  }
+  f.close();
+  *hasCloud = alpha >= 40;
+  *color565 = *hasCloud ? color : 0;
+  return true;
+}
+
+void frameCacheRemoveRadarColorGrid(int zoom) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return;
+  }
+  char path[40];
+  radarColorGridPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+  radarColorGridNewPath(zoom, path, sizeof(path));
+  LittleFS.remove(path);
+}
+
 static inline void accumulateCenterSample(RadarCenterSample* centerOut, int x,
                                           int y, uint16_t pix, uint8_t a) {
   if (!centerOut || a == 0) {
@@ -1409,10 +1550,28 @@ static inline void accumulateCenterSample(RadarCenterSample* centerOut, int x,
   centerOut->sumA += a;
 }
 
+static inline void accumulateRadarColorGrid(RadarColorGrid* gridOut, int x,
+                                            int y, uint16_t pix, uint8_t a) {
+  if (!gridOut || a == 0 || x < 0 || x >= LCD_WIDTH || y < 0 ||
+      y >= LCD_HEIGHT) {
+    return;
+  }
+  const int gx = x / RADAR_COLOR_GRID_CELL;
+  const int gy = y / RADAR_COLOR_GRID_CELL;
+  const int index = gy * RADAR_COLOR_GRID_COLS + gx;
+  // 一个 8x8 单元只保留最不透明的雷达源像素。比对最终合成色可靠，且
+  // 不会把道路、地名、十字或底栏误判为云图颜色。
+  if (a > gridOut->alpha[index]) {
+    gridOut->alpha[index] = a;
+    gridOut->color565[index] = pix;
+  }
+}
+
 bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
                               const char* rawPath, const char* alphaPath,
                               int pasteX, int pasteY, int scale, bool alphaKey,
-                              RadarCenterSample* centerOut) {
+                              RadarCenterSample* centerOut,
+                              RadarColorGrid* colorGridOut) {
   if (!frame || !rawPath || scale < 1 || bandY < 0 || bandHeight < 1 ||
       bandY + bandHeight > LCD_HEIGHT) {
     return false;
@@ -1494,6 +1653,7 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
         const uint16_t pix = row0[dx];
         if (useAlpha) {
           accumulateCenterSample(centerOut, x, y, pix, a0[dx]);
+          accumulateRadarColorGrid(colorGridOut, x, y, pix, a0[dx]);
           dst[x] = blend565(pix, dst[x], a0[dx]);
         } else if (alphaKey) {
           if (pix == 0) {
@@ -1625,6 +1785,7 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
         const uint16_t pix = (uint16_t)(((ra / aa) << 11) | ((ga / aa) << 5) | (ba / aa));
         const uint8_t a8 = (uint8_t)(aa > 255 ? 255 : aa);
         accumulateCenterSample(centerOut, x, y, pix, a8);
+        accumulateRadarColorGrid(colorGridOut, x, y, pix, a8);
         dst[x] = blend565(pix, dst[x], a8);
       } else {
         const uint16_t c00 = row0[x0];
@@ -1655,9 +1816,11 @@ bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
 bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
                                 const char* alphaPath, int pasteX, int pasteY,
                                 int scale, bool alphaKey,
-                                RadarCenterSample* centerOut) {
+                                RadarCenterSample* centerOut,
+                                RadarColorGrid* colorGridOut) {
   return frameCacheStampRawToBand(frame, 0, LCD_HEIGHT, rawPath, alphaPath,
-                                  pasteX, pasteY, scale, alphaKey, centerOut);
+                                  pasteX, pasteY, scale, alphaKey, centerOut,
+                                  colorGridOut);
 }
 
 static inline uint16_t bilSample(const uint16_t* tile, float sx, float sy) {

@@ -21,6 +21,8 @@
 static ComposeProgressFn s_progressFn = nullptr;
 static ComposeDisplayFn s_displayFn = nullptr;
 static bool s_crosshairVisible = true;
+// 仅在后台造片时使用；静态分配避免在 38.4KB 分段帧已分配后产生堆碎片。
+static RadarColorGrid s_radarColorGrid;
 
 void composeSetProgressFn(ComposeProgressFn fn) { s_progressFn = fn; }
 void composeSetDisplayFn(ComposeDisplayFn fn) { s_displayFn = fn; }
@@ -678,7 +680,7 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
         (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
     const bool ok = frameCacheStampRawToBand(
         frameBand, bandY, bandRows, rawPath, ap, ox, oy, sc, withAlpha,
-        centerOut);
+        centerOut, withAlpha ? &s_radarColorGrid : nullptr);
     LittleFS.remove(rawPath);
     if (ap) {
       LittleFS.remove(ap);
@@ -688,6 +690,7 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
 
   RadarCenterSample centerSample;
   radarCenterSampleReset(&centerSample);
+  memset(&s_radarColorGrid, 0, sizeof(s_radarColorGrid));
 
   int stamped = 0;
   int baseStamped = 0;
@@ -823,14 +826,20 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   // 下一轮“时间相同可跳过”的可信标记。旧 4B 时间也在此惰性迁移。
   frameCacheRemoveRadarTime(zoom);
   frameCacheRemoveAlert(zoom);
+  frameCacheRemoveRadarColorGrid(zoom);
   bool hasCloud = false;
   uint16_t alertColor = 0;
   radarCenterSampleFinalize(&centerSample, &hasCloud, &alertColor);
   const bool alertOk = frameCacheWriteAlert(zoom, hasCloud, alertColor);
+  const bool colorGridOk =
+      frameCacheWriteRadarColorGrid(zoom, &s_radarColorGrid, meta.time);
   Serial.printf("center alert hasCloud=%d color=%04x maxA=%u ok=%d\n",
                 (int)hasCloud, (unsigned)alertColor,
                 (unsigned)centerSample.maxAlpha, (int)alertOk);
-  if (alertOk && meta.time != 0 &&
+  Serial.printf("radar color grid z%d bytes=%u ok=%d\n", zoom,
+                (unsigned)(sizeof(s_radarColorGrid) + 12U),
+                (int)colorGridOk);
+  if (alertOk && colorGridOk && meta.time != 0 &&
       !frameCacheWriteRadarTime(zoom, meta.time)) {
     Serial.printf("radar time commit fail z%d t=%lu\n", zoom,
                   (unsigned long)meta.time);

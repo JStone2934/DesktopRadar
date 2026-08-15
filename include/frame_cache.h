@@ -18,6 +18,21 @@ struct RadarCenterSample {
   uint8_t maxAlpha;
 };
 
+// 雷达源图按 8x8 屏幕像素降采样；每格保留 alpha 最大的源色，供动态
+// 覆盖层判断当前位置是否有云。该网格不包含底图、十字或底栏颜色。
+static constexpr int RADAR_COLOR_GRID_CELL = 8;
+static constexpr int RADAR_COLOR_GRID_COLS =
+    LCD_WIDTH / RADAR_COLOR_GRID_CELL;
+static constexpr int RADAR_COLOR_GRID_ROWS =
+    LCD_HEIGHT / RADAR_COLOR_GRID_CELL;
+static constexpr int RADAR_COLOR_GRID_COUNT =
+    RADAR_COLOR_GRID_COLS * RADAR_COLOR_GRID_ROWS;
+
+struct RadarColorGrid {
+  uint16_t color565[RADAR_COLOR_GRID_COUNT];
+  uint8_t alpha[RADAR_COLOR_GRID_COUNT];
+};
+
 bool frameCacheBegin();
 
 /** 成品 RGB565 已就绪（ready + 长度校验）。 */
@@ -131,7 +146,8 @@ bool frameCachePromoteNewNoReady(int zoom);
 bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
                                 const char* alphaPath, int pasteX, int pasteY,
                                 int scale, bool alphaKey,
-                                RadarCenterSample* centerOut = nullptr);
+                                RadarCenterSample* centerOut = nullptr,
+                                RadarColorGrid* colorGridOut = nullptr);
 
 /**
  * frameCacheStampRawToBuffer 的分段版本；frame 的第 0 行对应屏幕 bandY。
@@ -139,7 +155,8 @@ bool frameCacheStampRawToBuffer(uint16_t* frame, const char* rawPath,
 bool frameCacheStampRawToBand(uint16_t* frame, int bandY, int bandHeight,
                               const char* rawPath, const char* alphaPath,
                               int pasteX, int pasteY, int scale, bool alphaKey,
-                              RadarCenterSample* centerOut = nullptr);
+                              RadarCenterSample* centerOut = nullptr,
+                              RadarColorGrid* colorGridOut = nullptr);
 
 /**
  * 将 256×256 RGB565 瓦片写入成品文件（慢，仅兼容保留）。
@@ -156,6 +173,15 @@ void frameCacheRemoveRadarTime(int zoom);
 bool frameCacheWriteAlert(int zoom, bool hasCloud, uint16_t color565);
 bool frameCacheReadAlert(int zoom, bool* hasCloud, uint16_t* color565);
 void frameCacheRemoveAlert(int zoom);
+
+/** 原子保存纯雷达颜色采样网格；radarTime 用于拒绝与成品不匹配的旧网格。 */
+bool frameCacheWriteRadarColorGrid(int zoom, const RadarColorGrid* grid,
+                                   uint32_t radarTime);
+
+/** 读取屏幕位置所属 8x8 单元的纯雷达颜色；无云时 hasCloud=false。 */
+bool frameCacheSampleRadarColor(int zoom, int x, int y, bool* hasCloud,
+                                uint16_t* color565);
+void frameCacheRemoveRadarColorGrid(int zoom);
 
 /** 由 RadarCenterSample 得到 hasCloud + RGB565；无有效样本返回 false。 */
 bool radarCenterSampleFinalize(const RadarCenterSample* s, bool* hasCloud,

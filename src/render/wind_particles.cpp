@@ -47,6 +47,8 @@ static constexpr int kWidePathCapacity = 32;
 static constexpr float kWidePathStep = 10.0f;
 static constexpr int kWideSeedGrid = 5;
 static constexpr int kZoomSlots = ZOOM_MAX - ZOOM_MIN + 1;
+static constexpr uint16_t kWideFallbackColor = 0xE7FF;  // RGB(225,253,255)
+static constexpr uint32_t kWideColorTransitionMs = 600UL;
 
 static Particle s_particles[WIND_PARTICLE_COUNT];
 static TrailPixel s_trails[kTrailPixelCapacity];
@@ -82,6 +84,13 @@ static float s_widePathLength = 0.0f;
 static float s_wideSeedX[kZoomSlots];
 static float s_wideSeedY[kZoomSlots];
 static bool s_wideSeedValid[kZoomSlots];
+static uint16_t s_wideColorCurrent = kWideFallbackColor;
+static uint16_t s_wideColorFrom = kWideFallbackColor;
+static uint16_t s_wideColorTarget = kWideFallbackColor;
+static uint32_t s_wideColorTransitionAt = 0;
+static bool s_wideColorReady = false;
+static bool s_wideColorSamplePending = true;
+static bool s_wideColorHasCloud = false;
 
 static constexpr uint8_t kTrailHead = 0x01;
 // 只用于开放式箭翼：本帧以头部颜色绘制，下一帧恢复静态底色，
@@ -110,6 +119,9 @@ static ArrowOffset
 static uint8_t s_wideArrowMaskCounts[kWideDirectionCount];
 static float s_wideDirectionVectors[kWideDirectionCount][2];
 static bool s_wideArrowMasksReady = false;
+
+static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t alpha);
+static uint16_t currentWideQueueColor(uint32_t now);
 
 static int styleParticleCount() {
   return s_style == WIND_PARTICLE_WIDE_ARROW ? kWideQueueSlots
@@ -201,6 +213,13 @@ static void resetAll(int zoom, uint32_t revision) {
   s_wideDirectionValid = false;
   s_widePathCount = 0;
   s_widePathLength = 0.0f;
+  s_wideColorCurrent = kWideFallbackColor;
+  s_wideColorFrom = kWideFallbackColor;
+  s_wideColorTarget = kWideFallbackColor;
+  s_wideColorTransitionAt = 0;
+  s_wideColorReady = false;
+  s_wideColorSamplePending = true;
+  s_wideColorHasCloud = false;
   Serial.printf("wind particles reset z%d count=%d fieldRev=%lu style=%u\n",
                 zoom, s_activeParticleCount, (unsigned long)revision,
                 (unsigned)s_style);
@@ -538,6 +557,7 @@ static bool buildWidePath(uint32_t revision) {
     s_wideQueueSpacing = 18.0f;
   }
   s_wideQueuePhase = 0.0f;
+  s_wideColorSamplePending = true;
   Serial.printf(
       "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f spacing=%.1f\n",
       s_seenZoom, bestX, bestY, (int)switched, candidateScore,
@@ -872,11 +892,87 @@ static uint8_t widePathAlpha(float distance) {
   return (uint8_t)lroundf(smooth * 255.0f);
 }
 
+static uint16_t brightenCloudColor(uint16_t color) {
+  int r = (int)(((color >> 11) & 0x1F) * 255U / 31U);
+  int g = (int)(((color >> 5) & 0x3F) * 255U / 63U);
+  int b = (int)((color & 0x1F) * 255U / 31U);
+  const int peak = max(r, max(g, b));
+  // 雷达低级别色有时较暗；只抬高亮度、不改变色相，避免同色箭头
+  // 完全融入云图。高亮黄/红等原色保持不变。
+  constexpr int kMinimumPeak = 184;
+  if (peak > 0 && peak < kMinimumPeak) {
+    r = min(255, r * kMinimumPeak / peak);
+    g = min(255, g * kMinimumPeak / peak);
+    b = min(255, b * kMinimumPeak / peak);
+  }
+  return (uint16_t)(((uint16_t)(r >> 3) << 11) |
+                    ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
+}
+
+static uint16_t currentWideQueueColor(uint32_t now) {
+  if (!s_wideColorReady || s_wideColorCurrent == s_wideColorTarget) {
+    return s_wideColorCurrent;
+  }
+  const uint32_t elapsed = now - s_wideColorTransitionAt;
+  if (elapsed >= kWideColorTransitionMs) {
+    s_wideColorCurrent = s_wideColorTarget;
+    s_wideColorFrom = s_wideColorTarget;
+    return s_wideColorCurrent;
+  }
+  const uint8_t alpha =
+      (uint8_t)((elapsed * 255UL) / kWideColorTransitionMs);
+  s_wideColorCurrent = blend565(s_wideColorTarget, s_wideColorFrom, alpha);
+  return s_wideColorCurrent;
+}
+
+static void refreshWideQueueColor() {
+  if (!s_wideColorSamplePending || s_widePathCount < 2 ||
+      s_seenZoom < ZOOM_MIN || s_seenZoom > ZOOM_MAX) {
+    return;
+  }
+  s_wideColorSamplePending = false;
+
+  // 在入口淡入段中点取样：这里是用户实际看见第一个箭头的位置，且比
+  // 圆屏裁切边缘更稳定。整列只采用这一个颜色。
+  const float sampleDistance =
+      min(kWideQueueFadeLength * 0.5f, s_widePathLength);
+  float x = s_widePath[0].x;
+  float y = s_widePath[0].y;
+  float tangentX = 0.0f;
+  float tangentY = 0.0f;
+  (void)sampleWidePath(sampleDistance, &x, &y, &tangentX, &tangentY);
+
+  bool hasCloud = false;
+  uint16_t radarColor = 0;
+  const bool sampled = frameCacheSampleRadarColor(
+      s_seenZoom, (int)lroundf(x), (int)lroundf(y), &hasCloud, &radarColor);
+  const uint16_t selected =
+      sampled && hasCloud && radarColor != 0 ? brightenCloudColor(radarColor)
+                                             : kWideFallbackColor;
+  const uint32_t now = millis();
+  if (!s_wideColorReady) {
+    s_wideColorCurrent = selected;
+    s_wideColorFrom = selected;
+    s_wideColorTarget = selected;
+    s_wideColorReady = true;
+  } else if (selected != s_wideColorTarget) {
+    s_wideColorFrom = currentWideQueueColor(now);
+    s_wideColorTarget = selected;
+    s_wideColorTransitionAt = now;
+  }
+  s_wideColorHasCloud = sampled && hasCloud && radarColor != 0;
+  Serial.printf(
+      "wind corridor color z%d at=(%.0f,%.0f) grid=%d cloud=%d raw=%04x target=%04x\n",
+      s_seenZoom, x, y, (int)sampled, (int)s_wideColorHasCloud,
+      (unsigned)radarColor, (unsigned)selected);
+}
+
 static int queueWideArrowTrain(uint32_t revision, float dtSec) {
   buildWideArrowMasks();
   if (!buildWidePath(revision)) {
     return 0;
   }
+  refreshWideQueueColor();
 
   s_wideQueuePhase += s_wideQueueSpeed * dtSec;
   while (s_wideQueuePhase >= s_wideQueueSpacing) {
@@ -1148,8 +1244,9 @@ static int drawTrailsAndHeads(LGFX* lcd) {
 }
 
 static int drawArrowFrame(LGFX* lcd) {
-  const uint16_t headColor = lcd->color565(225, 253, 255);
   const bool wideFade = s_style == WIND_PARTICLE_WIDE_ARROW;
+  const uint16_t headColor =
+      wideFade ? currentWideQueueColor(millis()) : kWideFallbackColor;
   const bool prevSwap = lcd->getSwapBytes();
   lcd->setSwapBytes(true);
   lcd->startWrite();
@@ -1231,12 +1328,21 @@ void windParticlesReset() {
   s_wideDirectionValid = false;
   s_widePathCount = 0;
   s_widePathLength = 0.0f;
+  s_wideColorCurrent = kWideFallbackColor;
+  s_wideColorFrom = kWideFallbackColor;
+  s_wideColorTarget = kWideFallbackColor;
+  s_wideColorTransitionAt = 0;
+  s_wideColorReady = false;
+  s_wideColorSamplePending = true;
+  s_wideColorHasCloud = false;
 }
 
 void windParticlesNotifyBaseRedrawn() {
   // 调用方刚完成整屏 blit/push；无需逐点恢复，直接忘掉旧底色。
   s_trailCount = 0;
   s_newCount = 0;
+  // 雷达成品可能已更新；下个风场帧只重采样一次入口颜色。
+  s_wideColorSamplePending = true;
 }
 
 bool windParticlesTick(LGFX* lcd, int displayedZoom, bool busy) {
