@@ -455,3 +455,24 @@ bool windFieldSample(float screenX, float screenY, float* east, float* south) {
 
 uint32_t windFieldRevision() { return s_revision; }
 uint32_t windFieldModelTime() { return s_modelTime; }
+
+void windFieldClearCache() {
+  if (!LittleFS.exists("/wind")) {
+    return;
+  }
+  File dir = LittleFS.open("/wind");
+  if (dir && dir.isDirectory()) {
+    File entry = dir.openNextFile();
+    while (entry) {
+      String path = entry.path();
+      entry.close();
+      LittleFS.remove(path);
+      entry = dir.openNextFile();
+    }
+  }
+  if (dir) {
+    dir.close();
+  }
+  LittleFS.rmdir("/wind");
+  Serial.println("wind cache cleared for ornament mode");
+}

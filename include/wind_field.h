@@ -31,3 +31,6 @@ bool windFieldSample(float screenX, float screenY, float* east,
 /** 每次成功装入/更新网格递增，粒子层据此重置轨迹。 */
 uint32_t windFieldRevision();
 uint32_t windFieldModelTime();
+
+/** 删除全部磁盘风场缓存；只应在风场服务未运行时调用。 */
+void windFieldClearCache();

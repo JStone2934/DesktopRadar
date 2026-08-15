@@ -93,7 +93,7 @@ void setupScreenUpdateStatus(LGFX* lcd, int remainSec) {
   drawStatusLine(lcd, remainSec);
 }
 
-void setupScreenShowSaved(LGFX* lcd, const char* ssid) {
+void setupScreenShowSaved(LGFX* lcd, const char* ssid, bool ornamentMode) {
   if (!lcd) {
     return;
   }
@@ -106,11 +106,12 @@ void setupScreenShowSaved(LGFX* lcd, const char* ssid) {
   lcd->drawString("配置已保存", LCD_WIDTH / 2, 92);
 
   lcd->setTextSize(1.25f);
-  lcd->drawString("正在连接 WiFi", LCD_WIDTH / 2, 126);
+  lcd->drawString(ornamentMode ? "Starting ornament" : "正在连接 WiFi",
+                  LCD_WIDTH / 2, 126);
 
   // 子集只覆盖 ASCII SSID。非 ASCII 名称仍完整保存和联网，但设备屏幕不
   // 尝试用缺字字体显示；上方两行固定中文已足够确认配置成功。
-  if (isPrintableAscii(ssid)) {
+  if (!ornamentMode && isPrintableAscii(ssid)) {
     lcd->setTextSize(1.0f);
     lcd->drawString(ssid, LCD_WIDTH / 2, 154);
   }

@@ -823,6 +823,16 @@ bool frameCacheRemove(int zoom) {
   return true;
 }
 
+void frameCacheClearAll() {
+  for (int zoom = ZOOM_MIN; zoom <= ZOOM_MAX; ++zoom) {
+    if (zoom != ZOOM_SKIP) {
+      frameCacheRemove(zoom);
+    }
+  }
+  frameCacheSetProtectedZoom(-1);
+  frameCacheScrubOrphans();
+}
+
 bool frameCachePrepare(int zoom) {
   // 清临时瓦片目录与 .new，保留旧 .rgb565 + .ready 供刷新期间秒切
   // （新帧写 .rgb565.new，commit 时原子替换；旧 .rgb565 始终可 blit）

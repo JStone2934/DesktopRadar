@@ -7,6 +7,8 @@
 
 static constexpr const char* kNs = "radar";
 static constexpr const char* kKeySaved = "saved";
+static constexpr const char* kKeyDisplayMode = "display_mode";
+static constexpr const char* kKeyDirectBoot = "direct_boot";
 static constexpr const char* kKeyMode = "mode";
 static constexpr const char* kKeySsid = "ssid";
 static constexpr const char* kKeyPass = "pass";
@@ -44,6 +46,11 @@ static WindParticleStyle clampWindStyle(uint8_t style) {
   return WIND_PARTICLE_DOT;
 }
 
+static DisplayMode clampDisplayMode(uint8_t mode) {
+  return mode == DISPLAY_MODE_ORNAMENT ? DISPLAY_MODE_ORNAMENT
+                                      : DISPLAY_MODE_RADAR;
+}
+
 uint16_t appConfigSecretSig(const char* s) {
   uint16_t sig = 0x4d3b;
   if (!s) {
@@ -62,6 +69,7 @@ void appConfigSetDefaults(AppConfig* cfg) {
     return;
   }
   memset(cfg, 0, sizeof(*cfg));
+  cfg->display_mode = DISPLAY_MODE_RADAR;
   cfg->wifi_mode = APP_WIFI_PSK;
   strncpy(cfg->ssid, WIFI_SSID, sizeof(cfg->ssid) - 1);
   strncpy(cfg->pass, WIFI_PASS, sizeof(cfg->pass) - 1);
@@ -102,6 +110,9 @@ bool appConfigLoad(AppConfig* cfg) {
     return false;
   }
 
+  cfg->display_mode = clampDisplayMode(
+      prefs.getUChar(kKeyDisplayMode, DISPLAY_MODE_RADAR));
+
   cfg->wifi_mode =
       static_cast<AppWifiMode>(prefs.getUChar(kKeyMode, APP_WIFI_PSK));
   if (cfg->wifi_mode != APP_WIFI_PSK &&
@@ -133,8 +144,8 @@ bool appConfigLoad(AppConfig* cfg) {
   cfg->identity[sizeof(cfg->identity) - 1] = '\0';
   strncpy(cfg->outer_identity, outerId.c_str(), sizeof(cfg->outer_identity) - 1);
   cfg->outer_identity[sizeof(cfg->outer_identity) - 1] = '\0';
-  Serial.printf("appConfig load: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d windStyle=%u defZoom=%d\n",
-                (unsigned)cfg->wifi_mode, cfg->ssid,
+  Serial.printf("appConfig load: display=%u mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d windStyle=%u defZoom=%d\n",
+                (unsigned)cfg->display_mode, (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
                 cfg->outer_identity, (int)cfg->show_crosshair,
@@ -164,6 +175,8 @@ bool appConfigSave(const AppConfig* cfg) {
     return false;
   }
   prefs.putBool(kKeySaved, true);
+  prefs.putUChar(kKeyDisplayMode,
+                 static_cast<uint8_t>(clampDisplayMode(cfg->display_mode)));
   prefs.putUChar(kKeyMode, static_cast<uint8_t>(cfg->wifi_mode));
   prefs.putString(kKeySsid, cfg->ssid);
   prefs.putString(kKeyPass, cfg->pass);
@@ -180,7 +193,8 @@ bool appConfigSave(const AppConfig* cfg) {
                      static_cast<uint8_t>(cfg->wind_particle_style))));
   prefs.putInt(kKeyDefaultZoom, clampZoom(cfg->default_zoom));
   prefs.end();
-  Serial.printf("appConfig save: mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d windStyle=%u defZoom=%d\n",
+  Serial.printf("appConfig save: display=%u mode=%u ssid=%s passLen=%u passSig=%04x id=%s outer=%s cross=%d wind=%d windStyle=%u defZoom=%d\n",
+                (unsigned)clampDisplayMode(cfg->display_mode),
                 (unsigned)cfg->wifi_mode, cfg->ssid,
                 (unsigned)strnlen(cfg->pass, sizeof(cfg->pass)),
                 (unsigned)appConfigSecretSig(cfg->pass), cfg->identity,
@@ -190,4 +204,30 @@ bool appConfigSave(const AppConfig* cfg) {
                     static_cast<uint8_t>(cfg->wind_particle_style)),
                 clampZoom(cfg->default_zoom));
   return true;
+}
+
+bool appConfigSetDisplayMode(DisplayMode mode, bool directBootOnce) {
+  Preferences prefs;
+  if (!prefs.begin(kNs, false)) {
+    return false;
+  }
+  prefs.putBool(kKeySaved, true);
+  const size_t wroteMode = prefs.putUChar(
+      kKeyDisplayMode, static_cast<uint8_t>(clampDisplayMode(mode)));
+  const size_t wroteBoot = prefs.putBool(kKeyDirectBoot, directBootOnce);
+  prefs.end();
+  return wroteMode == 1 && wroteBoot == 1;
+}
+
+bool appConfigConsumeDirectBootOnce() {
+  Preferences prefs;
+  if (!prefs.begin(kNs, false)) {
+    return false;
+  }
+  const bool direct = prefs.getBool(kKeyDirectBoot, false);
+  if (direct) {
+    prefs.putBool(kKeyDirectBoot, false);
+  }
+  prefs.end();
+  return direct;
 }

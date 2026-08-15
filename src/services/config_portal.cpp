@@ -13,6 +13,7 @@
 
 #include "button.h"
 #include "config.h"
+#include "ornament_media.h"
 #include "setup_screen.h"
 #include "update_manager.h"
 #include "zoom_ctrl.h"
@@ -33,6 +34,8 @@ static char s_lastSuccessText[32];
 static char s_lastAttemptText[32];
 static char s_lastErrorText[32];
 static char s_publishedText[32];
+static bool s_mediaUploadOk = false;
+static char s_mediaUploadError[128]{};
 
 struct PortalNetwork {
   String ssid;
@@ -262,6 +265,70 @@ static void sendNoStoreHeaders() {
   s_server->sendHeader("Expires", "0");
 }
 
+static void handlePortalMediaPrepare() {
+  if (!s_server) return;
+  s_webActive = true;
+  const String typeArg = s_server->arg("type");
+  const size_t size =
+      (size_t)strtoul(s_server->arg("size").c_str(), nullptr, 10);
+  if (typeArg != "gif" && typeArg != "image") {
+    sendNoStoreHeaders();
+    s_server->send(400, "text/plain; charset=utf-8", "不支持的媒体类型");
+    return;
+  }
+  const OrnamentMediaType type =
+      typeArg == "gif" ? OrnamentMediaType::Gif : OrnamentMediaType::Rgb565;
+  char error[128]{};
+  if (!ornamentMediaPrepareUpload(type, size, error, sizeof(error))) {
+    sendNoStoreHeaders();
+    s_server->send(400, "text/plain; charset=utf-8", error);
+    return;
+  }
+  sendNoStoreHeaders();
+  s_server->send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
+static void handlePortalMediaUploadDone() {
+  if (!s_server) return;
+  sendNoStoreHeaders();
+  if (s_mediaUploadOk) {
+    s_server->send(200, "application/json; charset=utf-8",
+                   "{\"ok\":true}");
+  } else {
+    s_server->send(400, "text/plain; charset=utf-8",
+                   s_mediaUploadError[0] ? s_mediaUploadError : "上传失败");
+  }
+}
+
+static void handlePortalMediaUploadData() {
+  if (!s_server) return;
+  s_webActive = true;
+  HTTPUpload& upload = s_server->upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    s_mediaUploadError[0] = '\0';
+    s_mediaUploadOk = ornamentMediaUploadBegin(
+        s_mediaUploadError, sizeof(s_mediaUploadError));
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (s_mediaUploadOk) {
+      s_mediaUploadOk = ornamentMediaUploadWrite(
+          upload.buf, upload.currentSize, s_mediaUploadError,
+          sizeof(s_mediaUploadError));
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (s_mediaUploadOk) {
+      // 配置引导仍留在屏幕上；保存进入摆件模式后再真正显示媒体。
+      s_mediaUploadOk = ornamentMediaUploadFinish(
+          s_mediaUploadError, sizeof(s_mediaUploadError), false);
+    } else {
+      ornamentMediaUploadAbort();
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    ornamentMediaUploadAbort();
+    s_mediaUploadOk = false;
+    snprintf(s_mediaUploadError, sizeof(s_mediaUploadError), "上传已中断");
+  }
+}
+
 static void handleRoot() {
   if (!s_server) {
     return;
@@ -347,8 +414,13 @@ static void handleRoot() {
             ".footerhint{background:#e8ecf2;border:1px solid #a8b0bd;color:#253449;border-radius:1px;padding:11px 12px;margin-top:10px}"
             ".footerhint:before{content:'NOTICE';display:block;margin-bottom:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;font-weight:800;letter-spacing:.12em;color:#9b3b3b;border-left:7px solid #9b3b3b;padding-left:6px}"
             ".update-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin:10px 0;font-size:.84rem}.update-meta b{color:#172033}.update-meta span{color:#5d6878;word-break:break-word}"
+            ".media-screen{width:240px;height:240px;border-radius:50%;overflow:hidden;background:#000;margin:14px auto;border:4px solid #26384c;box-shadow:0 6px 18px #0004;touch-action:none}"
+            ".media-screen canvas,.media-screen img{width:240px;height:240px;object-fit:contain;display:block}"
+            ".uploadbar{height:8px;background:#cbd2db;margin-top:12px}.uploadbar i{display:block;height:100%;width:0;background:#1d8f63}"
+            ".uploadmsg{min-height:22px;margin-top:9px;font-size:.82rem;color:#314157}"
             ".warning{padding:10px 11px;background:#fff3df;border:1px solid #d8af6c;color:#6d4a16;font-size:.82rem;margin-top:10px}"
             ".error{padding:10px 11px;background:#fff1f3;border:1px solid #d99aa4;color:#8b2f3e;font-size:.82rem;margin-top:10px}"
+            "[hidden]{display:none!important}"
             "button:disabled{opacity:.5;box-shadow:none}"
             ".footer{text-align:center;margin:18px 0 0;color:#5d6878;font-size:.82rem;letter-spacing:.03em}"
             ".footer .url{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#142d48;word-break:break-all;margin-top:4px;letter-spacing:0}"
@@ -356,12 +428,20 @@ static void handleRoot() {
             "</style></head><body>"
             "<div class=\"hero\"><div class=\"radar\" aria-hidden=\"true\"></div>"
             "<div class=\"brand\"><span class=\"dot\"></span>RadarSetup · LINK ONLINE</div>"
-            "<h1>风暴眼-桌面雷达设置</h1>"
-            "<p class=\"lead\">配置网络接入、雷达中心坐标与显示图层。保存后设备将退出配置热点，并尝试接入目标 WiFi。</p>"
-            "<div class=\"panelnote\"><span class=\"tri\"></span>RADAR CONFIG · FIELD SETUP</div></div>"
+            "<h1 id=\"pageTitle\">风暴眼-桌面雷达设置</h1>"
+            "<p class=\"lead\" id=\"pageLead\">配置网络接入、雷达中心坐标与显示图层。保存后设备将退出配置热点，并尝试接入目标 WiFi。</p>"
+            "<div class=\"panelnote\" id=\"panelMode\"><span class=\"tri\"></span>RADAR CONFIG · FIELD SETUP</div></div>"
             "<form method=\"POST\" action=\"/save\" accept-charset=\"UTF-8\" "
             "autocomplete=\"off\">"
-            "<section class=\"card\"><h2><span class=\"module\">LINK</span>网络接入</h2>"
+            "<section class=\"card\"><h2><span class=\"module\">MODE</span>运行模式</h2>"
+            "<label>设备用途</label><select name=\"display_mode\" id=\"displayMode\" autocomplete=\"off\" onchange=\"syncDisplayMode()\">");
+  html += s_seedCfg.display_mode == DISPLAY_MODE_ORNAMENT
+              ? F("<option value=\"0\">雷达显示</option>"
+                  "<option value=\"1\" selected>图片 / GIF 摆件</option>")
+              : F("<option value=\"0\" selected>雷达显示</option>"
+                  "<option value=\"1\">图片 / GIF 摆件</option>");
+  html += F("</select><p class=\"hint\" id=\"modeHint\">进入摆件模式会清除全部雷达缓存；热点将持续开启，可随时上传画面。</p></section>"
+            "<div id=\"radarOptions\"><section class=\"card\"><h2><span class=\"module\">LINK</span>网络接入</h2>"
             "<label>扫描到的网络</label><select id=\"scan\" autocomplete=\"off\" "
             "onchange=\"pickScan()\"><option value=\"\">手动填写或保留当前网络</option>");
   for (int i = 0; i < s_portalNetworkCount; ++i) {
@@ -514,8 +594,17 @@ static void handleRoot() {
             "<li>z3 视野最大、范围最广；z12 放大最多、细节最多。</li></ul></div>"
             "<div class=\"guide\"><b>缩放切换响应较慢？</b>"
             "短按 S 键切换缩放。若设备正在下载或生成缓存，响应可能延迟数秒；等待进度完成后会恢复，通常无需重新配置 WiFi。</div>"
-            "</section><div class=\"actions\"><button type=\"submit\">保存并连接目标 WiFi</button>"
-            "<p class=\"hint footerhint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>");
+            "</section></div>"
+            "<div id=\"ornamentOptions\" hidden><section class=\"card\"><h2><span class=\"module\">MEDIA</span>图片 / GIF 摆件</h2>"
+            "<p class=\"hint\">可先上传画面再保存模式；上传会清除雷达缓存。</p>"
+            "<label>选择静态图片或 GIF</label><input id=\"mediaFile\" type=\"file\" accept=\"image/jpeg,image/png,image/webp,image/gif\">"
+            "<div id=\"mediaStaticOptions\"><label>静态图片适配</label><select id=\"mediaFit\"><option value=\"cover\">填满裁切</option><option value=\"contain\">完整显示</option></select><p class=\"hint\">填满模式可在圆形预览中拖动画面位置。</p></div>"
+            "<div class=\"media-screen\" id=\"mediaScreen\"><canvas id=\"mediaCanvas\" width=\"240\" height=\"240\"></canvas><img id=\"mediaGif\" hidden></div>"
+            "<button type=\"button\" id=\"mediaUpload\">上传并准备摆件画面</button><div class=\"uploadbar\"><i id=\"mediaProgress\"></i></div><div class=\"uploadmsg\" id=\"mediaMessage\"></div>"
+            "<p class=\"hint\">静态图最大 20 MB；GIF 最大 1.4 MB、240×240、500 帧。</p>"
+            "</section></div>"
+            "<div class=\"actions\"><button type=\"submit\" id=\"saveButton\">保存并连接目标 WiFi</button>"
+            "<p class=\"hint footerhint\" id=\"saveHint\">提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。</p></div></form>");
 
   html += F("<section class=\"card\"><h2><span class=\"module\">FIRMWARE</span>固件更新</h2>"
             "<div class=\"update-meta\"><b>当前版本</b><span>");
@@ -585,6 +674,23 @@ static void handleRoot() {
             "document.getElementById('passLabel').textContent=o?'网络密码':'网络密码';"
             "document.getElementById('passHint').textContent=o?'开放网络无需填写密码。':"
             "(p?'若同一网络与 PEAP 账户已保存凭据，可留空继续使用原密码。':'若同一网络已保存凭据，可留空继续使用原密码；更换网络时需重新填写。');}"
+            "function syncDisplayMode(){var ornament=document.getElementById('displayMode').value==='1';"
+            "document.getElementById('radarOptions').hidden=ornament;"
+            "document.getElementById('ornamentOptions').hidden=!ornament;"
+            "document.getElementById('pageTitle').textContent=ornament?'Storm Eye 桌面摆件设置':'风暴眼-桌面雷达设置';"
+            "document.getElementById('pageLead').textContent=ornament?'热点持续开启，可随时上传图片或 GIF。':'配置网络、雷达中心和显示图层。';"
+            "document.getElementById('panelMode').lastChild.textContent=ornament?'ORNAMENT CONFIG · MEDIA DISPLAY':'RADAR CONFIG · FIELD SETUP';"
+            "document.getElementById('modeHint').textContent=ornament?'摆件模式会清除雷达缓存并保留网络配置。':'雷达模式会连接 WiFi 并建立全档缓存。';"
+            "document.getElementById('saveButton').textContent=ornament?'保存并进入摆件上传':'保存并连接目标 WiFi';"
+            "document.getElementById('saveHint').textContent=ornament?'保存后设备进入摆件页面；RadarSetup 热点不会关闭，重新打开 192.168.4.1 即可上传画面。':'提交后 RadarSetup 配置热点会关闭，手机断开属于正常现象；设备随后进入目标 WiFi 连接流程。';}"
+            "var mf=document.getElementById('mediaFile'),mc=document.getElementById('mediaCanvas'),mctx=mc.getContext('2d',{willReadFrequently:true}),mg=document.getElementById('mediaGif'),msource=null,mblob=null,mkind='',mox=0,moy=0,mdrag=false,mlx=0,mly=0,murl='',msending=false;"
+            "function mediaMsg(s,bad){var e=document.getElementById('mediaMessage');e.textContent=s;e.style.color=bad?'#a12636':'#314157';}"
+            "function mediaDraw(){if(!msource)return;mctx.fillStyle='#000';mctx.fillRect(0,0,240,240);var sw=msource.naturalWidth||msource.width,sh=msource.naturalHeight||msource.height,fit=document.getElementById('mediaFit').value,scale=fit==='cover'?Math.max(240/sw,240/sh):Math.min(240/sw,240/sh),w=sw*scale,h=sh*scale,x=(240-w)/2+mox,y=(240-h)/2+moy;if(fit==='contain'){mox=moy=0;x=(240-w)/2;y=(240-h)/2;}else{var mx=Math.max(0,(w-240)/2),my=Math.max(0,(h-240)/2);mox=Math.max(-mx,Math.min(mx,mox));moy=Math.max(-my,Math.min(my,moy));x=(240-w)/2+mox;y=(240-h)/2+moy;}mctx.drawImage(msource,x,y,w,h);}"
+            "function mediaRgbBlob(){var p=mctx.getImageData(0,0,240,240).data,o=new Uint8Array(115200);for(var i=0,j=0;i<p.length;i+=4){var v=((p[i]>>3)<<11)|((p[i+1]>>2)<<5)|(p[i+2]>>3);o[j++]=v&255;o[j++]=v>>8;}return new Blob([o],{type:'application/octet-stream'});}"
+            "mf.onchange=function(){mblob=null;mkind='';mox=moy=0;if(murl)URL.revokeObjectURL(murl);var f=mf.files[0];if(!f)return;murl=URL.createObjectURL(f);if(f.type==='image/gif'||/\\.gif$/i.test(f.name)){if(f.size>1400000){mediaMsg('GIF 不能超过 1.4 MB',true);return;}mkind='gif';mblob=f;mg.src=murl;mg.hidden=false;mc.hidden=true;document.getElementById('mediaStaticOptions').hidden=true;mg.onload=function(){if(mg.naturalWidth>240||mg.naturalHeight>240){mblob=null;mediaMsg('GIF 尺寸不能超过 240×240',true);}else mediaMsg('GIF 已就绪：'+mg.naturalWidth+'×'+mg.naturalHeight,false);};}else{if(!/^image\\/(jpeg|png|webp)$/.test(f.type)&&!/\\.(jpe?g|png|webp)$/i.test(f.name)){mediaMsg('仅支持 JPEG、PNG、WebP 或 GIF',true);return;}if(f.size>20*1024*1024){mediaMsg('静态原图不能超过 20 MB',true);return;}var im=new Image;im.onload=function(){if(im.naturalWidth*im.naturalHeight>32000000){mediaMsg('图片像素超过 3200 万',true);return;}msource=im;mkind='image';mg.hidden=true;mc.hidden=false;document.getElementById('mediaStaticOptions').hidden=false;mediaDraw();mediaMsg('拖动预览可调整裁切位置',false);};im.onerror=function(){mediaMsg('浏览器无法读取该图片',true);};im.src=murl;}};"
+            "document.getElementById('mediaFit').onchange=mediaDraw;document.getElementById('mediaScreen').onpointerdown=function(e){if(mkind!=='image')return;mdrag=true;mlx=e.clientX;mly=e.clientY;this.setPointerCapture(e.pointerId);};document.getElementById('mediaScreen').onpointermove=function(e){if(!mdrag)return;mox+=e.clientX-mlx;moy+=e.clientY-mly;mlx=e.clientX;mly=e.clientY;mediaDraw();};document.getElementById('mediaScreen').onpointerup=function(){mdrag=false;};"
+            "function mediaPost(path,data){return fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data)}).then(function(r){return r.text().then(function(t){if(!r.ok)throw Error(t);return t;});});}"
+            "document.getElementById('mediaUpload').onclick=async function(){if(msending)return;var b=this;try{if(mkind==='image'){mediaDraw();mblob=mediaRgbBlob();}if(!mblob)throw Error('请先选择有效文件');msending=true;b.disabled=true;document.getElementById('mediaProgress').style.width='0';mediaMsg('正在准备存储空间…',false);await mediaPost('/media/prepare',{type:mkind,size:mblob.size});var fd=new FormData;fd.append('media',mblob,'media.bin');var x=new XMLHttpRequest;x.open('POST','/media/upload');x.upload.onprogress=function(e){if(e.lengthComputable)document.getElementById('mediaProgress').style.width=(e.loaded/e.total*100)+'%';};x.onload=function(){msending=false;b.disabled=false;if(x.status===200){mediaMsg('画面已上传并验证，请保存运行模式',false);document.getElementById('mediaProgress').style.width='100%';}else mediaMsg(x.responseText||'上传失败',true);};x.onerror=function(){msending=false;b.disabled=false;mediaMsg('连接中断，请重新上传',true);};x.send(fd);}catch(e){msending=false;b.disabled=false;mediaMsg(e.message,true);}};"
             "function geoFail(){var h=document.getElementById('geoHint');"
             "h.textContent='无法读取浏览器定位，请手动输入十进制度坐标';"
             "var b=document.getElementById('geoBtn');b.disabled=false;"
@@ -604,7 +710,7 @@ static void handleRoot() {
             "b.disabled=false;b.textContent='使用当前定位';"
             "},function(){geoFail();},"
             "{enableHighAccuracy:true,timeout:15000,maximumAge:0});}"
-            "netChanged(false);</script>"
+            "netChanged(false);syncDisplayMode();</script>"
             "</body></html>");
   sendNoStoreHeaders();
   s_server->send(200, "text/html; charset=utf-8", html);
@@ -613,24 +719,23 @@ static void handleRoot() {
                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
-static const char kSavedHtml[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+static const char kSavedHead[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Cache-Control" content="no-store">
-<title>配置已提交</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);color:#17212b;margin:0;padding:28px 16px;text-align:center}
-.card{max-width:420px;margin:36px auto 0;background:#fff;border:1px solid #e3e8ef;border-radius:20px;padding:24px 18px;box-shadow:0 10px 28px rgba(25,42,62,.08)}
-h1{font-size:1.45rem;margin:0 0 10px}.ok{font-size:2rem;margin-bottom:8px;color:#19a763}
-p{color:#5b6978;line-height:1.5;margin:8px 0}.small{font-size:.84rem;color:#7a8795;margin-top:18px}
-</style>
-</head><body><div class="card"><div class="ok">✓</div><h1>配置已保存</h1>
-<p>RadarSetup 配置热点即将关闭，手机断开属于正常现象。</p>
-<p>设备正在使用新的网络参数连接目标 WiFi；连接成功后将进入雷达显示。</p>
-<p class="small">如需重新配置，请进入配置模式后打开 http://192.168.4.1/。</p>
-</div>
-</body></html>
+<meta http-equiv="Cache-Control" content="no-store"><title>配置已保存</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#f4fbf7 0,#f7f8fb 210px,#f2f4f7 100%);color:#17212b;margin:0;padding:28px 16px;text-align:center}.card{max-width:420px;margin:36px auto 0;background:#fff;border:1px solid #e3e8ef;border-radius:20px;padding:24px 18px;box-shadow:0 10px 28px rgba(25,42,62,.08)}h1{font-size:1.45rem;margin:0 0 10px}.ok{font-size:2rem;margin-bottom:8px;color:#19a763}p{color:#5b6978;line-height:1.5;margin:8px 0}.url{font-family:ui-monospace,monospace;color:#142d48}</style>
+</head><body><div class="card"><div class="ok">✓</div>
+)HTML";
+static const char kSavedRadarBody[] PROGMEM = R"HTML(
+<h1>雷达配置已保存</h1><p>RadarSetup 热点即将关闭，手机断开属于正常现象。</p><p>设备正在连接目标 WiFi，成功后进入雷达显示。</p>
+)HTML";
+static const char kSavedOrnamentBody[] PROGMEM = R"HTML(
+<h1>摆件模式已保存</h1>
+<p>已上传的画面会立即显示；RadarSetup 热点将持续开启。</p>
+<p>需要更换画面时，重新打开 <span class="url">http://192.168.4.1</span>。</p>
+)HTML";
+static const char kSavedTail[] PROGMEM = R"HTML(
+</div></body></html>
 )HTML";
 
 static const char kUpdateAcceptedHtml[] PROGMEM = R"HTML(
@@ -661,7 +766,14 @@ static void handleDone() {
   }
 
   s_server->sendHeader("Clear-Site-Data", "\"cache\"");
-  s_server->send_P(200, "text/html; charset=utf-8", kSavedHtml);
+  s_server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+  s_server->send(200, "text/html; charset=utf-8", "");
+  s_server->sendContent_P(kSavedHead);
+  s_server->sendContent_P(s_formCfg.display_mode == DISPLAY_MODE_ORNAMENT
+                              ? kSavedOrnamentBody
+                              : kSavedRadarBody);
+  s_server->sendContent_P(kSavedTail);
+  s_server->sendContent("");
   // 浏览器跟完 PRG 拿到完成页后再关热点，避免历史记录卡在 POST
   s_saved = true;
   Serial.println("portal: /done served, closing soon");
@@ -729,6 +841,10 @@ static const char* parseForm(AppConfig* cfg) {
     return "server";
   }
   memset(cfg, 0, sizeof(*cfg));
+
+  const String displayMode = s_server->arg("display_mode");
+  cfg->display_mode = displayMode == "1" ? DISPLAY_MODE_ORNAMENT
+                                         : DISPLAY_MODE_RADAR;
 
   Serial.printf("POST args=%d\n", s_server->args());
   for (int i = 0; i < s_server->args(); ++i) {
@@ -927,8 +1043,8 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d wind=%d windStyle=%u defZoom=%d\n",
-                (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
+  Serial.printf("config saved: display=%u mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d wind=%d windStyle=%u defZoom=%d\n",
+                (unsigned)cfg.display_mode, (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
                 (int)cfg.show_progress, (int)cfg.show_alert_ring,
                 (int)cfg.show_crosshair, (int)cfg.show_wind_particles,
                 (unsigned)cfg.wind_particle_style,
@@ -938,7 +1054,8 @@ static void handleSave() {
   s_server->sendHeader("Location", "/done", true);
   s_server->send(303, "text/plain", "");
   s_saveRedirectAt = millis() == 0 ? 1 : millis();
-  setupScreenShowSaved(s_portalLcd, cfg.ssid);
+  setupScreenShowSaved(s_portalLcd, cfg.ssid,
+                       cfg.display_mode == DISPLAY_MODE_ORNAMENT);
 }
 
 static void handleNotFound() {
@@ -958,6 +1075,8 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   s_webActive = false;
   s_saveRedirectAt = 0;
   s_updateRedirectAt = 0;
+  s_mediaUploadOk = false;
+  s_mediaUploadError[0] = '\0';
   memset(&s_formCfg, 0, sizeof(s_formCfg));
   if (!appConfigLoad(&s_seedCfg)) {
     appConfigSetDefaults(&s_seedCfg);
@@ -1004,6 +1123,9 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/done", HTTP_GET, handleDone);
+  server.on("/media/prepare", HTTP_POST, handlePortalMediaPrepare);
+  server.on("/media/upload", HTTP_POST, handlePortalMediaUploadDone,
+            handlePortalMediaUploadData);
   server.on("/update/confirm", HTTP_POST, handleUpdateConfirm);
   server.on("/update/accepted", HTTP_GET, handleUpdateAccepted);
   // 误用 GET /save（历史/刷新）时回到表单，不要当成已保存
@@ -1151,6 +1273,7 @@ PortalResult configPortalRun(LGFX* lcd, uint32_t timeoutMs, AppConfig* outCfg) {
   server.stop();
   delay(100);
   resetPortalWifiRadio();
+  ornamentMediaUploadAbort();
 
   if (outCfg) {
     if (result == PortalResult::Saved) {

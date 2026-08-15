@@ -9,6 +9,11 @@ enum AppWifiMode : uint8_t {
   APP_WIFI_OPEN = 2,
 };
 
+enum DisplayMode : uint8_t {
+  DISPLAY_MODE_RADAR = 0,
+  DISPLAY_MODE_ORNAMENT = 1,
+};
+
 /** 风场粒子样式：亮点保留渐隐拖影，两种开放式箭头均不显示拖尾。 */
 enum WindParticleStyle : uint8_t {
   WIND_PARTICLE_DOT = 0,
@@ -17,6 +22,7 @@ enum WindParticleStyle : uint8_t {
 };
 
 struct AppConfig {
+  DisplayMode display_mode;
   AppWifiMode wifi_mode;
   char ssid[33];
   char pass[65];            // PSK 密码；PEAP 用户密码；开放网络为空
@@ -43,6 +49,12 @@ bool appConfigLoad(AppConfig* cfg);
 
 /** 写入 NVS，标记已配置。成功返回 true。 */
 bool appConfigSave(const AppConfig* cfg);
+
+/** 只修改运行模式；用于摆件门户切换，不触碰网络凭据。 */
+bool appConfigSetDisplayMode(DisplayMode mode, bool directBootOnce);
+
+/** 消费模式切换后的单次直启标记。 */
+bool appConfigConsumeDirectBootOnce();
 
 /** 是否曾通过 Web 保存过配置。 */
 bool appConfigHasSaved();

@@ -11,5 +11,5 @@ void setupScreenDraw(LGFX* lcd, int remainSec);
 /** 仅刷新底部倒计时/等待文案。 */
 void setupScreenUpdateStatus(LGFX* lcd, int remainSec);
 
-/** 保存成功后立即替换引导页，明确告知用户设备已进入联网阶段。 */
-void setupScreenShowSaved(LGFX* lcd, const char* ssid);
+/** 保存成功后立即替换引导页；按运行模式显示联网或摆件启动状态。 */
+void setupScreenShowSaved(LGFX* lcd, const char* ssid, bool ornamentMode);

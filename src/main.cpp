@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <math.h>
@@ -21,6 +22,8 @@
 #include "config_portal.h"
 #include "frame_cache.h"
 #include "progress_ring.h"
+#include "ornament_media.h"
+#include "ornament_portal.h"
 #include "radar_font.h"
 #include "rainviewer.h"
 #include "update_manager.h"
@@ -31,6 +34,7 @@
 
 static LGFX lcd;
 static AppConfig s_cfg;
+static bool s_ornamentMode = false;
 
 static int s_displayedZoom = -1;
 static uint32_t s_lastRefresh = 0;
@@ -888,6 +892,22 @@ static bool startRadarWorker() {
   return true;
 }
 
+static void stopRadarWorker() {
+  if (!s_radarWorkerTask) return;
+  if (s_radarWorkActive) {
+    composeRequestAbort();
+    const uint32_t deadline = millis() + 3000UL;
+    while (s_radarWorkActive && (int32_t)(millis() - deadline) < 0) {
+      delay(10);
+    }
+  }
+  vTaskDelete(s_radarWorkerTask);
+  s_radarWorkerTask = nullptr;
+  s_radarWorkActive = false;
+  s_radarWorkDone = false;
+  Serial.println("radar worker stopped for ornament mode");
+}
+
 static bool startRadarWork(int zoom, RadarWorkKind kind) {
   if (!s_radarWorkerTask || s_radarWorkActive || !zoomCanCompose(zoom) ||
       WiFi.status() != WL_CONNECTED) {
@@ -1244,12 +1264,25 @@ static void runPortalAndApply() {
   }
 
   if (pr == PortalResult::Saved) {
+    if (s_cfg.display_mode == DISPLAY_MODE_ORNAMENT) {
+      showStatus("Storm Eye", "Starting ornament mode");
+      clearAllFrameCaches("enter ornament mode");
+      windFieldClearCache();
+      appConfigSetDisplayMode(DISPLAY_MODE_ORNAMENT, true);
+      delay(700);
+      ESP.restart();
+      return;
+    }
     if (!nearlySameLoc(oldLat, oldLon, s_cfg.lat, s_cfg.lon)) {
       clearAllFrameCaches("location change");
     } else if (oldCrosshair != s_cfg.show_crosshair) {
       clearAllFrameCaches("crosshair setting change");
     }
   }
+
+  // 用户在摆件上传区准备了媒体、但最终保留雷达模式或按 S 跳过时，
+  // 立即释放媒体空间，避免挤占全档雷达缓存。
+  if (s_cfg.display_mode == DISPLAY_MODE_RADAR) ornamentMediaClearAll();
 
   if (!s_cfg.show_progress) {
     progressRingHide(&lcd, s_displayedZoom);
@@ -1273,6 +1306,32 @@ static void runPortalAndApply() {
   s_wifiRetryAt = 0;
   s_wifiRetryStage = 0;
   tryWifiAndRadar();
+}
+
+static bool ornamentBootGuide() {
+  const PortalResult result =
+      configPortalRun(&lcd, CONFIG_PORTAL_TIMEOUT_MS, &s_cfg);
+  Serial.printf("ornament boot guide result=%u display=%u\n",
+                (unsigned)result, (unsigned)s_cfg.display_mode);
+
+  if (result == PortalResult::UpdateRequested) {
+    if (!updateManagerExecuteConfirmed(&lcd, &s_cfg)) {
+      showStatus("Update cancelled", "Returning to ornament");
+      delay(900);
+      if (updateManagerConsumeFilesystemReset()) frameCacheBegin();
+    }
+  }
+
+  if (result == PortalResult::Saved &&
+      s_cfg.display_mode == DISPLAY_MODE_RADAR) {
+    ornamentMediaClearAll();
+    appConfigSetDisplayMode(DISPLAY_MODE_RADAR, true);
+    showStatus("Storm Eye", "Starting radar mode");
+    delay(700);
+    ESP.restart();
+    return false;
+  }
+  return true;
 }
 
 void setup() {
@@ -1313,16 +1372,95 @@ void setup() {
     appConfigSetDefaults(&s_cfg);
   }
   updateManagerHandleBootResume(&lcd, &s_cfg);
+  const bool directBoot = appConfigConsumeDirectBootOnce();
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  // ESP.restart() 用于媒体播放器重启、模式切换和升级恢复，这些路径应直启；
+  // RST/重新上电等其它复位则进入一次配置引导。
+  const bool physicalBoot = resetReason != ESP_RST_SW;
+  Serial.printf("boot reset reason=%u direct=%d physical=%d\n",
+                (unsigned)resetReason, (int)directBoot, (int)physicalBoot);
+
+  if (s_cfg.display_mode == DISPLAY_MODE_ORNAMENT) {
+    s_ornamentMode = true;
+    stopRadarWorker();
+    frameCacheClearAll();
+    windFieldClearCache();
+    if (!directBoot && physicalBoot && !ornamentBootGuide()) return;
+    ornamentMediaBegin(&lcd);
+    if (!ornamentPortalBegin(&lcd, &s_cfg)) {
+      showStatus("Hotspot fail", "Restart device");
+    }
+    Serial.printf("ornament runtime ready media=%d heap=%u\n",
+                  (int)ornamentMediaValid(), ESP.getFreeHeap());
+    return;
+  }
+
+  ornamentMediaClearAll();
   seedZoomRefreshTimesFromCache();
   windFieldBegin();
   windParticlesSetStyle(s_cfg.wind_particle_style);
   windParticlesBegin();
 
-  runPortalAndApply();
+  if (directBoot) {
+    Serial.println("direct boot into radar mode");
+    windFieldSetEnabled(s_cfg.show_wind_particles);
+    windParticlesSetStyle(s_cfg.wind_particle_style);
+    zoomSetPrefetchRadius(ZOOM_MAX - ZOOM_MIN);
+    zoomSetDefault(s_cfg.default_zoom);
+    composeSetCrosshairVisible(s_cfg.show_crosshair);
+    zoomSetCurrent(zoomDefault());
+    tryWifiAndRadar();
+  } else {
+    runPortalAndApply();
+  }
 }
 
 void loop() {
   static uint32_t lastBeat = 0;
+
+  if (s_ornamentMode) {
+    const ButtonEvent mediaEvent = buttonPoll();
+    if (mediaEvent == ButtonEvent::ShortPress) {
+      const bool paused = ornamentMediaTogglePause();
+      Serial.printf("ornament GIF paused=%d\n", (int)paused);
+    } else if (mediaEvent == ButtonEvent::LongPress) {
+      ornamentMediaStop();
+      ornamentPortalEnd();
+      delay(80);
+      ESP.restart();
+      return;
+    }
+    ornamentPortalService();
+    if (!ornamentPortalBusy()) {
+      ornamentMediaService();
+    }
+    const OrnamentPortalAction action = ornamentPortalTakeAction();
+    if (action == OrnamentPortalAction::RestartRadar) {
+      ornamentMediaStop();
+      ornamentPortalEnd();
+      delay(80);
+      ESP.restart();
+      return;
+    }
+    if (action == OrnamentPortalAction::UpdateRequested) {
+      ornamentMediaStop();
+      ornamentPortalEnd();
+      if (!updateManagerExecuteConfirmed(&lcd, &s_cfg)) {
+        delay(600);
+        ESP.restart();
+      }
+      return;
+    }
+    if (millis() - lastBeat >= 5000) {
+      lastBeat = millis();
+      Serial.printf("[%lu] ornament heap=%u max=%u stations=%d media=%d busy=%d\n",
+                    millis() / 1000UL, ESP.getFreeHeap(),
+                    ESP.getMaxAllocHeap(), WiFi.softAPgetStationNum(),
+                    (int)ornamentMediaValid(), (int)ornamentPortalBusy());
+    }
+    delay(2);
+    return;
+  }
 
   initialCacheScreenTick(false);
   const ButtonEvent ev = buttonPoll();

@@ -74,6 +74,9 @@ bool frameCacheSampleAlertRing(int zoom, uint16_t* pix, uint8_t* xs, uint8_t* ys
 
 bool frameCacheRemove(int zoom);
 
+/** 删除全部缩放档、临时瓦片和 ready 边车；摆件模式独占 LittleFS。 */
+void frameCacheClearAll();
+
 /** 清除各档临时瓦片残留，保留已 commit 成品。 */
 void frameCacheScrubOrphans();
 
