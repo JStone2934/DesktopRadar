@@ -56,6 +56,14 @@ struct ManifestRecordBuffer {
   ~ManifestRecordBuffer() { free(value); }
 };
 
+struct HeapBuffer {
+  uint8_t* value;
+
+  explicit HeapBuffer(size_t size)
+      : value(static_cast<uint8_t*>(malloc(size))) {}
+  ~HeapBuffer() { free(value); }
+};
+
 void drawUpdateStatus(LGFX* lcd, const char* title, const char* detail) {
   if (!lcd) return;
   lcd->fillScreen(TFT_BLACK);
@@ -246,7 +254,9 @@ bool manifestsMatch(const UpdateManifest& a, const UpdateManifest& b) {
 }
 
 bool preflightAsset(const UpdateManifest& manifest) {
-  uint8_t prefix[4096];
+  constexpr size_t kPrefixSize = 4096;
+  HeapBuffer prefix(kPrefixSize);
+  if (!prefix.value) return false;
   WiFiClientSecure client;
   HTTPClient http;
   if (!configureHttp(&http, &client, manifest.url)) return false;
@@ -264,7 +274,7 @@ bool preflightAsset(const UpdateManifest& manifest) {
   NetworkClient* stream = http.getStreamPtr();
   size_t length = 0;
   const uint32_t deadline = millis() + 20000UL;
-  while (length < sizeof(prefix) &&
+  while (length < kPrefixSize &&
          static_cast<int32_t>(millis() - deadline) < 0 &&
          (http.connected() || stream->available())) {
     size_t available = stream->available();
@@ -272,15 +282,15 @@ bool preflightAsset(const UpdateManifest& manifest) {
       delay(2);
       continue;
     }
-    available = min(available, sizeof(prefix) - length);
-    const int got = stream->readBytes(prefix + length, available);
+    available = min(available, kPrefixSize - length);
+    const int got = stream->readBytes(prefix.value + length, available);
     if (got <= 0) break;
     length += static_cast<size_t>(got);
   }
   http.end();
   client.stop();
   return (status == HTTP_CODE_OK || status == HTTP_CODE_PARTIAL_CONTENT) &&
-         length >= 64 && prefix[0] == 0xE9 && total == manifest.size;
+         length >= 64 && prefix.value[0] == 0xE9 && total == manifest.size;
 }
 
 bool downloadFirmware(const UpdateManifest& manifest, LGFX* lcd,
@@ -321,7 +331,16 @@ bool downloadFirmware(const UpdateManifest& manifest, LGFX* lcd,
   }
 
   NetworkClient* stream = http.getStreamPtr();
-  uint8_t buffer[4096];
+  constexpr size_t kDownloadBufferSize = 4096;
+  HeapBuffer buffer(kDownloadBufferSize);
+  if (!buffer.value) {
+    http.end();
+    client.stop();
+    file.close();
+    mbedtls_sha256_free(&sha);
+    *error = UpdateError::Download;
+    return false;
+  }
   size_t length = 0;
   int lastPercent = -2;
   uint32_t lastData = millis();
@@ -336,12 +355,13 @@ bool downloadFirmware(const UpdateManifest& manifest, LGFX* lcd,
       delay(2);
       continue;
     }
-    available = min(available, sizeof(buffer));
+    available = min(available, kDownloadBufferSize);
     available = min(available, static_cast<size_t>(manifest.size - length));
-    const int got = stream->readBytes(buffer, available);
-    if (got <= 0 || file.write(buffer, static_cast<size_t>(got)) !=
+    const int got = stream->readBytes(buffer.value, available);
+    if (got <= 0 || file.write(buffer.value, static_cast<size_t>(got)) !=
                         static_cast<size_t>(got) ||
-        mbedtls_sha256_update(&sha, buffer, static_cast<size_t>(got)) != 0) {
+        mbedtls_sha256_update(&sha, buffer.value,
+                              static_cast<size_t>(got)) != 0) {
       streamOk = false;
       break;
     }
@@ -623,8 +643,8 @@ bool updateManagerHandleBootResume(LGFX* lcd, AppConfig* cfg) {
     return false;
   }
   for (int remain = 5; remain > 0; --remain) {
-    char detail[48];
-    snprintf(detail, sizeof(detail), "Resume in %ds - press S to cancel", remain);
+    char detail[] = "Resume in 0s - press S to cancel";
+    detail[10] = static_cast<char>('0' + remain);
     drawUpdateStatus(lcd, "Pending update", detail);
     const uint32_t until = millis() + 1000U;
     while (static_cast<int32_t>(millis() - until) < 0) {
