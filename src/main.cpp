@@ -257,9 +257,9 @@ static void initialCacheScreenTick(bool force) {
   lcd.drawString("Storm Eye", LCD_WIDTH / 2, 101);
 
   lcd.setFont(&radar_fonts::cn12);
-  lcd.setTextSize(1.0f);
+  lcd.setTextSize(1.25f);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.drawString("获取雷达数据中...", LCD_WIDTH / 2, 137);
+  lcd.drawString("雷达数据加载中...", LCD_WIDTH / 2, 137);
 
   progressRingUpdate(&lcd, initialCacheDone01(), -1);
   s_initialPulseDrawAt = now;

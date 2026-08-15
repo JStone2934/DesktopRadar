@@ -346,7 +346,11 @@ static void handleRoot() {
             "spellcheck=\"false\" value=\"");
   appendEscaped(html, s_seedCfg.ssid);
   // 密码不回填；留空则保留原密码。new-password 降低浏览器自动填充旧会话密码
-  html += F("\"><label id=\"passLabel\">网络密码</label>"
+  html += F("\"><div class=\"peap-only\" id=\"idRow\"><label>PEAP 账户</label>"
+            "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
+            "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
+  appendEscaped(html, s_seedCfg.identity);
+  html += F("\"></div><label id=\"passLabel\">网络密码</label>"
             "<input name=\"pass\" id=\"pass\" type=\"password\" maxlength=\"64\" "
             "value=\"\" autocomplete=\"new-password\" autocapitalize=\"none\" "
             "autocorrect=\"off\" spellcheck=\"false\">"
@@ -368,11 +372,8 @@ static void handleRoot() {
               : F("<option value=\"2\">开放网络</option>");
   html += F("</select>"
             "<p class=\"mini\">家用路由器或手机热点通常选择普通密码 WiFi；校园网、企业网通常选择 PEAP。</p>"
-            "<div class=\"peap-only\" id=\"idRow\"><label>PEAP 账户</label>"
-            "<input name=\"identity\" id=\"identity\" maxlength=\"63\" autocomplete=\"off\" "
-            "autocapitalize=\"none\" spellcheck=\"false\" value=\"");
-  appendEscaped(html, s_seedCfg.identity);
-  html += F("\"><label>外层身份 Outer Identity（可选）</label>"
+            "<div class=\"peap-only\" id=\"outerIdentityRow\">"
+            "<label>外层身份 Outer Identity（可选）</label>"
             "<input name=\"outer_identity\" id=\"outer_identity\" maxlength=\"63\" "
             "autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" "
             "placeholder=\"留空时使用 PEAP 账户\" value=\"");
@@ -469,6 +470,7 @@ static void handleRoot() {
             "var p=m==='1',o=m==='2';"
             "if(p&&openAdvanced)document.getElementById('advanced').open=true;"
             "document.getElementById('idRow').style.display=p?'block':'none';"
+            "document.getElementById('outerIdentityRow').style.display=p?'block':'none';"
             "document.getElementById('identity').required=p;"
             "document.getElementById('outer_identity').disabled=!p;"
             "document.getElementById('pass').disabled=o;"
