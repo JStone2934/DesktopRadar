@@ -30,6 +30,7 @@ constexpr char kPackagePath[] = "/littlefs/update/firmware.bin";
 
 spi_device_handle_t s_lcd = nullptr;
 bool s_littlefsMounted = false;
+UpdateManifestRecord s_manifestRecord{};
 
 // 5x7 glyphs: A-Z, 0-9, then space, %, -, /, ., :.
 constexpr uint8_t kGlyphs[][5] = {
@@ -465,14 +466,13 @@ extern "C" void app_main(void) {
     waitForManualRetry(&journal);
   }
   show("VERIFY PACKAGE");
-  UpdateManifestRecord manifest{};
-  if (!packageValid(journal, &manifest)) {
+  if (!packageValid(journal, &s_manifestRecord)) {
     journalFailure(&journal, UpdatePhase::Factory, UpdateError::ShaMismatch);
     waitForManualRetry(&journal);
   }
 
   while (journal.attempts < 3) {
-    const UpdateError result = installOnce(&journal, manifest, app);
+    const UpdateError result = installOnce(&journal, s_manifestRecord, app);
     if (result == UpdateError::None) {
       journal.state = UpdateState::BootPending;
       journal.phase = UpdatePhase::Boot;

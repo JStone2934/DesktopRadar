@@ -3,6 +3,7 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace {
@@ -23,36 +24,47 @@ bool readBlob(nvs_handle_t handle, const char* key, T* out) {
 template <typename T, bool (*Valid)(const T&)>
 bool loadDual(const char* key0, const char* key1, T* out) {
   if (!out) return false;
+  T* candidate = static_cast<T*>(calloc(1, sizeof(T)));
+  if (!candidate) return false;
   nvs_handle_t handle;
-  if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) return false;
-  T a{};
-  T b{};
-  const bool va = readBlob(handle, key0, &a) && Valid(a);
-  const bool vb = readBlob(handle, key1, &b) && Valid(b);
+  if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) {
+    free(candidate);
+    return false;
+  }
+  memset(out, 0, sizeof(T));
+  const bool va = readBlob(handle, key0, out) && Valid(*out);
+  const bool vb = readBlob(handle, key1, candidate) && Valid(*candidate);
   nvs_close(handle);
-  if (!va && !vb) return false;
-  *out = !vb || (va && newer(a.sequence, b.sequence)) ? a : b;
-  return true;
+  if (vb && (!va || newer(candidate->sequence, out->sequence))) {
+    *out = *candidate;
+  }
+  free(candidate);
+  return va || vb;
 }
 
 template <typename T, bool (*Valid)(const T&)>
 bool saveDual(const char* key0, const char* key1, T* record) {
   if (!record) return false;
-  T current{};
-  const bool have = loadDual<T, Valid>(key0, key1, &current);
-  record->sequence = have ? current.sequence + 1U : 1U;
+  T* scratch = static_cast<T*>(calloc(1, sizeof(T)));
+  if (!scratch) return false;
+  const bool have = loadDual<T, Valid>(key0, key1, scratch);
+  record->sequence = have ? scratch->sequence + 1U : 1U;
   record->crc32 = updateCrc32(record, offsetof(T, crc32));
   const char* key = (record->sequence & 1U) ? key1 : key0;
   nvs_handle_t handle;
-  if (nvs_open(kNamespace, NVS_READWRITE, &handle) != ESP_OK) return false;
+  if (nvs_open(kNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+    free(scratch);
+    return false;
+  }
   esp_err_t rc = nvs_set_blob(handle, key, record, sizeof(T));
   if (rc == ESP_OK) rc = nvs_commit(handle);
-  T verify{};
-  if (rc == ESP_OK && (!readBlob(handle, key, &verify) || !Valid(verify) ||
-                       verify.sequence != record->sequence)) {
+  if (rc == ESP_OK &&
+      (!readBlob(handle, key, scratch) || !Valid(*scratch) ||
+       scratch->sequence != record->sequence)) {
     rc = ESP_FAIL;
   }
   nvs_close(handle);
+  free(scratch);
   return rc == ESP_OK;
 }
 

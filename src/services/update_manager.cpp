@@ -47,6 +47,15 @@ bool s_exclusive = false;
 uint32_t s_nonce = 0;
 uint32_t s_dailyIdleSince = 0;
 
+struct ManifestRecordBuffer {
+  UpdateManifestRecord* value;
+
+  ManifestRecordBuffer()
+      : value(static_cast<UpdateManifestRecord*>(
+            calloc(1, sizeof(UpdateManifestRecord)))) {}
+  ~ManifestRecordBuffer() { free(value); }
+};
+
 void drawUpdateStatus(LGFX* lcd, const char* title, const char* detail) {
   if (!lcd) return;
   lcd->fillScreen(TFT_BLACK);
@@ -131,14 +140,14 @@ bool decodeOuterManifest(const uint8_t* json, size_t jsonLength,
   }
   const char* payloadB64 = doc["payload_b64"] | "";
   const char* signatureB64 = doc["signature_b64"] | "";
-  UpdateManifestRecord record{};
+  memset(out, 0, sizeof(*out));
   size_t payloadLength = 0;
   size_t signatureLength = 0;
-  if (mbedtls_base64_decode(record.payload, sizeof(record.payload),
+  if (mbedtls_base64_decode(out->payload, sizeof(out->payload),
                             &payloadLength,
                             reinterpret_cast<const uint8_t*>(payloadB64),
                             strlen(payloadB64)) != 0 ||
-      mbedtls_base64_decode(record.signature, sizeof(record.signature),
+      mbedtls_base64_decode(out->signature, sizeof(out->signature),
                             &signatureLength,
                             reinterpret_cast<const uint8_t*>(signatureB64),
                             strlen(signatureB64)) != 0 ||
@@ -146,17 +155,15 @@ bool decodeOuterManifest(const uint8_t* json, size_t jsonLength,
     *error = UpdateError::ManifestFormat;
     return false;
   }
-  record.payloadLength = static_cast<uint16_t>(payloadLength);
-  record.signatureLength = static_cast<uint16_t>(signatureLength);
-  if (!updateManifestVerifyAndParse(record.payload, record.payloadLength,
-                                    record.signature,
-                                    record.signatureLength,
-                                    &record.manifest)) {
+  out->payloadLength = static_cast<uint16_t>(payloadLength);
+  out->signatureLength = static_cast<uint16_t>(signatureLength);
+  if (!updateManifestVerifyAndParse(out->payload, out->payloadLength,
+                                    out->signature, out->signatureLength,
+                                    &out->manifest)) {
     *error = UpdateError::ManifestSignature;
     return false;
   }
-  record.checkedAt = checkedAt;
-  *out = record;
+  out->checkedAt = checkedAt;
   *error = UpdateError::None;
   return true;
 }
@@ -222,6 +229,9 @@ bool layoutCompatible(bool requireFactoryImage) {
 void journalFailure(UpdateJournal* journal, UpdatePhase phase,
                     UpdateError error) {
   if (!journal) return;
+  Serial.printf("update failed: phase=%u error=%s attempts=%u\n",
+                static_cast<unsigned>(phase), updateErrorName(error),
+                static_cast<unsigned>(journal->attempts));
   journal->state = UpdateState::Failed;
   journal->phase = phase;
   journal->error = error;
@@ -401,14 +411,15 @@ bool selectFactoryAndRestart(UpdateJournal* journal) {
 
 bool executeUpdate(LGFX* lcd, AppConfig* cfg, UpdateJournal* journal) {
   if (!lcd || !cfg || !journal) return false;
-  UpdateManifestRecord cached{};
-  if (!updateStoreLoadManifest(&cached) ||
-      cached.sequence != journal->manifestSequence ||
-      cached.manifest.versionCode != journal->targetVersionCode) {
+  ManifestRecordBuffer record;
+  if (!record.value || !updateStoreLoadManifest(record.value) ||
+      record.value->sequence != journal->manifestSequence ||
+      record.value->manifest.versionCode != journal->targetVersionCode) {
     journalFailure(journal, UpdatePhase::Manifest,
                    UpdateError::ManifestChanged);
     return false;
   }
+  const UpdateManifest cachedManifest = record.value->manifest;
 
   s_exclusive = true;
   drawUpdateStatus(lcd, "Update", "Connecting WiFi");
@@ -424,29 +435,28 @@ bool executeUpdate(LGFX* lcd, AppConfig* cfg, UpdateJournal* journal) {
     s_exclusive = false;
     return false;
   }
-  UpdateManifestRecord fresh{};
   UpdateError error = UpdateError::None;
-  if (!fetchManifest(&fresh, &error)) {
+  if (!fetchManifest(record.value, &error)) {
     journalFailure(journal, UpdatePhase::Manifest, error);
     s_exclusive = false;
     return false;
   }
-  if (!manifestsMatch(cached.manifest, fresh.manifest)) {
-    updateStoreSaveManifest(&fresh);
+  if (!manifestsMatch(cachedManifest, record.value->manifest)) {
+    updateStoreSaveManifest(record.value);
     journalFailure(journal, UpdatePhase::Manifest,
                    UpdateError::ManifestChanged);
     s_exclusive = false;
     return false;
   }
   if (!layoutCompatible(true) ||
-      !updateManifestIsInstallable(fresh.manifest, RADAR_VERSION_CODE,
+      !updateManifestIsInstallable(record.value->manifest, RADAR_VERSION_CODE,
                                    LittleFS.totalBytes())) {
     journalFailure(journal, UpdatePhase::Preflight,
                    UpdateError::FactoryIncompatible);
     s_exclusive = false;
     return false;
   }
-  if (!preflightAsset(fresh.manifest)) {
+  if (!preflightAsset(record.value->manifest)) {
     journalFailure(journal, UpdatePhase::Preflight,
                    UpdateError::AssetPreflight);
     s_exclusive = false;
@@ -479,7 +489,7 @@ bool executeUpdate(LGFX* lcd, AppConfig* cfg, UpdateJournal* journal) {
   for (uint8_t attempt = 1; attempt <= 3 && !downloaded; ++attempt) {
     journal->attempts = attempt;
     updateStoreSaveJournal(journal);
-    downloaded = downloadFirmware(fresh.manifest, lcd, &error);
+    downloaded = downloadFirmware(record.value->manifest, lcd, &error);
     if (!downloaded) {
       LittleFS.remove("/update/firmware.part");
       if (attempt < 3) delay(attempt == 1 ? 5000 : 30000);
@@ -506,19 +516,21 @@ bool executeUpdate(LGFX* lcd, AppConfig* cfg, UpdateJournal* journal) {
 }
 
 void dailyCheckTask(void*) {
-  UpdateManifestRecord record{};
+  ManifestRecordBuffer record;
   UpdateError result = UpdateError::None;
-  if (!fetchManifest(&record, &result)) {
+  if (!record.value || !fetchManifest(record.value, &result)) {
     updateStoreSetLastError(result);
-  } else if (!updateStoreSaveManifest(&record)) {
+  } else if (!updateStoreSaveManifest(record.value)) {
     result = UpdateError::StoreCorrupt;
     updateStoreSetLastError(result);
   } else {
-    updateStoreSetTime("last_success", record.checkedAt);
+    updateStoreSetTime("last_success", record.value->checkedAt);
     updateStoreSetLastError(UpdateError::None);
   }
   s_dailyResult = result;
   s_dailyDone = true;
+  free(record.value);
+  record.value = nullptr;
   vTaskDelete(nullptr);
 }
 
@@ -565,12 +577,12 @@ void updateManagerGetPortalInfo(UpdatePortalInfo* out) {
     out->lastError = journal.error;
     out->lastErrorAt = journal.updatedAt;
   }
-  UpdateManifestRecord record{};
-  if (updateStoreLoadManifest(&record)) {
+  ManifestRecordBuffer record;
+  if (record.value && updateStoreLoadManifest(record.value)) {
     out->haveManifest = true;
-    out->manifest = record.manifest;
+    out->manifest = record.value->manifest;
     out->available = out->factoryCompatible &&
-                     updateManifestIsInstallable(record.manifest,
+                     updateManifestIsInstallable(record.value->manifest,
                                                  RADAR_VERSION_CODE,
                                                  kFsSize);
   }
@@ -578,21 +590,21 @@ void updateManagerGetPortalInfo(UpdatePortalInfo* out) {
 
 bool updateManagerRequestFromPortal(uint32_t versionCode, uint32_t nonce) {
   if (nonce != s_nonce || nonce == 0 || !layoutCompatible(true)) return false;
-  UpdateManifestRecord record{};
-  if (!updateStoreLoadManifest(&record) ||
-      record.manifest.versionCode != versionCode ||
-      !updateManifestIsInstallable(record.manifest, RADAR_VERSION_CODE,
+  ManifestRecordBuffer record;
+  if (!record.value || !updateStoreLoadManifest(record.value) ||
+      record.value->manifest.versionCode != versionCode ||
+      !updateManifestIsInstallable(record.value->manifest, RADAR_VERSION_CODE,
                                    kFsSize)) {
     return false;
   }
   UpdateJournal journal{};
   journal.state = UpdateState::Requested;
   journal.phase = UpdatePhase::Manifest;
-  journal.targetVersionCode = record.manifest.versionCode;
-  journal.expectedSize = record.manifest.size;
-  memcpy(journal.expectedSha256, record.manifest.sha256,
+  journal.targetVersionCode = record.value->manifest.versionCode;
+  journal.expectedSize = record.value->manifest.size;
+  memcpy(journal.expectedSha256, record.value->manifest.sha256,
          sizeof(journal.expectedSha256));
-  journal.manifestSequence = record.sequence;
+  journal.manifestSequence = record.value->sequence;
   journal.requestedAt = static_cast<uint64_t>(time(nullptr));
   journal.updatedAt = journal.requestedAt;
   return updateStoreSaveJournal(&journal);

@@ -3,6 +3,8 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +26,13 @@ static uint32_t s_saveRedirectAt = 0;  // POST 成功后等待 /done；超时兜
 static uint32_t s_updateRedirectAt = 0;
 static AppConfig s_formCfg;
 static AppConfig s_seedCfg;
+// The WebServer callback runs on Arduino's loopTask. Keep the relatively large
+// manifest snapshot and formatted timestamps out of its 8 KiB stack.
+static UpdatePortalInfo s_portalUpdateInfo;
+static char s_lastSuccessText[32];
+static char s_lastAttemptText[32];
+static char s_lastErrorText[32];
+static char s_publishedText[32];
 
 struct PortalNetwork {
   String ssid;
@@ -259,7 +268,10 @@ static void handleRoot() {
   }
 
   s_webActive = true;
-  Serial.println("portal: setup page opened manually, timeout disabled");
+  Serial.printf(
+      "portal: setup page opened, heap=%u max=%u stackWatermark=%u\n",
+      ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+      static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
   // 输入框只填绝对值；正负由北纬/南纬、东经/西经决定
   char latBuf[24];
@@ -269,17 +281,16 @@ static void handleRoot() {
   const bool latSouth = s_seedCfg.lat < 0.0f;
   const bool lonWest = s_seedCfg.lon < 0.0f;
 
-  UpdatePortalInfo updateInfo{};
+  UpdatePortalInfo& updateInfo = s_portalUpdateInfo;
   updateManagerGetPortalInfo(&updateInfo);
-  char lastSuccess[32];
-  formatPortalTime(updateInfo.lastSuccess, lastSuccess, sizeof(lastSuccess));
-  char lastAttempt[32];
-  formatPortalTime(updateInfo.lastAttempt, lastAttempt, sizeof(lastAttempt));
-  char lastErrorAt[32];
-  formatPortalTime(updateInfo.lastErrorAt, lastErrorAt, sizeof(lastErrorAt));
-  char publishedAt[32];
-  formatPortalTime(updateInfo.manifest.publishedAt, publishedAt,
-                   sizeof(publishedAt));
+  formatPortalTime(updateInfo.lastSuccess, s_lastSuccessText,
+                   sizeof(s_lastSuccessText));
+  formatPortalTime(updateInfo.lastAttempt, s_lastAttemptText,
+                   sizeof(s_lastAttemptText));
+  formatPortalTime(updateInfo.lastErrorAt, s_lastErrorText,
+                   sizeof(s_lastErrorText));
+  formatPortalTime(updateInfo.manifest.publishedAt, s_publishedText,
+                   sizeof(s_publishedText));
 
   String html;
   html.reserve(20000);
@@ -500,9 +511,9 @@ static void handleRoot() {
   html += F(" · ");
   appendEscaped(html, updateInfo.currentBuild);
   html += F("</span><b>最近尝试检查</b><span>");
-  appendEscaped(html, lastAttempt);
+  appendEscaped(html, s_lastAttemptText);
   html += F("</span><b>最近成功检查</b><span>");
-  appendEscaped(html, lastSuccess);
+  appendEscaped(html, s_lastSuccessText);
   html += F("</span>");
   if (updateInfo.haveManifest) {
     html += F("<b>GitHub 最新版</b><span>");
@@ -510,7 +521,7 @@ static void handleRoot() {
     html += F(" · ");
     html += String(updateInfo.manifest.size / 1024U);
     html += F(" KiB</span><b>发布日期</b><span>");
-    appendEscaped(html, publishedAt);
+    appendEscaped(html, s_publishedText);
     html += F("</span></div>");
     if (updateInfo.manifest.notes[0]) {
       html += F("<p class=\"hint\">");
@@ -524,7 +535,7 @@ static void handleRoot() {
     html += F("<div class=\"error\">上次更新操作：");
     appendEscaped(html, updateErrorName(updateInfo.lastError));
     html += F("（");
-    appendEscaped(html, lastErrorAt);
+    appendEscaped(html, s_lastErrorText);
     html += F("）。本次确认前会再次联网核对，不会直接使用失效下载。</div>");
   }
   if (!updateInfo.factoryCompatible) {
@@ -585,6 +596,9 @@ static void handleRoot() {
             "</body></html>");
   sendNoStoreHeaders();
   s_server->send(200, "text/html; charset=utf-8", html);
+  Serial.printf("portal: page sent bytes=%u heap=%u stackWatermark=%u\n",
+                static_cast<unsigned>(html.length()), ESP.getFreeHeap(),
+                static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
 static const char kSavedHtml[] PROGMEM = R"HTML(
