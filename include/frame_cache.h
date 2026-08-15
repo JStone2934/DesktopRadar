@@ -125,6 +125,13 @@ bool frameCacheBeginRgb565New(int zoom);
 bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
                                const uint16_t* frame);
 
+/**
+ * 从正在构建的 .rgb565.new 读取连续若干行。
+ * 用于让 PNG 解码器与较大的合成帧带分时复用连续堆内存。
+ */
+bool frameCacheReadRgb565NewBand(int zoom, int startRow, int rowCount,
+                                 uint16_t* frame);
+
 /** 读已就绪静帧到内存缓冲（需 FRAME_RGB565_BYTES）。 */
 bool frameCacheLoadRgb565(int zoom, uint16_t* frame);
 

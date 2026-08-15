@@ -1077,9 +1077,9 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
     }
     return false;
   }
-  // 旧实现一次写入并 flush 80 行（38.4KB），遇到 LittleFS 回收时会形成
-  // 数百毫秒甚至更长的不可抢占窗口。8 行一批，把按键检查放在每次
-  // 3.84KB 写入前后；中止时只留下 .new 临时文件，正式缓存不受影响。
+  // 8 行一批写入并在每批前后检查按键，但不要每 8 行都 flush。
+  // LittleFS 的 flush 是昂贵的全文件同步；逐批同步会把一次瓦片合成
+  // 放大到数十秒。一个帧带完成后统一同步，正式缓存仍由 commit 保护。
   constexpr int kWriteRows = 8;
   size_t wrote = 0;
   for (int row = 0; row < rowCount; row += kWriteRows) {
@@ -1098,15 +1098,55 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
       f.close();
       return false;
     }
-    f.flush();
     inputServiceDuringBlock();
     if (composeAbortRequested()) {
       f.close();
       return false;
     }
   }
+  f.flush();
   f.close();
   return wrote == (size_t)rowCount * FRAME_ROW_BYTES;
+}
+
+bool frameCacheReadRgb565NewBand(int zoom, int startRow, int rowCount,
+                                 uint16_t* frame) {
+  if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX || startRow < 0 ||
+      rowCount < 1 || startRow + rowCount > LCD_HEIGHT) {
+    return false;
+  }
+  char path[40];
+  rgbNewPath(zoom, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  if (!f || !f.seek((size_t)startRow * FRAME_ROW_BYTES)) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+
+  constexpr int kReadRows = 8;
+  size_t readBytes = 0;
+  for (int row = 0; row < rowCount; row += kReadRows) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      f.close();
+      return false;
+    }
+    const int rows = min(kReadRows, rowCount - row);
+    const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(
+        frame + (size_t)row * LCD_WIDTH);
+    const int n = f.read(dst, bytes);
+    if (n != (int)bytes) {
+      f.close();
+      return false;
+    }
+    readBytes += (size_t)n;
+    inputServiceDuringBlock();
+  }
+  f.close();
+  return readBytes == (size_t)rowCount * FRAME_ROW_BYTES;
 }
 
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
