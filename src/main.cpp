@@ -1262,6 +1262,7 @@ static void runPortalAndApply() {
   }
 
   windFieldSetEnabled(s_cfg.show_wind_particles);
+  windParticlesSetStyle(s_cfg.wind_particle_style);
   windParticlesReset();
   // 两种模式都保留全档静帧秒切；差异只在刷新调度。
   zoomSetPrefetchRadius(ZOOM_MAX - ZOOM_MIN);
@@ -1314,6 +1315,7 @@ void setup() {
   updateManagerHandleBootResume(&lcd, &s_cfg);
   seedZoomRefreshTimesFromCache();
   windFieldBegin();
+  windParticlesSetStyle(s_cfg.wind_particle_style);
   windParticlesBegin();
 
   runPortalAndApply();

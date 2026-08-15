@@ -483,7 +483,19 @@ static void handleRoot() {
               : F("<option value=\"1\">开启</option>"
                   "<option value=\"0\" selected>关闭</option>");
   html += F("</select>"
-            "<p class=\"hint\">持续播放当前 10 米风场；气象数据约每小时更新，雷达更新期间自动降帧。</p></div>"
+            "<p class=\"hint\">持续播放当前 10 米风场；气象数据约每小时更新，雷达更新期间自动降帧。</p>"
+            "<label>粒子形状</label><select name=\"wind_style\" autocomplete=\"off\">");
+  html += s_seedCfg.wind_particle_style == WIND_PARTICLE_DOT
+              ? F("<option value=\"0\" selected>亮点（渐隐拖影）</option>")
+              : F("<option value=\"0\">亮点（渐隐拖影）</option>");
+  html += s_seedCfg.wind_particle_style == WIND_PARTICLE_OPEN_ARROW
+              ? F("<option value=\"1\" selected>细箭头（无拖尾）</option>")
+              : F("<option value=\"1\">细箭头（无拖尾）</option>");
+  html += s_seedCfg.wind_particle_style == WIND_PARTICLE_WIDE_ARROW
+              ? F("<option value=\"2\" selected>粗折角箭头（6 像素线宽）</option>")
+              : F("<option value=\"2\">粗折角箭头（6 像素线宽）</option>");
+  html += F("</select>"
+            "<p class=\"hint\">两种箭头均不显示拖尾；粗折角箭头只显示画面主导风向，以 9–10 个一组排队滚动。关闭风场后仍会保留此选择。</p></div>"
             "<div class=\"setting\"><label>启动默认缩放等级</label><select name=\"default_zoom\" "
             "autocomplete=\"off\">");
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
@@ -847,6 +859,18 @@ static const char* parseForm(AppConfig* cfg) {
   cfg->show_alert_ring = (s_server->arg("show_alert") == "1");
   cfg->show_crosshair = (s_server->arg("show_crosshair") != "0");
   cfg->show_wind_particles = (s_server->arg("show_wind") == "1");
+  const String windStyle = s_server->arg("wind_style");
+  if (windStyle.length() == 0) {
+    cfg->wind_particle_style = s_seedCfg.wind_particle_style;
+  } else if (windStyle == "0") {
+    cfg->wind_particle_style = WIND_PARTICLE_DOT;
+  } else if (windStyle == "1") {
+    cfg->wind_particle_style = WIND_PARTICLE_OPEN_ARROW;
+  } else if (windStyle == "2") {
+    cfg->wind_particle_style = WIND_PARTICLE_WIDE_ARROW;
+  } else {
+    return "风场粒子形状无效";
+  }
 
   String defaultZoomStr = s_server->arg("default_zoom");
   defaultZoomStr.trim();
@@ -903,10 +927,11 @@ static void handleSave() {
     return;
   }
   s_formCfg = cfg;
-  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d wind=%d defZoom=%d\n",
+  Serial.printf("config saved: mode=%u ssid=%s lat=%.4f lon=%.4f ring=%d alert=%d cross=%d wind=%d windStyle=%u defZoom=%d\n",
                 (unsigned)cfg.wifi_mode, cfg.ssid, cfg.lat, cfg.lon,
                 (int)cfg.show_progress, (int)cfg.show_alert_ring,
                 (int)cfg.show_crosshair, (int)cfg.show_wind_particles,
+                (unsigned)cfg.wind_particle_style,
                 cfg.default_zoom);
   // PRG：303 到 /done，避免刷新/历史记录重复 POST，也不把「已保存」绑在 POST 上缓存
   sendNoStoreHeaders();

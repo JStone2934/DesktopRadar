@@ -9,6 +9,13 @@ enum AppWifiMode : uint8_t {
   APP_WIFI_OPEN = 2,
 };
 
+/** 风场粒子样式：亮点保留渐隐拖影，两种开放式箭头均不显示拖尾。 */
+enum WindParticleStyle : uint8_t {
+  WIND_PARTICLE_DOT = 0,
+  WIND_PARTICLE_OPEN_ARROW = 1,
+  WIND_PARTICLE_WIDE_ARROW = 2,
+};
+
 struct AppConfig {
   AppWifiMode wifi_mode;
   char ssid[33];
@@ -21,6 +28,7 @@ struct AppConfig {
   bool show_alert_ring;  // 中心天气预警环
   bool show_crosshair;   // 中心十字准星
   bool show_wind_particles;  // 当前 10m 风场粒子动画
+  WindParticleStyle wind_particle_style;  // 亮点、细箭头或 6px 宽箭头
   int default_zoom;      // 启动默认缩放档；按住 S 键 2 秒跳回此档
 };
 
