@@ -495,7 +495,7 @@ static void handleRoot() {
               ? F("<option value=\"2\" selected>粗折角箭头（6 像素线宽）</option>")
               : F("<option value=\"2\">粗折角箭头（6 像素线宽）</option>");
   html += F("</select>"
-            "<p class=\"hint\">两种箭头均不显示拖尾；粗折角箭头只显示画面主导风向，以 9–10 个一组排队滚动。关闭风场后仍会保留此选择。</p></div>"
+            "<p class=\"hint\">两种箭头均不显示拖尾；粗折角箭头会选择稳定主流通道，以 9–10 个一组沿风向转弯滚动。关闭风场后仍会保留此选择。</p></div>"
             "<div class=\"setting\"><label>启动默认缩放等级</label><select name=\"default_zoom\" "
             "autocomplete=\"off\">");
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {

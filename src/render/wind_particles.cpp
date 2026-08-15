@@ -40,12 +40,13 @@ static constexpr int kTrailPixelCapacity = 3072;
 static constexpr int kNewPixelCapacity = 896;
 static constexpr uint32_t kTrailFadeMs = 1500UL;
 static constexpr int kWideQueueSlots = 10;
-static constexpr float kWideQueueLaneOffset = 30.0f;
 static constexpr float kWideQueueFadeLength = 28.0f;
 static constexpr int kWideArrowMaskCapacity = 112;
 static constexpr int kWideDirectionCount = 16;
 static constexpr int kWidePathCapacity = 32;
 static constexpr float kWidePathStep = 10.0f;
+static constexpr int kWideSeedGrid = 5;
+static constexpr int kZoomSlots = ZOOM_MAX - ZOOM_MIN + 1;
 
 static Particle s_particles[WIND_PARTICLE_COUNT];
 static TrailPixel s_trails[kTrailPixelCapacity];
@@ -78,6 +79,9 @@ static bool s_wideDirectionValid = false;
 static WidePathNode s_widePath[kWidePathCapacity];
 static int s_widePathCount = 0;
 static float s_widePathLength = 0.0f;
+static float s_wideSeedX[kZoomSlots];
+static float s_wideSeedY[kZoomSlots];
+static bool s_wideSeedValid[kZoomSlots];
 
 static constexpr uint8_t kTrailHead = 0x01;
 // 只用于开放式箭翼：本帧以头部颜色绘制，下一帧恢复静态底色，
@@ -137,6 +141,17 @@ static bool pointAllowed(float x, float y) {
     return false;
   }
   return true;
+}
+
+static bool wideArrowPixelAllowed(float x, float y) {
+  if (x < 4.0f || x > (float)(LCD_WIDTH - 5) || y < 4.0f ||
+      y >= (float)(LCD_HEIGHT - OVERLAY_BAR_H - 2)) {
+    return false;
+  }
+  const float dx = x - (float)LCD_WIDTH * 0.5f;
+  const float dy = y - (float)LCD_HEIGHT * 0.5f;
+  // 粗箭头允许穿过中心十字，只保留圆屏外沿和底栏裁切。
+  return dx * dx + dy * dy <= 112.0f * 112.0f;
 }
 
 static void spawnParticle(Particle* p) {
@@ -331,35 +346,13 @@ static void guidedWideFlow(float x, float y, float previousX,
   *outY = smoothY;
 }
 
-static void appendWidePathNode(float x, float y) {
-  if (s_widePathCount >= kWidePathCapacity) {
-    return;
-  }
-  float distance = 0.0f;
-  if (s_widePathCount > 0) {
-    const float dx = x - s_widePath[s_widePathCount - 1].x;
-    const float dy = y - s_widePath[s_widePathCount - 1].y;
-    distance = s_widePath[s_widePathCount - 1].distance +
-               sqrtf(dx * dx + dy * dy);
-  }
-  s_widePath[s_widePathCount++] = WidePathNode{x, y, distance};
-  s_widePathLength = distance;
-}
-
-static bool buildWidePath(uint32_t revision) {
-  // updateWideQueueDirection 在新 revision 时只更新主导向量；路径在这里
-  // 生成一次，之后所有动画帧复用。
-  if (s_wideDirectionRevision != revision &&
-      !updateWideQueueDirection(revision)) {
+static bool traceWidePath(float anchorX, float anchorY, WidePathNode* out,
+                          int* outCount, float* outLength,
+                          float* outScore) {
+  if (!out || !outCount || !outLength || !outScore ||
+      !widePathPointAllowed(anchorX, anchorY)) {
     return false;
   }
-  if (s_widePathCount >= 2) {
-    return true;
-  }
-  if (s_wideDirectionRevision != revision || !s_wideDirectionValid) {
-    return false;
-  }
-
   constexpr int kSideCapacity = (kWidePathCapacity - 1) / 2;
   float upstreamX[kSideCapacity];
   float upstreamY[kSideCapacity];
@@ -367,13 +360,6 @@ static bool buildWidePath(uint32_t revision) {
   float downstreamY[kSideCapacity];
   int upstreamCount = 0;
   int downstreamCount = 0;
-
-  const float perpendicularX = -s_wideDominantY;
-  const float perpendicularY = s_wideDominantX;
-  const float anchorX = (float)LCD_WIDTH * 0.5f +
-                        perpendicularX * kWideQueueLaneOffset;
-  const float anchorY = (float)LCD_HEIGHT * 0.5f +
-                        perpendicularY * kWideQueueLaneOffset;
 
   auto extend = [&](float sign, float* xs, float* ys, int* count) {
     float x = anchorX;
@@ -406,28 +392,156 @@ static bool buildWidePath(uint32_t revision) {
 
   extend(-1.0f, upstreamX, upstreamY, &upstreamCount);
   extend(1.0f, downstreamX, downstreamY, &downstreamCount);
-  s_widePathCount = 0;
-  s_widePathLength = 0.0f;
+
+  int count = 0;
+  float length = 0.0f;
+  auto append = [&](float x, float y) {
+    if (count >= kWidePathCapacity) {
+      return;
+    }
+    if (count > 0) {
+      const float dx = x - out[count - 1].x;
+      const float dy = y - out[count - 1].y;
+      length += sqrtf(dx * dx + dy * dy);
+    }
+    out[count++] = WidePathNode{x, y, length};
+  };
   for (int i = upstreamCount - 1; i >= 0; --i) {
-    appendWidePathNode(upstreamX[i], upstreamY[i]);
+    append(upstreamX[i], upstreamY[i]);
   }
-  appendWidePathNode(anchorX, anchorY);
+  append(anchorX, anchorY);
   for (int i = 0; i < downstreamCount; ++i) {
-    appendWidePathNode(downstreamX[i], downstreamY[i]);
+    append(downstreamX[i], downstreamY[i]);
   }
 
-  if (s_widePathCount < 2 || s_widePathLength < 120.0f) {
+  if (count < 2 || length < 120.0f) {
+    return false;
+  }
+
+  float speedSum = 0.0f;
+  float coherenceSum = 0.0f;
+  int fieldSamples = 0;
+  for (int i = 0; i < count; ++i) {
+    float east = 0.0f;
+    float south = 0.0f;
+    if (!windFieldSample(out[i].x, out[i].y, &east, &south)) {
+      continue;
+    }
+    const float speed = sqrtf(east * east + south * south);
+    if (speed < 0.08f) {
+      continue;
+    }
+    speedSum += speed;
+    east /= speed;
+    south /= speed;
+    const float alignment =
+        east * s_wideDominantX + south * s_wideDominantY;
+    coherenceSum += max(0.0f, alignment);
+    ++fieldSamples;
+  }
+  const float meanSpeed =
+      fieldSamples > 0 ? speedSum / (float)fieldSamples : 0.0f;
+  const float coherence =
+      fieldSamples > 0 ? coherenceSum / (float)fieldSamples : 0.0f;
+  // 长而连贯的流线优先；平均风速用于在长度接近时选择主风带。
+  *outCount = count;
+  *outLength = length;
+  *outScore = length * (0.65f + 0.35f * coherence) +
+              min(meanSpeed, 20.0f) * 4.0f;
+  return true;
+}
+
+static bool buildWidePath(uint32_t revision) {
+  // updateWideQueueDirection 在新 revision 时只更新主导向量；候选通道只
+  // 在缩放/风场变化时评分一次，之后所有动画帧复用。
+  if (s_wideDirectionRevision != revision &&
+      !updateWideQueueDirection(revision)) {
+    return false;
+  }
+  if (s_widePathCount >= 2) {
+    return true;
+  }
+  if (s_wideDirectionRevision != revision || !s_wideDirectionValid ||
+      s_seenZoom < ZOOM_MIN || s_seenZoom > ZOOM_MAX) {
+    return false;
+  }
+
+  WidePathNode candidate[kWidePathCapacity];
+  int candidateCount = 0;
+  float candidateLength = 0.0f;
+  float candidateScore = 0.0f;
+  float bestX = (float)LCD_WIDTH * 0.5f;
+  float bestY = (float)LCD_HEIGHT * 0.5f;
+  float bestScore = -1.0f;
+  const int seedSlot = s_seenZoom - ZOOM_MIN;
+  float previousScore = -1.0f;
+  bool previousUsable = false;
+
+  if (s_wideSeedValid[seedSlot]) {
+    previousUsable = traceWidePath(
+        s_wideSeedX[seedSlot], s_wideSeedY[seedSlot], candidate,
+        &candidateCount, &candidateLength, &previousScore);
+    if (previousUsable) {
+      bestX = s_wideSeedX[seedSlot];
+      bestY = s_wideSeedY[seedSlot];
+      bestScore = previousScore;
+    }
+  }
+
+  for (int gy = 0; gy < kWideSeedGrid; ++gy) {
+    const float y = 36.0f + (float)gy * 37.0f;
+    for (int gx = 0; gx < kWideSeedGrid; ++gx) {
+      const float x = 44.0f + (float)gx * 38.0f;
+      if (!traceWidePath(x, y, candidate, &candidateCount,
+                         &candidateLength, &candidateScore)) {
+        continue;
+      }
+      float rankedScore = candidateScore;
+      if (previousUsable) {
+        const float dx = x - s_wideSeedX[seedSlot];
+        const float dy = y - s_wideSeedY[seedSlot];
+        // 相近通道优先，抑制相邻网格之间无意义的来回跳动。
+        rankedScore -= sqrtf(dx * dx + dy * dy) * 0.18f;
+      }
+      if (rankedScore > bestScore) {
+        bestScore = rankedScore;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  bool switched = !previousUsable;
+  if (previousUsable && (bestX != s_wideSeedX[seedSlot] ||
+                         bestY != s_wideSeedY[seedSlot])) {
+    // 新通道至少强 15% 才允许换道；否则保留上一轮的稳定位置。
+    if (bestScore <= previousScore * 1.15f) {
+      bestX = s_wideSeedX[seedSlot];
+      bestY = s_wideSeedY[seedSlot];
+      bestScore = previousScore;
+    } else {
+      switched = true;
+    }
+  }
+
+  if (!traceWidePath(bestX, bestY, s_widePath, &s_widePathCount,
+                     &s_widePathLength, &candidateScore)) {
     s_widePathCount = 0;
     s_widePathLength = 0.0f;
     return false;
   }
+  s_wideSeedX[seedSlot] = bestX;
+  s_wideSeedY[seedSlot] = bestY;
+  s_wideSeedValid[seedSlot] = true;
   s_wideQueueSpacing = s_widePathLength / (float)(kWideQueueSlots - 1);
   if (s_wideQueueSpacing < 18.0f) {
     s_wideQueueSpacing = 18.0f;
   }
   s_wideQueuePhase = 0.0f;
-  Serial.printf("wind wide path nodes=%d length=%.1f spacing=%.1f\n",
-                s_widePathCount, s_widePathLength, s_wideQueueSpacing);
+  Serial.printf(
+      "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f spacing=%.1f\n",
+      s_seenZoom, bestX, bestY, (int)switched, candidateScore,
+      s_widePathCount, s_widePathLength, s_wideQueueSpacing);
   return true;
 }
 
@@ -685,7 +799,7 @@ static void queueParticleHead(const Particle& p, int8_t heading) {
 }
 
 static void appendWideHeadKey(int x, int y, uint8_t alpha) {
-  if (!pointAllowed((float)x, (float)y) ||
+  if (!wideArrowPixelAllowed((float)x, (float)y) ||
       s_newCount >= kNewPixelCapacity) {
     return;
   }
