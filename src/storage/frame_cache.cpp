@@ -6,6 +6,8 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +18,9 @@ static uint16_t s_readyMask = 0;
 // 新鲜度掩码：bit=1 表示该档为本轮已重建（新雷达）；ready 仅表示成品存在（可能过时）
 static uint16_t s_freshMask = 0;
 static int s_protectedZoom = -1;
+// UI 读取正式帧与后台任务替换正式帧之间只互斥极短的 rename 窗口。
+// 下载、解码和临时文件写入均不持锁，不会反向拖住 S 键。
+static SemaphoreHandle_t s_finalCacheMutex = nullptr;
 
 static constexpr int kBlitBandRows = 16;
 static uint16_t s_blitBand[LCD_WIDTH * kBlitBandRows];
@@ -79,6 +84,10 @@ static void rgbPath(int zoom, char* out, size_t n) {
 
 static void rgbNewPath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.rgb565.new", zoom);
+}
+
+static void rgbBackupPath(int zoom, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d.rgb565.bak", zoom);
 }
 
 static void alertPath(int zoom, char* out, size_t n) {
@@ -250,6 +259,13 @@ void frameCacheScrubOrphansExcept(int keepZoom) {
 }
 
 bool frameCacheBegin() {
+  if (!s_finalCacheMutex) {
+    s_finalCacheMutex = xSemaphoreCreateMutex();
+    if (!s_finalCacheMutex) {
+      Serial.println("frame cache mutex alloc fail");
+      return false;
+    }
+  }
   s_readyMask = 0;
   s_freshMask = 0;
   if (LittleFS.begin(false)) {
@@ -331,6 +347,37 @@ bool frameCacheBegin() {
   frameCacheScrubOrphans();
 
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    // 新成品替换使用 old -> .bak -> new -> final。若恰好在两次 rename
+    // 之间断电，启动时优先恢复完整旧帧，保证全档秒切不因一次更新丢档。
+    char backupPath[40];
+    char finalPath[40];
+    rgbBackupPath(z, backupPath, sizeof(backupPath));
+    rgbPath(z, finalPath, sizeof(finalPath));
+    if (LittleFS.exists(backupPath)) {
+      File finalFile = LittleFS.open(finalPath, "r");
+      const bool finalValid =
+          finalFile && finalFile.size() == FRAME_RGB565_BYTES;
+      if (finalFile) {
+        finalFile.close();
+      }
+      if (finalValid) {
+        LittleFS.remove(backupPath);
+      } else {
+        File backupFile = LittleFS.open(backupPath, "r");
+        const bool backupValid =
+            backupFile && backupFile.size() == FRAME_RGB565_BYTES;
+        if (backupFile) {
+          backupFile.close();
+        }
+        LittleFS.remove(finalPath);
+        if (backupValid && LittleFS.rename(backupPath, finalPath)) {
+          Serial.printf("recovered interrupted cache promote z%d\n", z);
+        } else {
+          LittleFS.remove(backupPath);
+        }
+      }
+    }
+
     char rpath[40];
     char fpath[40];
     readyPath(z, rpath, sizeof(rpath));
@@ -385,14 +432,30 @@ bool frameCacheBlit(LGFX* lcd, int zoom) {
   if (!lcd || !frameCacheHas(zoom)) {
     return false;
   }
+  if (s_finalCacheMutex) {
+    xSemaphoreTake(s_finalCacheMutex, portMAX_DELAY);
+  }
   File f;
   if (!openRgb565IfValid(zoom, &f)) {
+    // 内存 ready 与文件不一致时立即自愈，避免此档之后每次都假装可秒切。
+    readyMaskSet(zoom, false);
+    freshMaskSet(zoom, false);
+    if (s_finalCacheMutex) {
+      xSemaphoreGive(s_finalCacheMutex);
+    }
     return false;
   }
   // 缓存内存放 native RGB565（与 color565 一致）；
   // LovyanGFX 默认将 uint16_t* 当作 swap565，必须 setSwapBytes(true)
   const bool ok = blitRgb565File(lcd, f, zoom);
   f.close();
+  if (!ok) {
+    readyMaskSet(zoom, false);
+    freshMaskSet(zoom, false);
+  }
+  if (s_finalCacheMutex) {
+    xSemaphoreGive(s_finalCacheMutex);
+  }
   return ok;
 }
 
@@ -1127,10 +1190,33 @@ bool frameCachePromoteNewNoReady(int zoom) {
   }
   f.close();
   rgbPath(zoom, path, sizeof(path));
-  LittleFS.remove(path);
+  char backupPath[40];
+  rgbBackupPath(zoom, backupPath, sizeof(backupPath));
+  if (s_finalCacheMutex) {
+    xSemaphoreTake(s_finalCacheMutex, portMAX_DELAY);
+  }
+  LittleFS.remove(backupPath);
+  const bool hadOld = LittleFS.exists(path);
+  if (hadOld && !LittleFS.rename(path, backupPath)) {
+    if (s_finalCacheMutex) {
+      xSemaphoreGive(s_finalCacheMutex);
+    }
+    Serial.printf("promote backup fail z%d\n", zoom);
+    return false;
+  }
   if (!LittleFS.rename(newPath, path)) {
+    if (hadOld) {
+      LittleFS.rename(backupPath, path);
+    }
+    if (s_finalCacheMutex) {
+      xSemaphoreGive(s_finalCacheMutex);
+    }
     Serial.printf("promote rename fail z%d\n", zoom);
     return false;
+  }
+  LittleFS.remove(backupPath);
+  if (s_finalCacheMutex) {
+    xSemaphoreGive(s_finalCacheMutex);
   }
   return true;
 }

@@ -66,5 +66,11 @@ void inputServiceDuringBlock();
 typedef void (*BlockingUiServiceFn)();
 void inputSetBlockingUiService(BlockingUiServiceFn fn);
 
+/**
+ * 将当前 FreeRTOS 任务登记为唯一 UI/按键消费任务。
+ * 后台造片任务仍可检查 composeAbortRequested()，但不会消费按键事件或碰 LCD。
+ */
+void inputBindUiTaskToCurrent();
+
 /** 初始化全档缓存期间锁住缩放输入，并禁止物理按键中止后台造片。 */
 void inputSetLocked(bool locked);

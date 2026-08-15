@@ -126,7 +126,14 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
         Serial.printf("  %s stop retry: WiFi offline\n", tag);
         return false;
       }
-      delay(200 * attempt);
+      const uint32_t waitUntil = millis() + 200UL * attempt;
+      while ((int32_t)(millis() - waitUntil) < 0) {
+        inputServiceDuringBlock();
+        if (composeAbortRequested()) {
+          return false;
+        }
+        delay(10);
+      }
       continue;
     }
     if (!pngPathLooksComplete(tilePath)) {
@@ -138,7 +145,14 @@ static bool fetchTileToFs(int zoom, bool isRadar, int tx, int ty, const String& 
       Serial.printf("  %s small png len=%u accepted\n", tag, (unsigned)len);
     }
     Serial.printf("  %s saved %u bytes\n", tag, (unsigned)len);
-    delay(40);
+    const uint32_t settleUntil = millis() + 40UL;
+    while ((int32_t)(millis() - settleUntil) < 0) {
+      inputServiceDuringBlock();
+      if (composeAbortRequested()) {
+        return false;
+      }
+      delay(5);
+    }
     return true;
   }
   return false;

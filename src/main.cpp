@@ -6,6 +6,8 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +34,7 @@ static AppConfig s_cfg;
 static int s_displayedZoom = -1;
 static uint32_t s_lastRefresh = 0;
 static uint32_t s_refreshFailAt = 0;  // 非 0：上次定时刷新失败，待短重试
-static bool s_busyCompose = false;
+static volatile bool s_busyCompose = false;
 static bool s_wifiOk = false;
 static uint32_t s_wifiRetryAt = 0;
 static uint8_t s_wifiRetryStage = 0;
@@ -41,11 +43,27 @@ static bool s_statusScreen = false;  // 首次 Fetching 黑底，不 blit 地图
 static bool s_initialCacheScreen = false;
 static uint32_t s_initialPulseDrawAt = 0;
 static int s_initialPulseLevel = -1;
-static int s_bakeZoom = -1;
-static float s_bakeLocal = 0.0f;
+static volatile int s_bakeZoom = -1;
+static volatile float s_bakeLocal = 0.0f;
+
+enum class RadarWorkKind : uint8_t {
+  None = 0,
+  Scheduled,
+  Prefetch,
+};
+
+// 雷达下载/解码只在这个低优先级任务运行。UI 主任务永不等待它完成；
+// S 键只设置 abort 并立即读取已有成品缓存。
+static TaskHandle_t s_radarWorkerTask = nullptr;
+static volatile bool s_radarWorkActive = false;
+static volatile bool s_radarWorkDone = false;
+static volatile int s_radarWorkZoom = -1;
+static volatile RadarWorkKind s_radarWorkKind = RadarWorkKind::None;
+static volatile ComposeResult s_radarWorkResult = ComposeResult::Failed;
+static volatile bool s_radarUiPreempted = false;
 // 全档静帧曾铺满一次后进度条保持满（隐藏）
 static bool s_staticFullPassDone = false;
-// 用户交互后暂停后台预取（不挡定时雷达刷新）
+// 用户交互后暂停所有后台雷达造片（缓存显示本身不受影响）
 static uint32_t s_cachePauseUntil = 0;
 // 连续缩放时不逐档读取风场缓存；静止片刻后只加载最终停留档。
 static uint32_t s_windSelectNotBefore = 0;
@@ -72,6 +90,8 @@ static bool serviceWindField();
 static uint32_t nonzeroMillis();
 static void initialCacheScreenTick(bool force = false);
 static void finishInitialCacheScreenIfReady();
+static void serviceRadarWorkCompletion();
+static void serviceRadarWorkUi();
 
 static constexpr uint32_t kWifiRetryBackoffMs[] = {
     60UL * 1000UL, 3UL * 60UL * 1000UL, 10UL * 60UL * 1000UL};
@@ -344,15 +364,27 @@ static bool initialCacheBootstrapActive() {
 }
 
 static void onComposeProgress(int zoom, float local01) {
-  updateLongPressCue();
   s_bakeZoom = zoom;
   s_bakeLocal = local01;
+  // 此回调来自低优先级造片任务，只发布进度，绝不在后台任务碰 LCD。
+  // 抢占判断、进度条、预警环与按键全部由 UI 主循环推进。
+}
+
+static void serviceRadarWorkUi() {
+  if (!s_radarWorkActive) {
+    return;
+  }
+  updateLongPressCue();
+  const int zoom = s_bakeZoom;
   // 全档已经 ready 后，当前档定时刷新才可抢占邻档刷新。初次补齐阶段
   // 必须让缺失档完成提交，否则五分钟定时器会让全档缓存长期补不满。
-  if (zoom != zoomCurrent() && refreshIsDue() &&
+  if (s_radarWorkKind == RadarWorkKind::Prefetch &&
+      zoom != zoomCurrent() && refreshIsDue() &&
       !initialCacheBootstrapActive()) {
-    Serial.printf("abort prefetch z%d — refresh due\n", zoom);
-    composeRequestAbort();
+    if (!composeAbortRequested()) {
+      Serial.printf("abort prefetch z%d — refresh due\n", zoom);
+      composeRequestAbort();
+    }
   }
   pumpAlertRingDuringCompose();
   if (s_staticFullPassDone) {
@@ -360,6 +392,7 @@ static void onComposeProgress(int zoom, float local01) {
   }
   static uint32_t s_lastRingMs = 0;
   const uint32_t now = millis();
+  const float local01 = s_bakeLocal;
   if (local01 < 0.999f && (now - s_lastRingMs) < 200) {
     return;
   }
@@ -434,7 +467,8 @@ static size_t fsFreeBytes() {
  * 在保护期结束后制造一整串后台合成。
  */
 static void scheduleWindStaticRefreshes() {
-  if (!s_cfg.show_wind_particles || cachePaused() || heavyWorkCooling()) {
+  if (!s_cfg.show_wind_particles || s_radarWorkActive || cachePaused() ||
+      heavyWorkCooling()) {
     return;
   }
   // 当前档五分钟刷新到期或即将到期时，不再同时制造一个梯队 stale 档。
@@ -503,7 +537,9 @@ static void forceWifiReconnectAfterFetchFail(const char* reason) {
   WiFi.disconnect(false, false);
 }
 
-static ComposeResult buildAndCache(int zoom, bool pushToDisplay);
+static ComposeResult buildAndCacheBackground(int zoom);
+static bool startRadarWork(int zoom, RadarWorkKind kind);
+static bool startRadarWorker();
 static void handlePendingZoom();
 static bool pumpPrefetch();
 static void ensureZoomVisible(int zoom, bool userInitiated);
@@ -542,11 +578,6 @@ static void clearLongPressCue() {
 }
 
 static void updateLongPressCue() {
-  if (!s_wifiOk) {
-    clearLongPressCue();
-    s_longCueSuppressUntilRelease = false;
-    return;
-  }
   if (!buttonIsDown()) {
     clearLongPressCue();
     s_longCueSuppressUntilRelease = false;
@@ -600,7 +631,7 @@ static void updateLongPressCue() {
 static void pumpWindAnimation(bool busy) {
   static bool pumping = false;
   if (pumping || s_initialCacheScreen || !s_cfg.show_wind_particles ||
-      !s_wifiOk || s_statusScreen || s_displayedZoom < ZOOM_MIN ||
+      s_statusScreen || s_displayedZoom < ZOOM_MIN ||
       s_displayedZoom > ZOOM_MAX) {
     return;
   }
@@ -640,6 +671,7 @@ static void pumpWindDuringBlock() {
 
 static bool serviceWindField() {
   if (s_initialCacheScreen || !s_cfg.show_wind_particles ||
+      s_radarWorkActive ||
       s_displayedZoom < ZOOM_MIN || s_displayedZoom > ZOOM_MAX) {
     return false;
   }
@@ -743,14 +775,18 @@ static void onPendingZoomFeedback(int zoom) {
   }
   noteUserInteraction();
   if (!frameCacheHas(zoom)) {
-    // 用户刚好点到正在后台生成的档：沿用当前下载，不中止后从头再来。
-    // 完成后 pending 会在主循环中用新缓存立即上屏。
-    if (s_busyCompose && s_bakeZoom == zoom) {
-      composeClearAbort();
-      Serial.printf("pending z%d joins active compose\n", zoom);
-      return;
+    // S 键路径绝不等待网络造片。当前后台任务立即让路；缺失档留给之后的
+    // 低优先级预取，屏幕和逻辑档保持在最后一个真实可见缓存。
+    if (s_radarWorkActive) {
+      s_radarUiPreempted = true;
+      composeRequestAbort();
     }
-    Serial.printf("pending z%d not cached — wait for compose\n", zoom);
+    zoomClearPendingIf(zoom);
+    if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
+      zoomSetCurrent(s_displayedZoom);
+    }
+    Serial.printf("pending z%d unavailable — keep visible z%d\n", zoom,
+                  s_displayedZoom);
     return;
   }
   if (!showCached(zoom)) {
@@ -763,7 +799,7 @@ static void onPendingZoomFeedback(int zoom) {
   }
 }
 
-static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
+static ComposeResult buildAndCacheBackground(int zoom) {
   if (!zoomCanCompose(zoom)) {
     return ComposeResult::Failed;
   }
@@ -775,32 +811,10 @@ static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
     return ComposeResult::Failed;
   }
   const bool wasFresh = frameCacheIsFresh(zoom);
-  // 初始化期间任何造片都只写缓存；LCD 始终保留黑底呼吸画面。
-  if (s_initialCacheScreen) {
-    pushToDisplay = false;
-  }
-  s_busyCompose = true;
-  composeClearAbort();
-  s_bakeZoom = zoom;
-  s_bakeLocal = 0.0f;
-
-  if (pushToDisplay && s_displayedZoom < 0) {
-    char line2[20];
-    snprintf(line2, sizeof(line2), "zoom %d", zoom);
-    s_statusScreen = true;
-    showStatus("Fetching...", line2);
-    refreshProgressRing();
-  } else if (pushToDisplay) {
-    Serial.printf("rebuild z%d (keep display)\n", zoom);
-  } else {
-    Serial.printf("prefetch bake z%d (no display)\n", zoom);
-  }
+  Serial.printf("background bake z%d (display isolated)\n", zoom);
 
   const ComposeResult result =
-      composeRadarFrame(&lcd, s_cfg.lat, s_cfg.lon, zoom, pushToDisplay);
-  s_busyCompose = false;
-  s_bakeZoom = -1;
-  s_bakeLocal = 0.0f;
+      composeRadarFrame(&lcd, s_cfg.lat, s_cfg.lon, zoom, false);
 
   if (result == ComposeResult::Failed) {
     if (composeAbortRequested()) {
@@ -812,8 +826,6 @@ static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
     if (wasFresh && frameCacheHas(zoom)) {
       frameCacheMarkFresh(zoom, true);
     }
-    s_statusScreen = s_initialCacheScreen;
-    refreshProgressRing();
     return ComposeResult::Failed;
   }
 
@@ -821,33 +833,68 @@ static ComposeResult buildAndCache(int zoom, bool pushToDisplay) {
     frameCacheMarkFresh(zoom, true);
     noteZoomRefreshed(zoom);
     Serial.printf("build z%d unchanged; mark fresh without blit\n", zoom);
-    refreshProgressRing();
     return ComposeResult::Unchanged;
   }
 
-  // display-only（无雷达 commit）不算造片成功，避免刷新时钟被空转推进
+  // 无雷达 commit 不算造片成功，避免刷新时钟被空转推进。
   if (!frameCacheHas(zoom)) {
-    Serial.printf("build z%d not cached (display-only)\n", zoom);
+    Serial.printf("build z%d not cached\n", zoom);
     frameCacheRestoreStale(zoom);
     if (wasFresh && frameCacheHas(zoom)) {
       frameCacheMarkFresh(zoom, true);
     }
-    if (pushToDisplay && frameCacheHas(zoom)) {
-      s_displayedZoom = zoom;
-      s_statusScreen = false;
-      showCached(zoom);
-    }
-    refreshProgressRing();
     return ComposeResult::Failed;
   }
 
   noteZoomRefreshed(zoom);
-
-  if (pushToDisplay) {
-    // s_displayedZoom / statusScreen / 预警环已由 onComposeDisplay 回调同步
-  }
-  refreshProgressRing();
   return ComposeResult::Updated;
+}
+
+static void radarWorkerMain(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    const int zoom = s_radarWorkZoom;
+    const ComposeResult result = buildAndCacheBackground(zoom);
+    s_radarWorkResult = result;
+    s_busyCompose = false;
+    s_radarWorkDone = true;
+  }
+}
+
+static bool startRadarWorker() {
+  if (s_radarWorkerTask) {
+    return true;
+  }
+  const BaseType_t created =
+      xTaskCreate(radarWorkerMain, "radar-bake", 7168, nullptr,
+                  tskIDLE_PRIORITY, &s_radarWorkerTask);
+  if (created != pdPASS) {
+    s_radarWorkerTask = nullptr;
+    Serial.println("radar worker alloc fail; background refresh disabled");
+    return false;
+  }
+  Serial.println("radar worker ready: priority=idle stack=7168");
+  return true;
+}
+
+static bool startRadarWork(int zoom, RadarWorkKind kind) {
+  if (!s_radarWorkerTask || s_radarWorkActive || !zoomCanCompose(zoom) ||
+      WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  composeClearAbort();
+  s_bakeZoom = zoom;
+  s_bakeLocal = 0.0f;
+  s_radarWorkZoom = zoom;
+  s_radarWorkKind = kind;
+  s_radarWorkResult = ComposeResult::Failed;
+  s_radarUiPreempted = false;
+  s_radarWorkDone = false;
+  s_busyCompose = true;
+  s_radarWorkActive = true;
+  xTaskNotifyGive(s_radarWorkerTask);
+  Serial.printf("radar work start kind=%u z%d\n", (unsigned)kind, zoom);
+  return true;
 }
 
 static void pumpBackgroundPrefetch() {
@@ -867,7 +914,7 @@ static void pumpBackgroundPrefetch() {
   if (!bootstrap && (refreshIsDue() || refreshApproaching())) {
     return;
   }
-  if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
+  if (s_radarWorkActive || WiFi.status() != WL_CONNECTED) {
     return;
   }
   if (s_cfg.show_wind_particles && !bootstrap &&
@@ -883,17 +930,11 @@ static void pumpBackgroundPrefetch() {
     return;
   }
 
-  const bool attempted = pumpPrefetch();
-  finishInitialCacheScreenIfReady();
-  if (bootstrap && !s_initialCacheScreen) {
+  if (pumpPrefetch()) {
     return;
   }
-  if (attempted && s_cfg.show_wind_particles && !bootstrap) {
-    s_windBackgroundComposeAt = millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
-    Serial.printf("wind static cooldown %lus; interaction remains primary\n",
-                  (unsigned long)(WIND_BACKGROUND_COMPOSE_GAP_MS / 1000UL));
-  }
-  if (s_busyCompose) {
+  finishInitialCacheScreenIfReady();
+  if (bootstrap && !s_initialCacheScreen) {
     return;
   }
 
@@ -912,7 +953,8 @@ static void pumpBackgroundPrefetch() {
 static void ensureZoomVisible(int zoom, bool userInitiated) {
   if (userInitiated) {
     noteUserInteraction();
-    if (s_busyCompose) {
+    if (s_radarWorkActive) {
+      s_radarUiPreempted = true;
       composeRequestAbort();
     }
     zoomPrefetchClear();
@@ -942,37 +984,16 @@ static void ensureZoomVisible(int zoom, bool userInitiated) {
     return;
   }
 
-  // 没有该档缓存且当前离线：保持屏上旧档并立即恢复逻辑档。不能在这里
-  // 进入同步 compose，否则一次短按会依次等待所有瓦片的网络超时。
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("z%d unavailable offline — keep display z%d\n", zoom,
-                  s_displayedZoom);
-    if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
-      zoomSetCurrent(s_displayedZoom);
-    }
-    return;
+  // S 键只切已有缓存，永远不在交互路径启动网络任务。缺失档标为待补，
+  // 恢复屏上逻辑档；后台调度器会在交互保护期结束后再尝试生成。
+  frameCacheMarkFresh(zoom, false);
+  Serial.printf("z%d unavailable (%s) — keep display z%d and defer bake\n",
+                zoom, WiFi.status() == WL_CONNECTED ? "online" : "offline",
+                s_displayedZoom);
+  if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
+    zoomSetCurrent(s_displayedZoom);
   }
-
-  if (userInitiated && s_busyCompose) {
-    composeRequestAbort();
-  }
-  if (!userInitiated) {
-    zoomPrefetchClear();
-  }
-
-  if (buildAndCache(zoom, true) == ComposeResult::Failed) {
-    if (!zoomHasPending() && s_displayedZoom < 0) {
-      showStatus("Compose fail", "see serial");
-    }
-    if (s_displayedZoom >= ZOOM_MIN && s_displayedZoom <= ZOOM_MAX) {
-      Serial.printf("compose fail z%d — resync to display z%d\n", zoom,
-                    s_displayedZoom);
-      zoomSetCurrent(s_displayedZoom);
-    }
-    zoomPrefetchResetAround(zoomCurrent());
-    return;
-  }
-  zoomPrefetchResetAround(zoom);
+  zoomPrefetchResetAround(zoomCurrent());
 }
 
 static void handlePendingZoom() {
@@ -1016,7 +1037,7 @@ static bool pumpPrefetch() {
     handlePendingZoom();
     return false;
   }
-  if (s_busyCompose || WiFi.status() != WL_CONNECTED) {
+  if (s_radarWorkActive || WiFi.status() != WL_CONNECTED) {
     return false;
   }
   int z = 0;
@@ -1026,13 +1047,105 @@ static bool pumpPrefetch() {
   if (frameCacheIsFresh(z)) {
     return false;
   }
-  if (buildAndCache(z, false) != ComposeResult::Failed) {
-    zoomPrefetchNoteOk(z);
-  } else if (!composeAbortRequested()) {
-    zoomPrefetchNoteFail(z);
+  return startRadarWork(z, RadarWorkKind::Prefetch);
+}
+
+static void serviceRadarWorkCompletion() {
+  if (!s_radarWorkActive || !s_radarWorkDone) {
+    return;
   }
+
+  const int zoom = s_radarWorkZoom;
+  const RadarWorkKind kind = s_radarWorkKind;
+  const ComposeResult result = s_radarWorkResult;
+  s_radarWorkDone = false;
+  s_radarWorkActive = false;
+  s_radarWorkKind = RadarWorkKind::None;
+  s_radarWorkZoom = -1;
+  s_bakeZoom = -1;
+  s_bakeLocal = 0.0f;
+
+  const bool aborted = composeAbortRequested();
+  const bool uiInterrupted =
+      s_radarUiPreempted || buttonIsDown() || buttonPriorityRequested() ||
+      zoomHasPending() ||
+      (kind == RadarWorkKind::Scheduled &&
+       (zoomCurrent() != zoom ||
+        (s_displayedZoom >= ZOOM_MIN && s_displayedZoom != zoom)));
+  s_radarUiPreempted = false;
+
+  if (kind == RadarWorkKind::Prefetch) {
+    if (result != ComposeResult::Failed) {
+      zoomPrefetchNoteOk(zoom);
+    } else if (!aborted) {
+      zoomPrefetchNoteFail(zoom);
+    }
+
+    if (uiInterrupted && !s_initialCacheScreen) {
+      noteUserInteraction();
+      Serial.printf("background prefetch z%d preempted by UI\n", zoom);
+    } else if (s_cfg.show_wind_particles && !s_initialCacheScreen) {
+      s_windBackgroundComposeAt = millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
+      Serial.printf("wind static cooldown %lus; interaction remains primary\n",
+                    (unsigned long)(WIND_BACKGROUND_COMPOSE_GAP_MS / 1000UL));
+    }
+
+    if (frameCacheCountFresh() >= frameCacheZoomSlots()) {
+      s_staticFullPassDone = true;
+    }
+    finishInitialCacheScreenIfReady();
+    refreshProgressRing();
+    if (!s_initialCacheScreen && uiInterrupted) {
+      zoomPrefetchClear();
+    } else if (result == ComposeResult::Failed) {
+      zoomPrefetchResetAround(zoomCurrent());
+    }
+  } else if (kind == RadarWorkKind::Scheduled) {
+    separateNextHeavyWork();
+    if (result != ComposeResult::Failed) {
+      s_lastRefresh = millis();
+      s_refreshFailAt = 0;
+      uint32_t radarTime = 0;
+      frameCacheReadRadarTime(zoom, &radarTime);
+      if (result == ComposeResult::Updated && zoomCurrent() == zoom &&
+          s_displayedZoom == zoom) {
+        showCached(zoom);
+      }
+      if (s_cfg.show_wind_particles) {
+        s_windBackgroundComposeAt =
+            millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
+        s_staticFullPassDone =
+            frameCacheCountFresh() >= frameCacheZoomSlots();
+      } else {
+        s_staticFullPassDone = false;
+        frameCacheMarkAllStaleExcept(zoom);
+      }
+      refreshProgressRing();
+      Serial.printf("refresh ok z%d radar_t=%lu mode=%s fresh=%d/%d free=%u\n",
+                    zoom, (unsigned long)radarTime,
+                    s_cfg.show_wind_particles ? "wind-tiered" : "full-pass",
+                    frameCacheCountFresh(), frameCacheZoomSlots(),
+                    (unsigned)fsFreeBytes());
+      zoomPrefetchResetAround(zoomCurrent());
+    } else if (uiInterrupted) {
+      // 所有模式都把 S 抢占视为正常调度，不断 Wi-Fi、不进入失败重试。
+      s_refreshFailAt = 0;
+      zoomPrefetchClear();
+      noteUserInteraction();
+      Serial.printf("scheduled refresh z%d preempted by UI; keep WiFi/cache\n",
+                    zoom);
+      zoomPrefetchResetAround(zoomCurrent());
+    } else {
+      s_refreshFailAt = nonzeroMillis();
+      zoomPrefetchClear();
+      Serial.printf("refresh fail, retry in %lus free=%u\n",
+                    (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL),
+                    (unsigned)fsFreeBytes());
+      forceWifiReconnectAfterFetchFail("scheduled refresh failure");
+    }
+  }
+
   handlePendingZoom();
-  return true;
 }
 
 static bool tryWifiAndRadar() {
@@ -1040,14 +1153,19 @@ static bool tryWifiAndRadar() {
                 (unsigned)s_cfg.wifi_mode, s_cfg.ssid, s_cfg.lat, s_cfg.lon,
                 s_cfg.default_zoom);
   const bool recoveringInitialCache = s_initialCacheScreen;
-  if (!recoveringInitialCache) {
+  const bool hasVisibleCacheNow =
+      !s_statusScreen && s_displayedZoom >= ZOOM_MIN &&
+      s_displayedZoom <= ZOOM_MAX && frameCacheHas(s_displayedZoom);
+  if (!recoveringInitialCache && !hasVisibleCacheNow) {
     showStatus("Connecting...", s_cfg.ssid);
   }
   s_wifiOk = wifiConnect(&s_cfg);
   if (!s_wifiOk) {
     if (recoveringInitialCache) {
       initialCacheScreenTick(true);
-    } else {
+    } else if (!(s_displayedZoom >= ZOOM_MIN &&
+                 s_displayedZoom <= ZOOM_MAX &&
+                 frameCacheHas(s_displayedZoom) && !s_statusScreen)) {
       showStatus("WiFi fail", s_cfg.ssid);
     }
     scheduleWifiRetry();
@@ -1057,7 +1175,10 @@ static bool tryWifiAndRadar() {
   s_wifiRetryAt = 0;
   s_wifiRetryStage = 0;
 
-  if (!recoveringInitialCache) {
+  const bool visibleAfterConnect =
+      !s_statusScreen && s_displayedZoom >= ZOOM_MIN &&
+      s_displayedZoom <= ZOOM_MAX && frameCacheHas(s_displayedZoom);
+  if (!recoveringInitialCache && !visibleAfterConnect) {
     char ipBuf[24];
     snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
     showStatus("WiFi OK", ipBuf);
@@ -1133,6 +1254,10 @@ static void runPortalAndApply() {
 
 void setup() {
   Serial.begin(115200);
+  // USB CDC 主机存在但没有程序持续读取时，Arduino-ESP32 默认一次写入
+  // 最多等待约 20 x 100ms。状态/风场日志因此可能周期性冻结 UI 数秒。
+  // 日志只用于诊断：发送队列满就丢弃，绝不能反向阻塞 S 键和屏幕。
+  Serial.setTxTimeoutMs(0);
   delay(400);
   Serial.println();
   Serial.println("ESP32-C3 Radar SoftAP config + RGB565 zoom");
@@ -1142,6 +1267,7 @@ void setup() {
   lcd.setBrightness(255);
 
   buttonBegin();
+  inputBindUiTaskToCurrent();
   zoomSetDefault(MAP_ZOOM);
   zoomSetCurrent(MAP_ZOOM);
   zoomSetPendingFeedback(onPendingZoomFeedback);
@@ -1154,6 +1280,7 @@ void setup() {
   if (!frameCacheBegin()) {
     showStatus("FS fail", "no cache");
   }
+  startRadarWorker();
   seedZoomRefreshTimesFromCache();
   windFieldBegin();
   windParticlesBegin();
@@ -1167,24 +1294,28 @@ void loop() {
   initialCacheScreenTick(false);
   const ButtonEvent ev = buttonPoll();
   if (!s_initialCacheScreen && ev == ButtonEvent::ShortPress) {
-    if (s_wifiOk) {
-      handleShortPress();
-    }
+    handleShortPress();
   } else if (!s_initialCacheScreen && ev == ButtonEvent::LongPress) {
-    if (s_wifiOk) {
-      handleLongPress();
-    }
+    handleLongPress();
   }
+
+  serviceRadarWorkCompletion();
+  serviceRadarWorkUi();
 
   // 阻塞路径为抢占而锁存的 abort 只服务当前任务；任务已经回到主循环、
   // pending 也已消费后立即释放，不能误伤后续风场 HTTP 请求。
-  if (!s_busyCompose && !zoomHasPending() && !buttonIsDown()) {
+  if (!s_radarWorkActive && !zoomHasPending() && !buttonIsDown()) {
     composeClearAbort();
   }
 
   updateLongPressCue();
 
   if (!s_wifiOk) {
+    if (s_radarWorkActive) {
+      composeRequestAbort();
+      delay(10);
+      return;
+    }
     if (s_wifiRetryAt != 0 &&
         (int32_t)(millis() - s_wifiRetryAt) >= 0) {
       Serial.println("WiFi background retry starting");
@@ -1200,6 +1331,9 @@ void loop() {
     s_wifiOk = false;
     s_wifiRetryStage = 0;
     s_wifiRetryAt = nonzeroMillis();
+    if (s_radarWorkActive) {
+      composeRequestAbort();
+    }
     delay(50);
     return;
   }
@@ -1212,12 +1346,11 @@ void loop() {
   }
 
   const bool due = refreshIsDue();
-  // 首次全档未完成时，两种模式都禁止定时刷新抢占补档；全档完成后，
-  // 风场模式再额外遵守用户交互保护，普通模式维持原刷新时序。
+  // 首次全档未完成时禁止定时刷新抢占补档；其余时候所有模式都遵守
+  // 用户交互保护，避免松手后的同一轮马上启动后台重活。
   const bool deferScheduledRefresh =
-      initialCacheBootstrapActive() ||
-      (s_cfg.show_wind_particles && cachePaused());
-  if (!s_busyCompose && !windWorked && !heavyWorkCooling() && due &&
+      initialCacheBootstrapActive() || cachePaused();
+  if (!s_radarWorkActive && !windWorked && !heavyWorkCooling() && due &&
       !deferScheduledRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
@@ -1228,76 +1361,19 @@ void loop() {
       // 先刷新当前档；成功后再按当前模式决定哪些邻档进入后台队列。
       rainviewerInvalidatePin();
       frameCacheSetProtectedZoom(s_displayedZoom >= 0 ? s_displayedZoom : z);
-      // 风场模式后台提交，不在合成分段中碰屏；普通模式保留原路径。
-      const bool composeToDisplay = !s_cfg.show_wind_particles;
-      const ComposeResult result = buildAndCache(z, composeToDisplay);
-      separateNextHeavyWork();
-      if (result != ComposeResult::Failed) {
-        s_lastRefresh = millis();
-        s_refreshFailAt = 0;
-        uint32_t t = 0;
-        frameCacheReadRadarTime(z, &t);
-        if (result == ComposeResult::Updated &&
-            (!s_cfg.show_wind_particles ||
-             (zoomCurrent() == z && s_displayedZoom == z))) {
-          showCached(z);
-        }
-        if (s_cfg.show_wind_particles) {
-          s_windBackgroundComposeAt =
-              millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
-          // 风场模式：其余档由 15/45 分钟分级计时器负责，旧帧保持 ready。
-          s_staticFullPassDone =
-              frameCacheCountFresh() >= frameCacheZoomSlots();
-        } else {
-          // 原模式：当前档成功后，其余全部进入同一轮更新。
-          s_staticFullPassDone = false;
-          frameCacheMarkAllStaleExcept(z);
-        }
-        refreshProgressRing();
-        Serial.printf("refresh ok z%d radar_t=%lu mode=%s fresh=%d/%d "
-                      "free=%u — prefetch others\n",
-                      z, (unsigned long)t,
-                      s_cfg.show_wind_particles ? "wind-tiered" : "full-pass",
-                      frameCacheCountFresh(), frameCacheZoomSlots(),
-                      (unsigned)fsFreeBytes());
-        handlePendingZoom();
-        zoomPrefetchResetAround(zoomCurrent());
-      } else {
-        const bool userInterrupted =
-            s_cfg.show_wind_particles &&
-            (composeAbortRequested() || zoomCurrent() != z ||
-             (s_displayedZoom >= ZOOM_MIN && s_displayedZoom != z));
-        if (userInterrupted) {
-          // 切档中止刷新不是网络故障：保留连接与旧缓存，并重新给用户完整的
-          // 静默窗口。否则会误触发断网重连，再立刻刷新下一档，形成卡顿循环。
-          s_refreshFailAt = 0;
-          zoomPrefetchClear();
-          noteUserInteraction();
-          Serial.printf(
-              "scheduled refresh z%d interrupted by zoom switch; keep WiFi and cache\n",
-              z);
-          handlePendingZoom();
-          zoomPrefetchResetAround(zoomCurrent());
-          return;
-        }
-        s_refreshFailAt = millis() == 0 ? 1 : millis();
-        zoomPrefetchClear();
-        Serial.printf("refresh fail, retry in %lus free=%u\n",
-                      (unsigned long)(RADAR_REFRESH_RETRY_MS / 1000UL),
-                      (unsigned)fsFreeBytes());
-        forceWifiReconnectAfterFetchFail("scheduled refresh failure");
-        handlePendingZoom();
-      }
+      // 所有模式都只后台写缓存，绝不在刷新中触碰当前屏幕。
+      startRadarWork(z, RadarWorkKind::Scheduled);
     }
   }
 
-  if (!s_busyCompose && !frameCacheHas(zoomCurrent()) &&
+  if (!s_radarWorkActive && !frameCacheHas(zoomCurrent()) &&
       zoomCanCompose(zoomCurrent())) {
     static uint32_t lastUncachedRetry = 0;
     if (millis() - lastUncachedRetry >= 15000) {
       lastUncachedRetry = millis();
       Serial.printf("retry uncached z%d\n", zoomCurrent());
-      ensureZoomVisible(zoomCurrent(), true);
+      frameCacheMarkFresh(zoomCurrent(), false);
+      zoomPrefetchResetAround(zoomCurrent());
     }
   }
 
@@ -1310,7 +1386,7 @@ void loop() {
   }
 
   // 呼吸未结束时不启动阻塞式预取/补满（否则会冻住数秒再跳变）
-  if (!s_busyCompose && !alertBreathing) {
+  if (!s_radarWorkActive && !alertBreathing) {
     pumpBackgroundPrefetch();
   }
 

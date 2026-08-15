@@ -3,6 +3,8 @@
 #include "button.h"
 #include "config.h"
 #include "frame_cache.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 static int s_zoom = MAP_ZOOM;
 static int s_defaultZoom = MAP_ZOOM;
@@ -14,6 +16,7 @@ static volatile bool s_composeAbort = false;
 static int s_pendingZoom = -1;
 static ZoomPendingFeedbackFn s_pendingFeedback = nullptr;
 static BlockingUiServiceFn s_blockingUiService = nullptr;
+static TaskHandle_t s_inputUiTask = nullptr;
 static bool s_inputLocked = false;
 static int s_prefetchRadius = ZOOM_MAX - ZOOM_MIN;
 
@@ -189,6 +192,10 @@ void inputSetBlockingUiService(BlockingUiServiceFn fn) {
   s_blockingUiService = fn;
 }
 
+void inputBindUiTaskToCurrent() {
+  s_inputUiTask = xTaskGetCurrentTaskHandle();
+}
+
 void inputSetLocked(bool locked) {
   s_inputLocked = locked;
   if (locked) {
@@ -198,6 +205,12 @@ void inputSetLocked(bool locked) {
 }
 
 void inputServiceDuringBlock() {
+  // 雷达造片在低优先级任务中运行。它只能观察主任务设置的 abort，不能
+  // 自己消费 ButtonEvent 或调用 pendingFeedback 触碰 LCD。
+  if (s_inputUiTask && xTaskGetCurrentTaskHandle() != s_inputUiTask) {
+    taskYIELD();
+    return;
+  }
   const ButtonEvent ev = buttonPoll();
   if (s_inputLocked) {
     if (s_blockingUiService) {

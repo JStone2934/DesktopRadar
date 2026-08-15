@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "zoom_ctrl.h"
 
 #if __has_include("esp_eap_client.h")
 #include "esp_eap_client.h"
@@ -25,6 +26,20 @@ static volatile uint8_t s_lastDisconnectReason = 0;
 static volatile int8_t s_lastDisconnectRssi = 0;
 static volatile uint32_t s_disconnectSequence = 0;
 static bool s_eventRegistered = false;
+
+/** Wi-Fi 扫描、射频复位和认证等待期间仍由主任务消费 S 键。 */
+static void responsiveDelay(uint32_t durationMs) {
+  const uint32_t started = millis();
+  do {
+    inputServiceDuringBlock();
+    const uint32_t elapsed = millis() - started;
+    if (elapsed >= durationMs) {
+      break;
+    }
+    const uint32_t remaining = durationMs - elapsed;
+    delay(remaining > 10UL ? 10UL : remaining);
+  } while (true);
+}
 
 struct ApChoice {
   bool found;
@@ -403,7 +418,7 @@ void wifiDisconnectClean() {
   ensureWifiEvents();
   WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, true);
-  delay(100);
+  responsiveDelay(100);
   wifiDisableEnterprise();
   resetWifiEvents();
 }
@@ -416,7 +431,7 @@ static void stopStaRadioClean(const char* reason) {
     // 先终止仍在进行的连接，再清掉 PEAP supplicant 状态。Arduino 2.0.17
     // 的首次失败会暗中 WiFi.begin() 一次，因此只做轻量 disconnect 不够。
     esp_wifi_disconnect();
-    delay(150);
+    responsiveDelay(150);
     wifiDisableEnterprise();
   }
 
@@ -428,9 +443,9 @@ static void stopStaRadioClean(const char* reason) {
 
   const uint32_t started = millis();
   while (WiFi.getMode() != WIFI_MODE_NULL && millis() - started < 2000UL) {
-    delay(25);
+    responsiveDelay(25);
   }
-  delay(250);
+  responsiveDelay(250);
   resetWifiEvents();
   Serial.printf("WiFi radio clean stop (%s) mode=%u\n",
                 reason ? reason : "retry", (unsigned)WiFi.getMode());
@@ -456,7 +471,7 @@ static bool prepareStaRadio() {
       break;
     }
     Serial.printf("WiFi: STA mode retry %u\n", (unsigned)(i + 1));
-    delay(300);
+    responsiveDelay(300);
   }
   if (!staOk) {
     Serial.println("WiFi: failed to enter STA mode after retries");
@@ -473,7 +488,7 @@ static bool prepareStaRadio() {
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.setHostname("esp32-radar");
   logEspErr("esp_wifi_set_storage", esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  delay(100);
+  responsiveDelay(100);
   return true;
 }
 
@@ -522,7 +537,12 @@ static ApChoice scanBestAp(const char* ssid, AppWifiMode mode,
 
   Serial.printf("WiFi scan target: ssid=%s mode=%u skip=%u\n", ssid,
                 (unsigned)mode, (unsigned)skipUsable);
-  const int found = WiFi.scanNetworks(false, true);
+  int found = WiFi.scanNetworks(true, true);
+  while (found == WIFI_SCAN_RUNNING) {
+    inputServiceDuringBlock();
+    delay(10);
+    found = WiFi.scanComplete();
+  }
   Serial.printf("WiFi scan found %d networks\n", found);
   for (int i = 0; i < found; ++i) {
     if (WiFi.SSID(i) != ssid) {
@@ -636,6 +656,7 @@ static bool waitForIp(uint32_t timeoutMs, const char* label,
   uint32_t nextDot = 0;
 
   while (millis() - start <= timeoutMs) {
+    inputServiceDuringBlock();
     peapAirDrain(peapSummary);
     if (WiFi.status() == WL_CONNECTED && s_eventGotIp) {
       Serial.println();
@@ -664,7 +685,7 @@ static bool waitForIp(uint32_t timeoutMs, const char* label,
       Serial.print('.');
       nextDot = millis() + 500;
     }
-    delay(50);
+    responsiveDelay(50);
   }
 
   peapAirDrain(peapSummary);
@@ -703,7 +724,7 @@ static bool connectWithAttempts(const char* label, uint8_t attempts,
     // 轻量重试：保留 STA 驱动和 PEAP 凭据，只断开当前关联并清理事件。
     // 下一次 esp_wifi_connect() 会按 SSID 重新做全信道扫描和自动选 AP。
     WiFi.disconnect(false, false);
-    delay(retryBaseMs + attempt * retryBaseMs);
+    responsiveDelay(retryBaseMs + attempt * retryBaseMs);
     resetWifiEvents();
     Serial.printf("WiFi %s retry without radio re-init\n", label);
   }

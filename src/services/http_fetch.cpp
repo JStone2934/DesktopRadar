@@ -41,8 +41,10 @@ static int responsiveHttpGet(HTTPClient& http) {
       xTaskCreate(httpGetWorker, "http-get", 6144, &ctx,
                   tskIDLE_PRIORITY + 1, &worker);
   if (created != pdPASS) {
-    Serial.println("HTTP GET worker alloc fail; using direct request");
-    return http.GET();
+    // 直接 GET 会把唯一 UI 主任务锁死到网络超时。更新可以失败，缓存切换
+    // 不能失败；内存不足时快速放弃本次后台更新。
+    Serial.println("HTTP GET worker alloc fail; defer request for UI priority");
+    return HTTPC_ERROR_CONNECTION_REFUSED;
   }
   while (!ctx.done) {
     inputServiceDuringBlock();
