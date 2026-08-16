@@ -34,8 +34,15 @@ bool updateManagerExecuteConfirmed(LGFX* lcd, AppConfig* cfg);
 bool updateManagerConfirmFirstBoot(LGFX* lcd, bool filesystemReady,
                                    bool workerReady);
 
-/** Starts at most one low-priority manifest check when canStart is true. */
-void updateManagerServiceDailyCheck(bool canStart);
+/**
+ * Marks a check due after 24 hours and starts it when the foreground is safe.
+ * On each seventh day of a failure cycle, userIdle is no longer required;
+ * a failed forced attempt starts a new seven-day cycle. safeToStart still
+ * protects an active compose and physical button handling.
+ */
+void updateManagerServiceDailyCheck(bool safeToStart, bool userIdle);
+/** True while a persisted due check is waiting to run. */
+bool updateManagerCheckPending();
 bool updateManagerBusy();
 
 /** True if the failed update formatted LittleFS and cache state must reload. */

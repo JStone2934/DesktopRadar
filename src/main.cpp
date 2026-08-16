@@ -70,6 +70,7 @@ static volatile bool s_radarUiPreempted = false;
 static bool s_staticFullPassDone = false;
 // 用户交互后暂停所有后台雷达造片（缓存显示本身不受影响）
 static uint32_t s_cachePauseUntil = 0;
+static uint32_t s_lastUserInteractionAt = 0;
 // 连续缩放时不逐档读取风场缓存；静止片刻后只加载最终停留档。
 static uint32_t s_windSelectNotBefore = 0;
 // 风场模式后台静态造片的最早启动时刻；避免多个档位无缝连跑。
@@ -91,7 +92,7 @@ static bool refreshApproaching();
 static void updateLongPressCue();
 static void pumpWindAnimation(bool busy);
 static void pumpWindDuringBlock();
-static bool serviceWindField();
+static bool serviceWindField(bool allowNetwork = true);
 static uint32_t nonzeroMillis();
 static void initialCacheScreenTick(bool force = false);
 static void finishInitialCacheScreenIfReady();
@@ -133,6 +134,7 @@ static void scheduleWifiRetry() {
 
 static void noteUserInteraction() {
   const uint32_t now = millis();
+  s_lastUserInteractionAt = now == 0 ? 1 : now;
   const uint32_t pauseMs = s_cfg.show_wind_particles
                                ? WIND_CACHE_PAUSE_AFTER_USER_MS
                                : CACHE_PAUSE_AFTER_USER_MS;
@@ -684,7 +686,7 @@ static void pumpWindDuringBlock() {
   updateLongPressCue();
 }
 
-static bool serviceWindField() {
+static bool serviceWindField(bool allowNetwork) {
   if (s_initialCacheScreen || !s_cfg.show_wind_particles ||
       s_radarWorkActive ||
       s_displayedZoom < ZOOM_MIN || s_displayedZoom > ZOOM_MAX) {
@@ -703,6 +705,9 @@ static bool serviceWindField() {
   // 装入最终档磁盘旧场后即可恢复粒子；静默期只拦截后面的 HTTPS 更新。
   // 当前档完全没有风场时绕过 60 秒静默期。
   windFieldSelect(s_cfg.lat, s_cfg.lon, s_displayedZoom);
+  if (!allowNetwork) {
+    return false;
+  }
   if (heavyWorkCooling()) {
     return false;
   }
@@ -929,6 +934,9 @@ static bool startRadarWork(int zoom, RadarWorkKind kind) {
 }
 
 static void pumpBackgroundPrefetch() {
+  if (updateManagerCheckPending()) {
+    return;
+  }
   if (zoomHasPending()) {
     handlePendingZoom();
     return;
@@ -1509,21 +1517,24 @@ void loop() {
     return;
   }
 
-  const bool updateCheckMayStart =
-      !s_radarWorkActive && !initialCacheBootstrapActive() &&
-      frameCacheCountReady() >= frameCacheZoomSlots() && !cachePaused() &&
-      !heavyWorkCooling() && !buttonIsDown() && !zoomHasPending();
-  updateManagerServiceDailyCheck(updateCheckMayStart);
+  const uint32_t updateIdleAge =
+      s_lastUserInteractionAt == 0 ? millis()
+                                   : millis() - s_lastUserInteractionAt;
+  const bool updateCheckSafeToStart =
+      !s_radarWorkActive && !buttonIsDown() && !zoomHasPending();
+  const bool updateUserIdle = updateIdleAge >= 10000UL;
+  updateManagerServiceDailyCheck(updateCheckSafeToStart, updateUserIdle);
   if (updateManagerBusy()) {
     pumpWindAnimation(false);
     delay(10);
     return;
   }
+  const bool updateCheckPending = updateManagerCheckPending();
 
   // 风场首拉优先于邻档预取；已有旧场时请求期间动画继续播放。
-  const bool windWorked = serviceWindField();
+  const bool windWorked = serviceWindField(!updateCheckPending);
   pumpWindAnimation(false);
-  if (!windWorked) {
+  if (!windWorked && !updateCheckPending) {
     scheduleWindStaticRefreshes();
   }
 
@@ -1532,8 +1543,8 @@ void loop() {
   // 用户交互保护，避免松手后的同一轮马上启动后台重活。
   const bool deferScheduledRefresh =
       initialCacheBootstrapActive() || cachePaused();
-  if (!s_radarWorkActive && !windWorked && !heavyWorkCooling() && due &&
-      !deferScheduledRefresh) {
+  if (!updateCheckPending && !s_radarWorkActive && !windWorked &&
+      !heavyWorkCooling() && due && !deferScheduledRefresh) {
     const int z = zoomCurrent();
     if (zoomCanCompose(z)) {
       Serial.printf("scheduled refresh focus z%d (%s) free=%u\n", z,

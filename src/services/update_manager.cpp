@@ -29,6 +29,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 namespace {
 
 constexpr uint64_t kDaySeconds = 24ULL * 60ULL * 60ULL;
+constexpr uint64_t kForceAfterSeconds = 7ULL * kDaySeconds;
 constexpr time_t kValidEpoch = 1700000000;
 constexpr size_t kManifestHttpMax = 4096;
 constexpr uint32_t kFactoryOffset = 0x10000;
@@ -45,7 +46,12 @@ bool s_timeStarted = false;
 bool s_filesystemReset = false;
 bool s_exclusive = false;
 uint32_t s_nonce = 0;
-uint32_t s_dailyIdleSince = 0;
+uint64_t s_dailyDueAt = 0;
+bool s_dailyForced = false;
+volatile bool s_dailyAttemptForced = false;
+
+constexpr const char* kCheckDueKey = "check_due";
+constexpr const char* kFailureSinceKey = "failure_since";
 
 struct ManifestRecordBuffer {
   UpdateManifestRecord* value;
@@ -538,7 +544,10 @@ bool executeUpdate(LGFX* lcd, AppConfig* cfg, UpdateJournal* journal) {
 void dailyCheckTask(void*) {
   ManifestRecordBuffer record;
   UpdateError result = UpdateError::None;
-  if (!record.value || !fetchManifest(record.value, &result)) {
+  if (!record.value) {
+    result = UpdateError::ManifestHttp;
+    updateStoreSetLastError(result);
+  } else if (!fetchManifest(record.value, &result)) {
     updateStoreSetLastError(result);
   } else if (!updateStoreSaveManifest(record.value)) {
     result = UpdateError::StoreCorrupt;
@@ -546,6 +555,23 @@ void dailyCheckTask(void*) {
   } else {
     updateStoreSetTime("last_success", record.value->checkedAt);
     updateStoreSetLastError(UpdateError::None);
+  }
+  const time_t finished = time(nullptr);
+  if (finished >= kValidEpoch) {
+    const uint64_t finishedAt = static_cast<uint64_t>(finished);
+    updateStoreSetTime("last_attempt", finishedAt);
+    if (result == UpdateError::None) {
+      updateStoreSetTime(kFailureSinceKey, 0);
+    } else {
+      uint64_t failureSince = 0;
+      // 第 7 天的高优先级尝试仍失败时，从今天重新开始一个七天周期：
+      // 接下来六天恢复普通的“空闲 10 秒后检查”，第七天再高优先级。
+      if (s_dailyAttemptForced ||
+          !updateStoreGetTime(kFailureSinceKey, &failureSince) ||
+          failureSince == 0) {
+        updateStoreSetTime(kFailureSinceKey, finishedAt);
+      }
+    }
   }
   s_dailyResult = result;
   s_dailyDone = true;
@@ -576,6 +602,9 @@ bool filesystemProbe() {
 
 void updateManagerBegin() {
   updateStoreBegin();
+  if (!updateStoreGetTime(kCheckDueKey, &s_dailyDueAt)) {
+    s_dailyDueAt = 0;
+  }
   s_nonce = esp_random();
   if (s_nonce == 0) s_nonce = 1;
 }
@@ -733,42 +762,67 @@ bool updateManagerConfirmFirstBoot(LGFX* lcd, bool filesystemReady,
   return true;
 }
 
-void updateManagerServiceDailyCheck(bool canStart) {
+void updateManagerServiceDailyCheck(bool safeToStart, bool userIdle) {
   if (s_dailyDone) {
     Serial.printf("daily update check: %s\n",
                   updateErrorName(static_cast<UpdateError>(s_dailyResult)));
     s_dailyDone = false;
     s_dailyActive = false;
-  }
-  if (!canStart || WiFi.status() != WL_CONNECTED) {
-    s_dailyIdleSince = 0;
-    return;
+    s_dailyAttemptForced = false;
+    s_dailyDueAt = 0;
+    s_dailyForced = false;
+    updateStoreSetTime(kCheckDueKey, 0);
   }
   if (s_dailyActive) return;
-  if (s_dailyIdleSince == 0) {
-    s_dailyIdleSince = millis() == 0 ? 1 : millis();
-    return;
-  }
-  if (millis() - s_dailyIdleSince < 60000UL) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
   startTimeSync();
   const time_t now = time(nullptr);
   if (now < kValidEpoch) return;
+  const uint64_t now64 = static_cast<uint64_t>(now);
+
   uint64_t lastAttempt = 0;
-  if (updateStoreGetTime("last_attempt", &lastAttempt) &&
-      static_cast<uint64_t>(now) < lastAttempt + kDaySeconds) {
-    return;
+  const bool haveLastAttempt =
+      updateStoreGetTime("last_attempt", &lastAttempt) && lastAttempt != 0;
+  if (s_dailyDueAt == 0 &&
+      (!haveLastAttempt || now64 >= lastAttempt + kDaySeconds)) {
+    s_dailyDueAt = now64;
+    updateStoreSetTime(kCheckDueKey, s_dailyDueAt);
+    Serial.printf("update check due last=%llu now=%llu\n",
+                  (unsigned long long)lastAttempt,
+                  (unsigned long long)now64);
   }
-  if (!updateStoreSetTime("last_attempt", static_cast<uint64_t>(now))) return;
-  s_dailyIdleSince = 0;
+  if (s_dailyDueAt == 0) return;
+
+  uint64_t failureSince = 0;
+  s_dailyForced =
+      updateStoreGetTime(kFailureSinceKey, &failureSince) &&
+      failureSince != 0 && now64 >= failureSince + kForceAfterSeconds;
+  if (!safeToStart || (!userIdle && !s_dailyForced)) return;
+
+  Serial.printf("update check start pending=%llus forced=%d\n",
+                (unsigned long long)(now64 - s_dailyDueAt),
+                (int)s_dailyForced);
+  s_dailyAttemptForced = s_dailyForced;
   s_dailyActive = true;
   s_dailyDone = false;
   TaskHandle_t task = nullptr;
   if (xTaskCreate(dailyCheckTask, "update-check", 12288, nullptr,
                   tskIDLE_PRIORITY, &task) != pdPASS) {
     s_dailyActive = false;
+    s_dailyAttemptForced = false;
     updateStoreSetLastError(UpdateError::ManifestHttp);
+    updateStoreSetTime("last_attempt", now64);
+    if (s_dailyForced || failureSince == 0) {
+      updateStoreSetTime(kFailureSinceKey, now64);
+    }
+    s_dailyDueAt = 0;
+    s_dailyForced = false;
+    updateStoreSetTime(kCheckDueKey, 0);
   }
 }
+
+bool updateManagerCheckPending() { return s_dailyDueAt != 0; }
 
 bool updateManagerBusy() { return s_exclusive || s_dailyActive; }
 
