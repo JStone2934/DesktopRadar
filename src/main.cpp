@@ -1080,6 +1080,11 @@ static bool pumpPrefetch() {
     return false;
   }
   int z = 0;
+  const int repair = frameCacheTakeRepairZoom();
+  if (repair >= 0) {
+    Serial.printf("priority cache repair z%d\n", repair);
+    return startRadarWork(repair, RadarWorkKind::Prefetch);
+  }
   if (!zoomPrefetchPop(&z)) {
     return false;
   }

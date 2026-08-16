@@ -487,11 +487,12 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   if (composeAbortRequested()) {
     return ComposeResult::Failed;
   }
-  // 只检查逐瓦片解码所需工作区；绝不为刷新删除其它档的已完成缓存。
-  // 空间不足时本次刷新失败，旧图仍可秒切。
+  // 三个临时帧带 + 单张压缩瓦片 + 单张 radar raw/alpha，并保留
+  // LittleFS 元数据余量。逐瓦片删除 PNG 后才改写帧带，因此 PNG 峰值与
+  // 帧带写时复制峰值不会叠加；任何时候都不删除其它档的正式缓存。
   constexpr size_t kBakeWorkspaceBytes =
-      FRAME_RGB565_BYTES + (size_t)TILE_SIZE * TILE_SIZE * 3U +
-      HTTP_MAX_TILE_BYTES;
+      FRAME_RGB565_BYTES + HTTP_MAX_TILE_BYTES +
+      (size_t)TILE_SIZE * TILE_SIZE * 3U + 48U * 1024U;
   if (!frameCacheEnsureBakeSpace(kBakeWorkspaceBytes, zoom)) {
     Serial.printf("compose z%d deferred: keep completed zoom caches\n", zoom);
     return ComposeResult::Failed;
@@ -502,15 +503,13 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
       (vp.tx1 - vp.tx0 + 1) * (vp.ty1 - vp.ty0 + 1);
   const int radarTiles =
       haveRadarMeta ? (rtx1 - rtx0 + 1) * (rty1 - rty0 + 1) : 0;
-  const int dlTotal = baseTiles + radarTiles;
-  int dlDone = 0;
-
+  const int workTotal = baseTiles + radarTiles;
+  int workDone = 0;
   auto afterTile = [&]() {
-    ++dlDone;
-    // 下载占该档进度的 ~75%
+    ++workDone;
     const float frac =
-        dlTotal > 0 ? (float)dlDone / (float)dlTotal : 1.0f;
-    reportComposeProgress(zoom, 0.06f + 0.69f * frac);
+        workTotal > 0 ? (float)workDone / (float)workTotal : 1.0f;
+    reportComposeProgress(zoom, 0.06f + 0.87f * frac);
   };
 
   auto fetchBasemapOnce = [&](int tx, int ty) -> bool {
@@ -519,88 +518,26 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
                          AMAP_REFERER, 800, "basemap");
   };
 
-  int baseOk = 0;
-  int radarOk = 0;
-
-  for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
-    for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
-      if (composeAbortRequested()) {
-        return ComposeResult::Failed;
-      }
-      bool ok = fetchBasemapOnce(tx, ty);
-      if (!ok && WiFi.status() == WL_CONNECTED) {
-        // 单瓦失败再试一次（网络/Flash 抖动）
-        Serial.printf("  retry basemap z=%d x=%d y=%d\n", zoom, tx, ty);
-        ok = fetchBasemapOnce(tx, ty);
-      }
-      if (ok) {
-        ++baseOk;
-      } else {
-        Serial.printf("  basemap FAIL z=%d x=%d y=%d\n", zoom, tx, ty);
-        if (WiFi.status() != WL_CONNECTED) {
-          Serial.println("  basemap pass stopped: WiFi offline");
-          return ComposeResult::Failed;
-        }
-      }
-      afterTile();
-    }
-  }
-  Serial.printf("Basemap dl ok=%d/%d\n", baseOk, baseTiles);
-
-  // 底图必须齐全：缺 1 张就会在圆屏上留下约 1/4 近黑块，且会进缓存
-  if (baseOk < baseTiles) {
-    Serial.printf("basemap incomplete %d/%d, skip commit\n", baseOk, baseTiles);
-    return ComposeResult::Failed;
-  }
-
-  if (haveRadarMeta && !composeAbortRequested()) {
-    for (int ty = rty0; ty <= rty1; ++ty) {
-      for (int tx = rtx0; tx <= rtx1; ++tx) {
-        if (composeAbortRequested()) {
-          return ComposeResult::Failed;
-        }
-        Serial.printf("  dl radar oz=%d x=%d y=%d\n", overlayZoom, tx, ty);
-        if (fetchTileToFs(zoom, true, tx, ty,
-                          rainviewerTileUrl(meta, overlayZoom, tx, ty), nullptr,
-                          200, "radar")) {
-          ++radarOk;
-        }
-        afterTile();
-      }
-    }
-  }
-  Serial.printf("Radar dl ok=%d/%d\n", radarOk, radarTiles);
-
-  // 元数据成功但瓦片全失败：勿写入「无雷达」成品，否则秒切会一直缺雷达
-  if (haveRadarMeta && radarOk == 0) {
-    Serial.println("radar tiles missing, skip commit");
-    return ComposeResult::Failed;
-  }
-  // 元数据失败：允许仅底图上屏但不 commit（由调用方/预取重试）
-  const bool allowCommit = haveRadarMeta && radarOk > 0;
-  if (!haveRadarMeta) {
-    Serial.println("RainViewer meta unavailable; bake display-only if needed");
-  }
-
-  if (composeAbortRequested()) {
-    return ComposeResult::Failed;
-  }
-
-  frameCacheWriteMeta(zoom, vp, radarOk > 0, overlayZoom, scale, rtx0, rty0, rtx1,
-                      rty1);
-
-  reportComposeProgress(zoom, 0.78f);
-  logHeap("before-bake");
-
   char pngPath[48];
   char rawPath[48];
   char alphaPathBuf[48];
 
-  // 每个屏幕分段只解码当前要贴的一张瓦片，贴完立即删除 raw/alpha。
-  // PNG 留到最后一个分段才删除。这样 Flash 中最多只有一张展开瓦片，
-  // 不会因同时保留 8 份 raw/alpha 耗尽空间，也无需牺牲其它档成品。
-  auto decodeOne = [&](bool isRadar, int tx, int ty, bool withAlpha,
-                       bool cleanupPng) -> bool {
+  auto cleanupTile = [&](bool isRadar, int tx, int ty, bool withAlpha) {
+    frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
+    LittleFS.remove(pngPath);
+    snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
+             isRadar ? 'r' : 'b', tx, ty);
+    LittleFS.remove(rawPath);
+    if (withAlpha) {
+      snprintf(alphaPathBuf, sizeof(alphaPathBuf), "/frames/z%02d/%c_%d_%d.a",
+               zoom, isRadar ? 'r' : 'b', tx, ty);
+      LittleFS.remove(alphaPathBuf);
+    }
+  };
+
+  // 解码成功后立刻删除 PNG，再申请帧带并改写 LittleFS，避免压缩图与
+  // 写时复制峰值重叠。
+  auto decodeOne = [&](bool isRadar, int tx, int ty, bool withAlpha) -> bool {
     frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
     if (!LittleFS.exists(pngPath)) {
       Serial.printf("  missing png %s\n", pngPath);
@@ -618,34 +555,16 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     if (!decodePngToRawFile(pngPath, rawPath, ap)) {
       return false;
     }
-    if (cleanupPng) {
-      LittleFS.remove(pngPath);
+    if (!LittleFS.remove(pngPath) && LittleFS.exists(pngPath)) {
+      Serial.printf("  png cleanup fail %s\n", pngPath);
+      return false;
     }
     return true;
   };
 
-  const int bakeTiles = baseTiles + radarOk;
-  // pngle 自身需要约 44KB 连续堆，不能与 38.4KB 帧带同时存在。
-  // 先把 .new 初始化为背景；之后每张 PNG 只解码一次，销毁解码器后
-  // 再申请帧带，从 .new 分段读改写。这样两个大对象严格分时复用堆，
-  // 也避免为了省内存而把同一 PNG 重复解码三次。
-  constexpr int kComposeBandRows = LCD_HEIGHT / 3;
-  const int composeBandCount =
-      (LCD_HEIGHT + kComposeBandRows - 1) / kComposeBandRows;
-  int bakeWorkDone = 0;
-  auto afterBakeStep = [&]() {
-    ++bakeWorkDone;
-    const float frac =
-        bakeTiles > 0 ? (float)bakeWorkDone / (float)bakeTiles : 1.0f;
-    reportComposeProgress(zoom, 0.78f + 0.20f * frac);
-  };
-
+  constexpr int kComposeBandRows = FRAME_COMPOSE_BAND_ROWS;
   const size_t composeBandBytes =
       (size_t)LCD_WIDTH * kComposeBandRows * sizeof(uint16_t);
-  if (!frameCacheBeginRgb565New(zoom)) {
-    Serial.println("beginRgb565New fail");
-    return ComposeResult::Failed;
-  }
 
   const uint16_t bg = backdropColor(lcd);
   uint16_t* frameBand = nullptr;
@@ -661,18 +580,27 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     return true;
   };
 
-  // 先建立完整背景文件。释放帧带后才允许创建 pngle。
+  struct BandGuard {
+    int zoom;
+    bool active;
+    ~BandGuard() {
+      if (active) frameCacheRemoveComposeBands(zoom);
+    }
+  } bandGuard{zoom, true};
+
+  // 三个独立小文件代替一个反复改写的大文件；每段写后立即读回比对。
   if (!allocFrameBand()) {
     return ComposeResult::Failed;
   }
-  for (int bandY = 0; bandY < LCD_HEIGHT; bandY += kComposeBandRows) {
-    const int bandRows = min(kComposeBandRows, (int)LCD_HEIGHT - bandY);
+  for (int band = 0; band < FRAME_COMPOSE_BAND_COUNT; ++band) {
+    const int bandY = band * kComposeBandRows;
+    const int bandRows = min(kComposeBandRows, LCD_HEIGHT - bandY);
     const size_t bandPixels = (size_t)LCD_WIDTH * bandRows;
     for (size_t i = 0; i < bandPixels; ++i) {
       frameBand[i] = bg;
     }
-    if (!frameCacheWriteRgb565Band(zoom, bandY, bandRows, frameBand)) {
-      Serial.printf("init rgb565 band fail y=%d rows=%d\n", bandY, bandRows);
+    if (!frameCacheWriteComposeBand(zoom, band, frameBand)) {
+      Serial.printf("init compose band fail b%d\n", band);
       free(frameBand);
       return ComposeResult::Failed;
     }
@@ -680,68 +608,46 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
   free(frameBand);
   frameBand = nullptr;
 
-  auto stampOne = [&](int bandY, int bandRows, bool isRadar,
-                      int tx, int ty, int sc, bool withAlpha,
-                      RadarCenterSample* centerOut) -> bool {
-    snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
-             isRadar ? 'r' : 'b', tx, ty);
-    if (!LittleFS.exists(rawPath)) {
+  RadarCenterSample centerSample;
+  radarCenterSampleReset(&centerSample);
+  memset(&s_radarColorGrid, 0, sizeof(s_radarColorGrid));
+
+  auto bakeOneTile = [&](bool isRadar, int tx, int ty, int sc,
+                         bool withAlpha, RadarCenterSample* centerOut) -> bool {
+    // 此时 frameBand 必须为空，确保 pngle 能取得最大的连续堆块。
+    if (frameBand || !decodeOne(isRadar, tx, ty, withAlpha)) {
+      cleanupTile(isRadar, tx, ty, withAlpha);
       return false;
     }
+    logHeap("after-png-decode");
+    if (!allocFrameBand()) {
+      cleanupTile(isRadar, tx, ty, withAlpha);
+      return false;
+    }
+
+    snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
+             isRadar ? 'r' : 'b', tx, ty);
     const char* ap = nullptr;
     if (withAlpha) {
       snprintf(alphaPathBuf, sizeof(alphaPathBuf), "/frames/z%02d/%c_%d_%d.a",
                zoom, isRadar ? 'r' : 'b', tx, ty);
       ap = alphaPathBuf;
     }
-    const int ox =
-        (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
-    const int oy =
-        (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
-    return frameCacheStampRawToBand(
-        frameBand, bandY, bandRows, rawPath, ap, ox, oy, sc, withAlpha,
-        centerOut, withAlpha ? &s_radarColorGrid : nullptr);
-  };
-
-  RadarCenterSample centerSample;
-  radarCenterSampleReset(&centerSample);
-  memset(&s_radarColorGrid, 0, sizeof(s_radarColorGrid));
-
-  auto cleanupDecoded = [&](bool isRadar, int tx, int ty, bool withAlpha,
-                            bool cleanupPng) {
-    snprintf(rawPath, sizeof(rawPath), "/frames/z%02d/%c_%d_%d.raw", zoom,
-             isRadar ? 'r' : 'b', tx, ty);
-    LittleFS.remove(rawPath);
-    if (withAlpha) {
-      snprintf(alphaPathBuf, sizeof(alphaPathBuf), "/frames/z%02d/%c_%d_%d.a",
-               zoom, isRadar ? 'r' : 'b', tx, ty);
-      LittleFS.remove(alphaPathBuf);
-    }
-    if (cleanupPng) {
-      frameCacheTilePath(zoom, isRadar, tx, ty, pngPath, sizeof(pngPath));
-      LittleFS.remove(pngPath);
-    }
-  };
-
-  auto bakeOneTile = [&](bool isRadar, int tx, int ty, int sc,
-                         bool withAlpha, RadarCenterSample* centerOut) -> bool {
-    // 此时 frameBand 必须为空，确保 pngle 能取得最大的连续堆块。
-    if (frameBand || !decodeOne(isRadar, tx, ty, withAlpha, false)) {
-      return false;
-    }
-    logHeap("after-png-decode");
-    if (!allocFrameBand()) {
-      cleanupDecoded(isRadar, tx, ty, withAlpha, false);
-      return false;
-    }
-
+    const int ox = (int)lround((double)tx * TILE_SIZE * sc - vp.origin_px);
+    const int oy = (int)lround((double)ty * TILE_SIZE * sc - vp.origin_py);
+    const int outBottom = oy + TILE_SIZE * sc;
     bool ok = true;
-    for (int bandY = 0; bandY < LCD_HEIGHT; bandY += kComposeBandRows) {
-      const int bandRows = min(kComposeBandRows, (int)LCD_HEIGHT - bandY);
-      if (!frameCacheReadRgb565NewBand(zoom, bandY, bandRows, frameBand) ||
-          !stampOne(bandY, bandRows, isRadar, tx, ty, sc, withAlpha,
-                    centerOut) ||
-          !frameCacheWriteRgb565Band(zoom, bandY, bandRows, frameBand)) {
+    for (int band = 0; band < FRAME_COMPOSE_BAND_COUNT; ++band) {
+      const int bandY = band * kComposeBandRows;
+      const int bandRows = min(kComposeBandRows, LCD_HEIGHT - bandY);
+      if (oy >= bandY + bandRows || outBottom <= bandY) {
+        continue;
+      }
+      if (!frameCacheReadComposeBand(zoom, band, frameBand) ||
+          !frameCacheStampRawToBand(
+              frameBand, bandY, bandRows, rawPath, ap, ox, oy, sc, withAlpha,
+              centerOut, withAlpha ? &s_radarColorGrid : nullptr) ||
+          !frameCacheWriteComposeBand(zoom, band, frameBand)) {
         Serial.printf("  tile stamp FAIL z=%d type=%c x=%d y=%d bandY=%d\n",
                       zoom, isRadar ? 'r' : 'b', tx, ty, bandY);
         ok = false;
@@ -750,61 +656,85 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     }
     free(frameBand);
     frameBand = nullptr;
-    cleanupDecoded(isRadar, tx, ty, withAlpha, ok);
-    if (ok) {
-      afterBakeStep();
-    }
+    cleanupTile(isRadar, tx, ty, withAlpha);
     return ok;
   };
 
+  int baseOk = 0;
   int baseStamped = 0;
   for (int ty = vp.ty0; ty <= vp.ty1; ++ty) {
     for (int tx = vp.tx0; tx <= vp.tx1; ++tx) {
-      if (composeAbortRequested() ||
-          !bakeOneTile(false, tx, ty, 1, false, nullptr)) {
-        Serial.printf("basemap bake abort z=%d x=%d y=%d\n", zoom, tx, ty);
+      if (composeAbortRequested()) return ComposeResult::Failed;
+      bool fetched = fetchBasemapOnce(tx, ty);
+      if (!fetched && WiFi.status() == WL_CONNECTED) {
+        Serial.printf("  retry basemap z=%d x=%d y=%d\n", zoom, tx, ty);
+        fetched = fetchBasemapOnce(tx, ty);
+      }
+      if (!fetched || !bakeOneTile(false, tx, ty, 1, false, nullptr)) {
+        cleanupTile(false, tx, ty, false);
+        Serial.printf("basemap pipeline fail z=%d x=%d y=%d\n", zoom, tx, ty);
         return ComposeResult::Failed;
       }
+      ++baseOk;
       ++baseStamped;
+      afterTile();
     }
   }
+  Serial.printf("Basemap pipeline ok=%d/%d\n", baseOk, baseTiles);
 
+  int radarOk = 0;
   int radarStamped = 0;
-  if (radarOk > 0) {
+  if (haveRadarMeta && !composeAbortRequested()) {
     for (int ty = rty0; ty <= rty1; ++ty) {
       for (int tx = rtx0; tx <= rtx1; ++tx) {
-        frameCacheTilePath(zoom, true, tx, ty, pngPath, sizeof(pngPath));
-        if (!LittleFS.exists(pngPath)) {
-          continue;
+        if (composeAbortRequested()) return ComposeResult::Failed;
+        Serial.printf("  dl radar oz=%d x=%d y=%d\n", overlayZoom, tx, ty);
+        const bool fetched = fetchTileToFs(
+            zoom, true, tx, ty, rainviewerTileUrl(meta, overlayZoom, tx, ty),
+            nullptr, 200, "radar");
+        if (fetched) {
+          if (!bakeOneTile(true, tx, ty, scale, true, &centerSample)) {
+            cleanupTile(true, tx, ty, true);
+            Serial.printf("radar pipeline fail z=%d x=%d y=%d\n", zoom, tx,
+                          ty);
+            return ComposeResult::Failed;
+          }
+          ++radarOk;
+          ++radarStamped;
         }
-        if (composeAbortRequested() ||
-            !bakeOneTile(true, tx, ty, scale, true, &centerSample)) {
-          Serial.printf("radar bake abort z=%d x=%d y=%d\n", zoom, tx, ty);
-          return ComposeResult::Failed;
-        }
-        ++radarStamped;
+        afterTile();
       }
     }
   }
-  if (baseStamped != baseTiles || radarStamped != radarOk) {
-    Serial.printf("tile stamp incomplete base=%d/%d radar=%d/%d\n",
-                  baseStamped, baseTiles, radarStamped, radarOk);
+  Serial.printf("Radar pipeline ok=%d/%d\n", radarOk, radarTiles);
+  if (baseOk != baseTiles || baseStamped != baseTiles || radarOk == 0 ||
+      radarStamped != radarOk) {
+    Serial.printf("pipeline incomplete base=%d/%d radar=%d/%d\n", baseStamped,
+                  baseTiles, radarStamped, radarTiles);
     return ComposeResult::Failed;
   }
 
-  // 所有瓦片完成后才加固定覆盖层并选择性上屏，避免半帧可见。
+  const bool allowCommit = haveRadarMeta && radarOk > 0;
+  if (!frameCacheWriteMeta(zoom, vp, true, overlayZoom, scale, rtx0, rty0,
+                           rtx1, rty1)) {
+    Serial.println("write compose meta fail");
+    return ComposeResult::Failed;
+  }
+
+  // 所有瓦片完成后才顺序拼成 .new；每段只追加一次，避免大文件反复
+  // 写时复制。写后先校验，再允许上屏和 commit。
+  if (!frameCacheBeginRgb565New(zoom)) {
+    Serial.println("beginRgb565New fail");
+    return ComposeResult::Failed;
+  }
   if (!allocFrameBand()) {
     return ComposeResult::Failed;
   }
-  const bool prevSwap = lcd->getSwapBytes();
-  if (pushToDisplay) {
-    lcd->setSwapBytes(true);
-  }
-  for (int bandY = 0; bandY < LCD_HEIGHT; bandY += kComposeBandRows) {
-    const int bandRows = min(kComposeBandRows, (int)LCD_HEIGHT - bandY);
-    if (!frameCacheReadRgb565NewBand(zoom, bandY, bandRows, frameBand)) {
-      Serial.printf("final band read fail y=%d rows=%d\n", bandY, bandRows);
-      if (pushToDisplay) lcd->setSwapBytes(prevSwap);
+  for (int band = 0; band < FRAME_COMPOSE_BAND_COUNT; ++band) {
+    const int bandY = band * kComposeBandRows;
+    const int bandRows = min(kComposeBandRows, LCD_HEIGHT - bandY);
+    if (!frameCacheReadComposeBand(zoom, band, frameBand)) {
+      Serial.printf("final scratch read fail b%d\n", band);
       free(frameBand);
       return ComposeResult::Failed;
     }
@@ -815,16 +745,36 @@ ComposeResult composeRadarFrame(LGFX* lcd, float lat, float lon, int zoom,
     frameCacheDrawOverlayBand(frameBand, bandY, bandRows, meta.time);
     if (!frameCacheWriteRgb565Band(zoom, bandY, bandRows, frameBand)) {
       Serial.printf("final band write fail y=%d rows=%d\n", bandY, bandRows);
-      if (pushToDisplay) lcd->setSwapBytes(prevSwap);
       free(frameBand);
       return ComposeResult::Failed;
     }
-    if (pushToDisplay) {
+  }
+
+  if (!frameCacheValidateRgb565New(zoom, bg)) {
+    free(frameBand);
+    return ComposeResult::Failed;
+  }
+  frameCacheRemoveComposeBands(zoom);
+  bandGuard.active = false;
+
+  if (pushToDisplay) {
+    const bool prevSwap = lcd->getSwapBytes();
+    lcd->setSwapBytes(true);
+    bool displayOk = true;
+    for (int band = 0; band < FRAME_COMPOSE_BAND_COUNT; ++band) {
+      const int bandY = band * kComposeBandRows;
+      const int bandRows = min(kComposeBandRows, LCD_HEIGHT - bandY);
+      if (!frameCacheReadRgb565NewBand(zoom, bandY, bandRows, frameBand)) {
+        displayOk = false;
+        break;
+      }
       lcd->pushImage(0, bandY, LCD_WIDTH, bandRows, frameBand);
     }
-  }
-  if (pushToDisplay) {
     lcd->setSwapBytes(prevSwap);
+    if (!displayOk) {
+      free(frameBand);
+      return ComposeResult::Failed;
+    }
     if (s_displayFn) {
       s_displayFn(zoom);
     }

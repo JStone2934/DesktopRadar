@@ -17,6 +17,7 @@
 static uint16_t s_readyMask = 0;
 // 新鲜度掩码：bit=1 表示该档为本轮已重建（新雷达）；ready 仅表示成品存在（可能过时）
 static uint16_t s_freshMask = 0;
+static uint16_t s_repairMask = 0;
 static int s_protectedZoom = -1;
 // UI 读取正式帧与后台任务替换正式帧之间只互斥极短的 rename 窗口。
 // 下载、解码和临时文件写入均不持锁，不会反向拖住 S 键。
@@ -24,6 +25,7 @@ static SemaphoreHandle_t s_finalCacheMutex = nullptr;
 
 static constexpr int kBlitBandRows = 16;
 static uint16_t s_blitBand[LCD_WIDTH * kBlitBandRows];
+static uint8_t s_verifyChunk[512];
 
 static inline void freshMaskSet(int zoom, bool on) {
   if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
@@ -90,6 +92,10 @@ static void rgbBackupPath(int zoom, char* out, size_t n) {
   snprintf(out, n, "/frames/z%02d.rgb565.bak", zoom);
 }
 
+static void composeBandPath(int zoom, int bandIndex, char* out, size_t n) {
+  snprintf(out, n, "/frames/z%02d/band%d.rgb", zoom, bandIndex);
+}
+
 static void alertPath(int zoom, char* out, size_t n) {
   // 与 rgb565 / ready 同级，commit 清 zXX/ 临时目录后仍保留
   snprintf(out, n, "/frames/z%02d.alert", zoom);
@@ -127,6 +133,102 @@ static bool openRgb565IfValid(int zoom, File* out) {
   }
   *out = f;
   return true;
+}
+
+static uint16_t expectedBackdrop565() {
+  return (uint16_t)(((BASEMAP_BACKDROP_R & 0xF8) << 8) |
+                    ((BASEMAP_BACKDROP_G & 0xFC) << 3) |
+                    (BASEMAP_BACKDROP_B >> 3));
+}
+
+static bool verifyFileRegion(const char* path, size_t offset,
+                             const uint8_t* expected, size_t bytes,
+                             bool requireExactSize) {
+  File check = LittleFS.open(path, "r");
+  if (!check || (requireExactSize ? check.size() != offset + bytes
+                                  : check.size() < offset + bytes) ||
+      !check.seek(offset)) {
+    if (check) check.close();
+    return false;
+  }
+  size_t done = 0;
+  while (done < bytes) {
+    const size_t chunk = min(sizeof(s_verifyChunk), bytes - done);
+    const int n = check.read(s_verifyChunk, chunk);
+    if (n != (int)chunk || memcmp(s_verifyChunk, expected + done, chunk) != 0) {
+      check.close();
+      return false;
+    }
+    done += chunk;
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      check.close();
+      return false;
+    }
+  }
+  check.close();
+  return true;
+}
+
+static bool writeFileRegionVerified(const char* path, size_t offset,
+                                    const uint8_t* data, size_t bytes,
+                                    bool truncate) {
+  File f = LittleFS.open(path, truncate ? "w" : "r+");
+  if (!f || (!truncate && !f.seek(offset))) {
+    if (f) f.close();
+    return false;
+  }
+  constexpr size_t kWriteChunk = FRAME_ROW_BYTES * 8U;
+  size_t wrote = 0;
+  while (wrote < bytes) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      f.close();
+      return false;
+    }
+    const size_t chunk = min(kWriteChunk, bytes - wrote);
+    const size_t n = f.write(data + wrote, chunk);
+    if (n != chunk) {
+      f.close();
+      return false;
+    }
+    wrote += n;
+  }
+  f.flush();
+  f.close();
+  // File::flush() 没有可检查的返回值；重新打开逐字节比对，才能捕获
+  // LittleFS 在 fsync/close 阶段报告 ENOSPC、但 write() 已接收数据的情况。
+  return verifyFileRegion(path, offset, data, bytes, truncate);
+}
+
+static bool fileHasBackdropGap(const char* path, uint16_t backdropColor) {
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() != FRAME_RGB565_BYTES) {
+    if (f) f.close();
+    return true;
+  }
+  uint16_t row[LCD_WIDTH];
+  int consecutive = 0;
+  constexpr int kGapPixels = LCD_WIDTH * 9 / 10;
+  constexpr int kGapRows = 4;
+  for (int y = 0; y < LCD_HEIGHT - OVERLAY_BAR_H; ++y) {
+    if (f.read(reinterpret_cast<uint8_t*>(row), FRAME_ROW_BYTES) !=
+        (int)FRAME_ROW_BYTES) {
+      f.close();
+      return true;
+    }
+    int count = 0;
+    for (int x = 0; x < LCD_WIDTH; ++x) {
+      count += row[x] == backdropColor;
+    }
+    consecutive = count >= kGapPixels ? consecutive + 1 : 0;
+    if (consecutive >= kGapRows) {
+      f.close();
+      return true;
+    }
+  }
+  f.close();
+  return false;
 }
 
 static bool blitRgb565File(LGFX* lcd, File& f, int zoom) {
@@ -276,6 +378,7 @@ bool frameCacheBegin() {
   }
   s_readyMask = 0;
   s_freshMask = 0;
+  s_repairMask = 0;
   if (LittleFS.begin(false)) {
     if (!LittleFS.exists("/frames")) {
       LittleFS.mkdir("/frames");
@@ -403,8 +506,15 @@ bool frameCacheBegin() {
     f.close();
     if (ok) {
       readyMaskSet(z, true);
-      // 启动时把磁盘上有效成品视为新鲜（首次刷新前不重建）
-      freshMaskSet(z, true);
+      const bool damaged =
+          fileHasBackdropGap(fpath, expectedBackdrop565());
+      freshMaskSet(z, !damaged);
+      if (damaged) {
+        // 保留旧帧供秒切，但撤销可信时间，后台会优先重新合成并原子替换。
+        s_repairMask |= (uint16_t)(1u << zoomBit(z));
+        frameCacheRemoveRadarTime(z);
+        Serial.printf("cache z%d backdrop gap; keep ready, queue repair\n", z);
+      }
     }
   }
 
@@ -820,6 +930,7 @@ bool frameCacheRemove(int zoom) {
   LittleFS.remove(path);
   readyMaskSet(zoom, false);
   freshMaskSet(zoom, false);
+  s_repairMask &= (uint16_t)~(1u << zoomBit(zoom));
   return true;
 }
 
@@ -1062,6 +1173,68 @@ bool frameCacheBeginRgb565New(int zoom) {
   return true;
 }
 
+bool frameCacheWriteComposeBand(int zoom, int bandIndex,
+                                const uint16_t* frame) {
+  if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX || bandIndex < 0 ||
+      bandIndex >= FRAME_COMPOSE_BAND_COUNT) {
+    return false;
+  }
+  char path[48];
+  composeBandPath(zoom, bandIndex, path, sizeof(path));
+  const int startRow = bandIndex * FRAME_COMPOSE_BAND_ROWS;
+  const int rows = min(FRAME_COMPOSE_BAND_ROWS, LCD_HEIGHT - startRow);
+  const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
+  const bool ok = writeFileRegionVerified(
+      path, 0, reinterpret_cast<const uint8_t*>(frame), bytes, true);
+  if (!ok) {
+    Serial.printf("compose band write verify fail z%d b%d\n", zoom, bandIndex);
+  }
+  return ok;
+}
+
+bool frameCacheReadComposeBand(int zoom, int bandIndex, uint16_t* frame) {
+  if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX || bandIndex < 0 ||
+      bandIndex >= FRAME_COMPOSE_BAND_COUNT) {
+    return false;
+  }
+  char path[48];
+  composeBandPath(zoom, bandIndex, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  const int startRow = bandIndex * FRAME_COMPOSE_BAND_ROWS;
+  const int rows = min(FRAME_COMPOSE_BAND_ROWS, LCD_HEIGHT - startRow);
+  const size_t expected = (size_t)rows * FRAME_ROW_BYTES;
+  if (!f || f.size() != expected) {
+    if (f) f.close();
+    return false;
+  }
+  size_t done = 0;
+  constexpr size_t kReadChunk = FRAME_ROW_BYTES * 8U;
+  uint8_t* dst = reinterpret_cast<uint8_t*>(frame);
+  while (done < expected) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      f.close();
+      return false;
+    }
+    const size_t chunk = min(kReadChunk, expected - done);
+    if (f.read(dst + done, chunk) != (int)chunk) {
+      f.close();
+      return false;
+    }
+    done += chunk;
+  }
+  f.close();
+  return true;
+}
+
+void frameCacheRemoveComposeBands(int zoom) {
+  char path[48];
+  for (int i = 0; i < FRAME_COMPOSE_BAND_COUNT; ++i) {
+    composeBandPath(zoom, i, path, sizeof(path));
+    LittleFS.remove(path);
+  }
+}
+
 bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
                                const uint16_t* frame) {
   if (!frame || zoom < ZOOM_MIN || zoom > ZOOM_MAX || startRow < 0 ||
@@ -1070,43 +1243,15 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
   }
   char path[40];
   rgbNewPath(zoom, path, sizeof(path));
-  File f = LittleFS.open(path, "r+");
-  if (!f || !f.seek((size_t)startRow * FRAME_ROW_BYTES)) {
-    if (f) {
-      f.close();
-    }
-    return false;
+  const size_t offset = (size_t)startRow * FRAME_ROW_BYTES;
+  const size_t bytes = (size_t)rowCount * FRAME_ROW_BYTES;
+  const bool ok = writeFileRegionVerified(
+      path, offset, reinterpret_cast<const uint8_t*>(frame), bytes, false);
+  if (!ok) {
+    Serial.printf("rgb565 band write verify fail z%d y%d rows%d\n", zoom,
+                  startRow, rowCount);
   }
-  // 8 行一批写入并在每批前后检查按键，但不要每 8 行都 flush。
-  // LittleFS 的 flush 是昂贵的全文件同步；逐批同步会把一次瓦片合成
-  // 放大到数十秒。一个帧带完成后统一同步，正式缓存仍由 commit 保护。
-  constexpr int kWriteRows = 8;
-  size_t wrote = 0;
-  for (int row = 0; row < rowCount; row += kWriteRows) {
-    inputServiceDuringBlock();
-    if (composeAbortRequested()) {
-      f.close();
-      return false;
-    }
-    const int rows = min(kWriteRows, rowCount - row);
-    const size_t bytes = (size_t)rows * FRAME_ROW_BYTES;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(
-        frame + (size_t)row * LCD_WIDTH);
-    const size_t n = f.write(src, bytes);
-    wrote += n;
-    if (n != bytes) {
-      f.close();
-      return false;
-    }
-    inputServiceDuringBlock();
-    if (composeAbortRequested()) {
-      f.close();
-      return false;
-    }
-  }
-  f.flush();
-  f.close();
-  return wrote == (size_t)rowCount * FRAME_ROW_BYTES;
+  return ok;
 }
 
 bool frameCacheReadRgb565NewBand(int zoom, int startRow, int rowCount,
@@ -1147,6 +1292,19 @@ bool frameCacheReadRgb565NewBand(int zoom, int startRow, int rowCount,
   }
   f.close();
   return readBytes == (size_t)rowCount * FRAME_ROW_BYTES;
+}
+
+bool frameCacheValidateRgb565New(int zoom, uint16_t backdropColor) {
+  if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+    return false;
+  }
+  char path[40];
+  rgbNewPath(zoom, path, sizeof(path));
+  const bool ok = !fileHasBackdropGap(path, backdropColor);
+  if (!ok) {
+    Serial.printf("rgb565 new backdrop gap z%d\n", zoom);
+  }
+  return ok;
 }
 
 bool frameCacheWriteRgb565(int zoom, const uint16_t* frame) {
@@ -2180,6 +2338,7 @@ bool frameCacheCommit(int zoom) {
   r.close();
   readyMaskSet(zoom, true);
   freshMaskSet(zoom, true);
+  s_repairMask &= (uint16_t)~(1u << zoomBit(zoom));
   Serial.printf("frameCache commit z%d rgb565 ok\n", zoom);
   return true;
 }
@@ -2219,6 +2378,17 @@ int frameCacheCountFresh() {
     }
   }
   return n;
+}
+
+int frameCacheTakeRepairZoom() {
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    const uint16_t bit = (uint16_t)(1u << zoomBit(z));
+    if (s_repairMask & bit) {
+      s_repairMask &= (uint16_t)~bit;
+      return z;
+    }
+  }
+  return -1;
 }
 
 void frameCacheSetProtectedZoom(int zoom) { s_protectedZoom = zoom; }

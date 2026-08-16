@@ -118,6 +118,17 @@ bool frameCacheWriteRgb565(int zoom, const uint16_t* frame);
 /** 清空并创建 .rgb565.new，供低内存分段造片。 */
 bool frameCacheBeginRgb565New(int zoom);
 
+// 低内存合成使用三个固定 80 行临时段，避免反复修改 115KB 单文件时
+// LittleFS 写时复制占满剩余空间。临时段位于对应 zXX 目录，失败时可直接丢弃。
+static constexpr int FRAME_COMPOSE_BAND_ROWS = LCD_HEIGHT / 3;
+static constexpr int FRAME_COMPOSE_BAND_COUNT =
+    (LCD_HEIGHT + FRAME_COMPOSE_BAND_ROWS - 1) / FRAME_COMPOSE_BAND_ROWS;
+
+bool frameCacheWriteComposeBand(int zoom, int bandIndex,
+                                const uint16_t* frame);
+bool frameCacheReadComposeBand(int zoom, int bandIndex, uint16_t* frame);
+void frameCacheRemoveComposeBands(int zoom);
+
 /**
  * 将连续若干行写入 .rgb565.new；调用前须 frameCacheBeginRgb565New。
  * frame 只需容纳 rowCount×LCD_WIDTH 个 RGB565 像素。
@@ -131,6 +142,9 @@ bool frameCacheWriteRgb565Band(int zoom, int startRow, int rowCount,
  */
 bool frameCacheReadRgb565NewBand(int zoom, int startRow, int rowCount,
                                  uint16_t* frame);
+
+/** 校验新成品长度，并拒绝非底栏区域的大面积初始化背景色。 */
+bool frameCacheValidateRgb565New(int zoom, uint16_t backdropColor);
 
 /** 读已就绪静帧到内存缓冲（需 FRAME_RGB565_BYTES）。 */
 bool frameCacheLoadRgb565(int zoom, uint16_t* frame);
@@ -242,6 +256,9 @@ void frameCacheMarkAllStaleExcept(int keepZoom);
 
 /** 当前 fresh 档数。 */
 int frameCacheCountFresh();
+
+/** 取出一个启动检查发现的残缺档；只取一次，失败后回到普通预取重试。 */
+int frameCacheTakeRepairZoom();
 
 /** 设置受保护档（屏上正在显示）；保留接口供缓存状态跟踪。 */
 void frameCacheSetProtectedZoom(int zoom);
