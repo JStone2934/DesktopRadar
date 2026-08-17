@@ -8,6 +8,7 @@
 #include "config.h"
 #include "frame_cache.h"
 #include "wind_field.h"
+#include "zoom_ctrl.h"
 
 namespace {
 
@@ -37,14 +38,24 @@ static_assert(sizeof(TrailPixel) == 6, "TrailPixel must stay compact");
 
 static constexpr int kTrailPixelCapacity = 3072;
 // 最长约 300px 的通道按 20px 间距最多需要 15 个粗箭头；每个方向掩码
-// 最多 78 像素，1280 项仍留有 110 项余量。旧帧和新帧最坏约 2340 项，
-// 保持在 3072 项轨迹池内。
+// 最多 78 像素，1280 项工作区和 3072 项轨迹池仍留有足够余量。
 static constexpr int kNewPixelCapacity = 1280;
 static constexpr uint32_t kTrailFadeMs = 1500UL;
+static constexpr int kWideQueueMinSlots = 6;
 static constexpr int kWideQueueMaxSlots = 15;
+static constexpr int kWideQueueMaxReduction = 3;
 static constexpr float kWideQueueTargetSpacing = 20.0f;
 static constexpr float kWideQueueFadeLength = 28.0f;
 static constexpr float kWideQueueEndExclusion = 12.0f;
+static constexpr float kWideQueueSpeedScale = 3.0f;
+static constexpr float kWideQueueMinimumSpeed = 6.0f;
+static constexpr uint32_t kWideSpeedTransitionMs = 2000UL;
+static constexpr float kWideQueueMinRouteLength = 120.0f;
+static constexpr float kWideQueueTrimStep = 10.0f;
+static constexpr uint8_t kWideOverlapAlphaMin = 64;
+static constexpr uint8_t kWideOverlapPixelLimit = 6;
+static constexpr size_t kWideAuditBitmapBytes =
+    (LCD_WIDTH * LCD_HEIGHT + 7U) / 8U;
 static constexpr int kWideArrowMaskCapacity = 112;
 static constexpr int kWideDirectionCount = 16;
 static constexpr int kWidePathCapacity = 32;
@@ -78,7 +89,12 @@ static int s_activeParticleCount = WIND_PARTICLE_COUNT;
 static int s_wideQueueSlotCount = 0;
 static float s_wideQueuePhase = 0.0f;
 static float s_wideQueueSpacing = 22.0f;
-static float s_wideQueueSpeed = 12.0f;
+static float s_wideQueueSpeed = kWideQueueMinimumSpeed;
+static float s_wideQueueSpeedFrom = kWideQueueMinimumSpeed;
+static float s_wideQueueSpeedTarget = kWideQueueMinimumSpeed;
+static uint32_t s_wideQueueSpeedTransitionAt = 0;
+static float s_wideCenterSpeed = 0.0f;
+static bool s_wideCenterSpeedValid = false;
 static float s_wideWindowStart = 0.0f;
 static float s_wideWindowLength = 0.0f;
 static float s_wideWindowMinGap = 0.0f;
@@ -100,6 +116,24 @@ static uint32_t s_wideColorTransitionAt = 0;
 static bool s_wideColorReady = false;
 static bool s_wideColorSamplePending = true;
 static bool s_wideColorHasCloud = false;
+static uint32_t s_wideAuditRevision = 0;
+static bool s_wideAuditHidden = false;
+static uint16_t s_wideAuditMaxShared = 0;
+static float s_wideAuditTrim = 0.0f;
+static uint32_t s_wideAuditMs = 0;
+static int s_wideAuditInitialSlots = 0;
+static bool s_wideAuditHeld = false;
+
+struct WideLayoutState {
+  float routeLength;
+  uint32_t revision;
+  uint8_t slots;
+  uint8_t safeStreak;
+  bool valid;
+};
+
+static WideLayoutState s_wideApplied[kZoomSlots];
+static WideLayoutState s_widePending[kZoomSlots];
 
 static constexpr uint8_t kTrailHead = 0x01;
 // 只用于开放式箭翼：本帧以头部颜色绘制，下一帧恢复静态底色，
@@ -131,6 +165,8 @@ static bool s_wideArrowMasksReady = false;
 
 static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t alpha);
 static uint16_t currentWideQueueColor(uint32_t now);
+static int quantizeWideDirection(float forwardX, float forwardY);
+static void buildWideArrowMasks();
 
 static int styleParticleCount() {
   return s_style == WIND_PARTICLE_WIDE_ARROW ? 0 : WIND_PARTICLE_COUNT;
@@ -215,7 +251,12 @@ static void resetAll(int zoom, uint32_t revision) {
   s_wideQueueSlotCount = 0;
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
-  s_wideQueueSpeed = 12.0f;
+  s_wideQueueSpeed = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedFrom = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedTarget = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedTransitionAt = 0;
+  s_wideCenterSpeed = 0.0f;
+  s_wideCenterSpeedValid = false;
   s_wideWindowStart = 0.0f;
   s_wideWindowLength = 0.0f;
   s_wideWindowMinGap = 0.0f;
@@ -233,6 +274,13 @@ static void resetAll(int zoom, uint32_t revision) {
   s_wideColorReady = false;
   s_wideColorSamplePending = true;
   s_wideColorHasCloud = false;
+  s_wideAuditRevision = revision;
+  s_wideAuditHidden = false;
+  s_wideAuditMaxShared = 0;
+  s_wideAuditTrim = 0.0f;
+  s_wideAuditMs = 0;
+  s_wideAuditInitialSlots = 0;
+  s_wideAuditHeld = false;
   Serial.printf("wind particles reset z%d count=%d fieldRev=%lu style=%u\n",
                 zoom, s_activeParticleCount, (unsigned long)revision,
                 (unsigned)s_style);
@@ -255,6 +303,61 @@ static int8_t quantizeHeading(float east, float south) {
   return south >= 0.0f ? 3 : 5;
 }
 
+static float smoothTransition(float from, float target, uint32_t startedAt,
+                              uint32_t durationMs, uint32_t now) {
+  if (startedAt == 0 || durationMs == 0) {
+    return target;
+  }
+  const uint32_t elapsed = now - startedAt;
+  if (elapsed >= durationMs) {
+    return target;
+  }
+  const float t = (float)elapsed / (float)durationMs;
+  const float smooth = t * t * (3.0f - 2.0f * t);
+  return from + (target - from) * smooth;
+}
+
+static float currentWideQueueSpeed(uint32_t now) {
+  s_wideQueueSpeed =
+      smoothTransition(s_wideQueueSpeedFrom, s_wideQueueSpeedTarget,
+                       s_wideQueueSpeedTransitionAt,
+                       kWideSpeedTransitionMs, now);
+  return s_wideQueueSpeed;
+}
+
+static void updateWideQueueCenterSpeed(uint32_t revision) {
+  float east = 0.0f;
+  float south = 0.0f;
+  if (!windFieldSample((float)LCD_WIDTH * 0.5f,
+                       (float)LCD_HEIGHT * 0.5f, &east, &south)) {
+    Serial.printf("wind wide center unavailable retain=%d rev=%lu\n",
+                  (int)s_wideCenterSpeedValid, (unsigned long)revision);
+    return;
+  }
+  const float centerSpeed = sqrtf(east * east + south * south);
+  if (!isfinite(centerSpeed)) {
+    Serial.printf("wind wide center invalid rev=%lu\n",
+                  (unsigned long)revision);
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool hadValidSpeed = s_wideCenterSpeedValid;
+  const float currentSpeed = currentWideQueueSpeed(now);
+  s_wideCenterSpeed = centerSpeed;
+  s_wideCenterSpeedValid = true;
+  const float speedTarget =
+      max(kWideQueueMinimumSpeed, centerSpeed * kWideQueueSpeedScale);
+  if (!hadValidSpeed || fabsf(speedTarget - s_wideQueueSpeedTarget) > 0.001f) {
+    s_wideQueueSpeedFrom = currentSpeed;
+    s_wideQueueSpeedTarget = speedTarget;
+    s_wideQueueSpeedTransitionAt = now;
+  }
+  Serial.printf(
+      "wind wide center=%.2fm/s vector=(%.2f,%.2f) target=%.1fpx/s rev=%lu\n",
+      centerSpeed, east, south, speedTarget, (unsigned long)revision);
+}
+
 static bool updateWideQueueDirection(uint32_t revision) {
   if (s_wideDirectionRevision == revision) {
     return s_wideDirectionValid;
@@ -263,6 +366,9 @@ static bool updateWideQueueDirection(uint32_t revision) {
   s_wideDirectionValid = false;
   s_widePathCount = 0;
   s_widePathLength = 0.0f;
+  s_wideAuditRevision = revision;
+  s_wideAuditHidden = false;
+  updateWideQueueCenterSpeed(revision);
 
   // 画面内 5×5 采样，以风速作为权重累计到八方向。选择权重最大的方向，
   // 比只看中心点更能代表整幅雷达图的主导风向，也不会被局部乱流带偏。
@@ -315,15 +421,9 @@ static bool updateWideQueueDirection(uint32_t revision) {
   s_wideDominantX = eastSum[best] / dominantMagnitude;
   s_wideDominantY = southSum[best] / dominantMagnitude;
   s_wideDirectionValid = true;
-  // 队列必须持续可读；风速只在较窄范围内影响滚动速度，不让强风飞得过快。
-  s_wideQueueSpeed = 10.0f + meanSpeed * 0.7f;
-  if (s_wideQueueSpeed > 18.0f) {
-    s_wideQueueSpeed = 18.0f;
-  }
   Serial.printf(
-      "wind wide dominant bin=%d vector=(%.2f,%.2f) score=%.1f mean=%.1fm/s speed=%.1fpx/s rev=%lu\n",
+      "wind wide dominant bin=%d vector=(%.2f,%.2f) score=%.1f mean=%.1fm/s rev=%lu\n",
       best, s_wideDominantX, s_wideDominantY, score[best], meanSpeed,
-      s_wideQueueSpeed,
       (unsigned long)revision);
   return true;
 }
@@ -517,36 +617,226 @@ static bool sampleWidePath(float distance, float* x, float* y,
   return normalizeVector(tangentX, tangentY);
 }
 
+static uint8_t wideLayoutAlpha(float distance, float routeLength,
+                               float spacing) {
+  const float distanceFromEnd = min(distance, routeLength - distance);
+  if (distanceFromEnd <= 0.0f) {
+    return 0;
+  }
+  const float fadeLength = min(kWideQueueFadeLength, spacing);
+  if (distanceFromEnd >= fadeLength) {
+    return 255;
+  }
+  const float t = distanceFromEnd / fadeLength;
+  return (uint8_t)lroundf(t * t * (3.0f - 2.0f * t) * 255.0f);
+}
+
+enum WideAuditResult : uint8_t {
+  WIDE_AUDIT_SAFE = 0,
+  WIDE_AUDIT_OVERLAP,
+  WIDE_AUDIT_ABORTED,
+};
+
+// 用实际旋转点阵模拟一个完整相位。位图只记录本相位已经占用的屏幕
+// 像素；同一个箭头与前面所有箭头累计共享 6px 才视为实质重叠。
+static WideAuditResult auditWideLayout(float routeLength, int slots,
+                                       uint8_t* bitmap,
+                                       uint16_t* maxShared) {
+  if (!bitmap || !maxShared || slots < kWideQueueMinSlots ||
+      routeLength < kWideQueueMinRouteLength) {
+    return WIDE_AUDIT_OVERLAP;
+  }
+  const float spacing = routeLength / (float)slots;
+  const int phaseSteps = max(1, (int)ceilf(spacing));
+  *maxShared = 0;
+  for (int phaseStep = 0; phaseStep < phaseSteps; ++phaseStep) {
+    inputServiceDuringBlock();
+    if (composeAbortRequested()) {
+      return WIDE_AUDIT_ABORTED;
+    }
+    memset(bitmap, 0, kWideAuditBitmapBytes);
+    const float phase = spacing * (float)phaseStep / (float)phaseSteps;
+    for (int slot = 0; slot < slots; ++slot) {
+      const float distance = phase + (float)slot * spacing;
+      if (distance > routeLength ||
+          wideLayoutAlpha(distance, routeLength, spacing) <
+              kWideOverlapAlphaMin) {
+        continue;
+      }
+      float x = 0.0f;
+      float y = 0.0f;
+      float tangentX = 0.0f;
+      float tangentY = 0.0f;
+      if (!sampleWidePath(distance, &x, &y, &tangentX, &tangentY)) {
+        continue;
+      }
+      const int heading = quantizeWideDirection(tangentX, tangentY);
+      const int centerX = (int)lroundf(x);
+      const int centerY = (int)lroundf(y);
+      uint16_t shared = 0;
+      for (int i = 0; i < s_wideArrowMaskCounts[heading]; ++i) {
+        const int px = centerX + s_wideArrowMasks[heading][i].x;
+        const int py = centerY + s_wideArrowMasks[heading][i].y;
+        if (!wideArrowPixelAllowed((float)px, (float)py)) {
+          continue;
+        }
+        const size_t key = (size_t)py * LCD_WIDTH + (size_t)px;
+        const uint8_t bit = (uint8_t)(1U << (key & 7U));
+        uint8_t& cell = bitmap[key >> 3U];
+        if (cell & bit) {
+          ++shared;
+        } else {
+          cell |= bit;
+        }
+      }
+      *maxShared = max(*maxShared, shared);
+      if (shared >= kWideOverlapPixelLimit) {
+        // 一个相位已经足以否决此布局；继续检查不会改变安全结论，只会
+        // 延迟首次显示和按键抢占。
+        return WIDE_AUDIT_OVERLAP;
+      }
+    }
+  }
+  return WIDE_AUDIT_SAFE;
+}
+
+static bool sameWideLayout(const WideLayoutState& state, int slots,
+                           float routeLength) {
+  return state.valid && state.slots == slots &&
+         fabsf(state.routeLength - routeLength) < 0.6f;
+}
+
 static bool configureWideQueueWindow(int zoomSlot) {
-  (void)zoomSlot;
-  if (s_widePathLength < 1.0f) {
+  if (s_widePathLength < kWideQueueMinRouteLength || zoomSlot < 0 ||
+      zoomSlot >= kZoomSlots) {
+    return false;
+  }
+  buildWideArrowMasks();
+  const uint32_t auditStartedAt = millis();
+  uint8_t* bitmap = (uint8_t*)malloc(kWideAuditBitmapBytes);
+  if (!bitmap) {
+    s_wideAuditHidden = true;
+    s_wideAuditMs = millis() - auditStartedAt;
+    Serial.printf("wind corridor hidden z%d reason=bitmap bytes=%u\n",
+                  s_seenZoom, (unsigned)kWideAuditBitmapBytes);
     return false;
   }
 
-  // 按有效通道长度选择最接近 20px 间距的整数箭头数，再用实际长度反算
-  // 精确间距。长通道自然增加箭头，短通道自然减少，不再固定为 10 个。
-  const float endExclusion =
-      min(kWideQueueEndExclusion, max(0.0f, s_widePathLength - 1.0f));
-  const float usableLength = s_widePathLength - endExclusion;
-  int slotCount = (int)lroundf(usableLength / kWideQueueTargetSpacing);
-  slotCount = max(1, min(kWideQueueMaxSlots, slotCount));
-  const float spacing = usableLength / (float)slotCount;
+  const float endExclusion = min(
+      kWideQueueEndExclusion,
+      max(0.0f, s_widePathLength - kWideQueueMinRouteLength));
+  const float fullRouteLength = s_widePathLength - endExclusion;
+  s_wideAuditInitialSlots = max(
+      kWideQueueMinSlots,
+      min(kWideQueueMaxSlots,
+          (int)lroundf(fullRouteLength / kWideQueueTargetSpacing)));
 
-  // 曲率只用于串口诊断，不再参与筛选或拒绝；急弯即使让相邻箭头略微
-  // 靠近也要原样显示。
+  float selectedLength = 0.0f;
+  int selectedSlots = 0;
+  uint16_t selectedShared = 0;
+  uint16_t maximumShared = 0;
+  bool aborted = false;
+  float routeLength = fullRouteLength;
+  while (true) {
+    const int initialSlots = max(
+        kWideQueueMinSlots,
+        min(kWideQueueMaxSlots,
+            (int)lroundf(routeLength / kWideQueueTargetSpacing)));
+    const int minimumSlots =
+        max(kWideQueueMinSlots, initialSlots - kWideQueueMaxReduction);
+    for (int slots = initialSlots; slots >= minimumSlots; --slots) {
+      uint16_t shared = 0;
+      const WideAuditResult result =
+          auditWideLayout(routeLength, slots, bitmap, &shared);
+      maximumShared = max(maximumShared, shared);
+      if (result == WIDE_AUDIT_ABORTED) {
+        aborted = true;
+        break;
+      }
+      if (result == WIDE_AUDIT_SAFE) {
+        selectedLength = routeLength;
+        selectedSlots = slots;
+        selectedShared = shared;
+        break;
+      }
+    }
+    if (aborted || selectedSlots > 0) {
+      break;
+    }
+    if (routeLength <= kWideQueueMinRouteLength + 0.01f) {
+      break;
+    }
+    routeLength =
+        max(kWideQueueMinRouteLength, routeLength - kWideQueueTrimStep);
+  }
+
+  if (aborted) {
+    free(bitmap);
+    return false;
+  }
+  if (selectedSlots == 0) {
+    free(bitmap);
+    s_wideAuditHidden = true;
+    s_wideAuditMaxShared = maximumShared;
+    s_wideAuditTrim = fullRouteLength - kWideQueueMinRouteLength;
+    s_wideAuditMs = millis() - auditStartedAt;
+    Serial.printf(
+        "wind corridor hidden z%d reason=overlap initial=%d maxShared=%u trim=%.0f audit=%lums\n",
+        s_seenZoom, s_wideAuditInitialSlots, (unsigned)maximumShared,
+        s_wideAuditTrim, (unsigned long)s_wideAuditMs);
+    return false;
+  }
+
+  // 安全方案若要求更少箭头或更短路径会立即生效；反向恢复则先保留当前
+  // 仍安全的较保守布局，连续两个不同风场 revision 均安全才扩展。
+  WideLayoutState& applied = s_wideApplied[zoomSlot];
+  WideLayoutState& pending = s_widePending[zoomSlot];
+  s_wideAuditHeld = false;
+  if (applied.valid &&
+      (selectedSlots > applied.slots ||
+       selectedLength > applied.routeLength + 0.5f)) {
+    const int conservativeSlots = min(selectedSlots, (int)applied.slots);
+    const float conservativeLength =
+        min(selectedLength, applied.routeLength);
+    uint16_t conservativeShared = 0;
+    const WideAuditResult conservativeResult = auditWideLayout(
+        conservativeLength, conservativeSlots, bitmap, &conservativeShared);
+    if (conservativeResult == WIDE_AUDIT_ABORTED) {
+      free(bitmap);
+      return false;
+    }
+    if (conservativeResult == WIDE_AUDIT_SAFE) {
+      if (sameWideLayout(pending, selectedSlots, selectedLength) &&
+          pending.revision != s_wideDirectionRevision) {
+        ++pending.safeStreak;
+        pending.revision = s_wideDirectionRevision;
+      } else {
+        pending = WideLayoutState{selectedLength, s_wideDirectionRevision,
+                                  (uint8_t)selectedSlots, 1, true};
+      }
+      if (pending.safeStreak < 2) {
+        selectedSlots = conservativeSlots;
+        selectedLength = conservativeLength;
+        selectedShared = conservativeShared;
+        s_wideAuditHeld = true;
+      } else {
+        pending.valid = false;
+      }
+    }
+  } else {
+    pending.valid = false;
+  }
+  applied = WideLayoutState{selectedLength, s_wideDirectionRevision,
+                            (uint8_t)selectedSlots, 0, true};
+  free(bitmap);
+
+  const float spacing = selectedLength / (float)selectedSlots;
   float minGap = 10000.0f;
-  const float sampleStep = spacing * 0.25f;
   for (float distance = 0.0f;
-       distance <= usableLength - spacing + 0.01f;
-       distance += sampleStep) {
-    float x0 = 0.0f;
-    float y0 = 0.0f;
-    float tx0 = 0.0f;
-    float ty0 = 0.0f;
-    float x1 = 0.0f;
-    float y1 = 0.0f;
-    float tx1 = 0.0f;
-    float ty1 = 0.0f;
+       distance <= selectedLength - spacing + 0.01f;
+       distance += max(1.0f, spacing * 0.25f)) {
+    float x0 = 0.0f, y0 = 0.0f, tx0 = 0.0f, ty0 = 0.0f;
+    float x1 = 0.0f, y1 = 0.0f, tx1 = 0.0f, ty1 = 0.0f;
     if (!sampleWidePath(distance, &x0, &y0, &tx0, &ty0) ||
         !sampleWidePath(distance + spacing, &x1, &y1, &tx1, &ty1)) {
       return false;
@@ -562,13 +852,16 @@ static bool configureWideQueueWindow(int zoomSlot) {
                                      oldSpacing
                                : 0.0f;
   s_wideQueueSpacing = spacing;
-  s_wideQueueSlotCount = slotCount;
+  s_wideQueueSlotCount = selectedSlots;
   s_wideWindowStart = 0.0f;
-  s_wideWindowLength = usableLength;
+  s_wideWindowLength = selectedLength;
   s_wideQueuePhase = phaseRatio * spacing;
   s_wideWindowMinGap = minGap;
-  s_wideWindowFallback = slotCount >= kWideQueueMaxSlots &&
-                         spacing > kWideQueueTargetSpacing + 0.5f;
+  s_wideWindowFallback = selectedSlots < s_wideAuditInitialSlots ||
+                         selectedLength < fullRouteLength - 0.5f;
+  s_wideAuditMaxShared = selectedShared;
+  s_wideAuditTrim = fullRouteLength - selectedLength;
+  s_wideAuditMs = millis() - auditStartedAt;
   return true;
 }
 
@@ -577,6 +870,9 @@ static bool buildWidePath(uint32_t revision) {
   // 在缩放/风场变化时评分一次，之后所有动画帧复用。
   if (s_wideDirectionRevision != revision &&
       !updateWideQueueDirection(revision)) {
+    return false;
+  }
+  if (s_wideAuditHidden && s_wideAuditRevision == revision) {
     return false;
   }
   if (s_widePathCount >= 2) {
@@ -655,18 +951,23 @@ static bool buildWidePath(uint32_t revision) {
   s_wideSeedY[seedSlot] = bestY;
   s_wideSeedValid[seedSlot] = true;
   if (!configureWideQueueWindow(seedSlot)) {
-    s_widePathCount = 0;
-    s_widePathLength = 0.0f;
+    // 没有安全布局时保留已构建路径但隐藏本 revision，避免每帧重复做
+    // 昂贵审计；按键中止则允许后续重试。
+    if (!s_wideAuditHidden) {
+      s_widePathCount = 0;
+      s_widePathLength = 0.0f;
+    }
     return false;
   }
   s_wideColorSamplePending = true;
   Serial.printf(
-      "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f route=%.1f..%.1f spacing=%.1f minGap=%.1f short=%d slots=%d\n",
+      "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f route=%.1f..%.1f initial=%d slots=%d spacing=%.1f minGap=%.1f shared=%u trim=%.0f held=%d audit=%lums\n",
       s_seenZoom, bestX, bestY, (int)switched, candidateScore,
       s_widePathCount, s_widePathLength, s_wideWindowStart,
-      s_wideWindowStart + s_wideWindowLength, s_wideQueueSpacing,
-      s_wideWindowMinGap, (int)s_wideWindowFallback,
-      s_wideQueueSlotCount);
+      s_wideWindowStart + s_wideWindowLength, s_wideAuditInitialSlots,
+      s_wideQueueSlotCount, s_wideQueueSpacing, s_wideWindowMinGap,
+      (unsigned)s_wideAuditMaxShared, s_wideAuditTrim,
+      (int)s_wideAuditHeld, (unsigned long)s_wideAuditMs);
   return true;
 }
 
@@ -950,21 +1251,8 @@ static void queueWideArrowAt(float screenX, float screenY, int heading,
 }
 
 static uint8_t wideWindowAlpha(float localDistance) {
-  const float distanceFromEnd =
-      min(localDistance, s_wideWindowLength - localDistance);
-  if (distanceFromEnd <= 0.0f) {
-    return 0;
-  }
-  // 淡变区不超过一个箭头间距，因此入口和出口各自最多只有一个箭头
-  // 处于渐变状态，不会在终点叠出一团亮块。
-  const float fadeLength =
-      min(kWideQueueFadeLength, s_wideQueueSpacing);
-  if (distanceFromEnd >= fadeLength) {
-    return 255;
-  }
-  const float t = distanceFromEnd / fadeLength;
-  const float smooth = t * t * (3.0f - 2.0f * t);
-  return (uint8_t)lroundf(smooth * 255.0f);
+  return wideLayoutAlpha(localDistance, s_wideWindowLength,
+                         s_wideQueueSpacing);
 }
 
 static uint16_t brightenCloudColor(uint16_t color) {
@@ -1050,9 +1338,14 @@ static int queueWideArrowTrain(uint32_t revision, float dtSec) {
   }
   refreshWideQueueColor();
 
-  s_wideQueuePhase += s_wideQueueSpeed * dtSec;
-  while (s_wideQueuePhase >= s_wideQueueSpacing) {
-    s_wideQueuePhase -= s_wideQueueSpacing;
+  const uint32_t now = millis();
+  const float queueSpeed = currentWideQueueSpeed(now);
+  if (s_wideQueueSpacing > 0.001f) {
+    s_wideQueuePhase =
+        fmodf(s_wideQueuePhase + queueSpeed * dtSec, s_wideQueueSpacing);
+    if (s_wideQueuePhase < 0.0f) {
+      s_wideQueuePhase += s_wideQueueSpacing;
+    }
   }
 
   for (int slot = 0; slot < s_wideQueueSlotCount; ++slot) {
@@ -1399,7 +1692,12 @@ void windParticlesReset() {
   s_wideQueueSlotCount = 0;
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
-  s_wideQueueSpeed = 12.0f;
+  s_wideQueueSpeed = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedFrom = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedTarget = kWideQueueMinimumSpeed;
+  s_wideQueueSpeedTransitionAt = 0;
+  s_wideCenterSpeed = 0.0f;
+  s_wideCenterSpeedValid = false;
   s_wideWindowStart = 0.0f;
   s_wideWindowLength = 0.0f;
   s_wideWindowMinGap = 0.0f;
@@ -1417,6 +1715,15 @@ void windParticlesReset() {
   s_wideColorReady = false;
   s_wideColorSamplePending = true;
   s_wideColorHasCloud = false;
+  s_wideAuditRevision = 0;
+  s_wideAuditHidden = false;
+  s_wideAuditMaxShared = 0;
+  s_wideAuditTrim = 0.0f;
+  s_wideAuditMs = 0;
+  s_wideAuditInitialSlots = 0;
+  s_wideAuditHeld = false;
+  memset(s_wideApplied, 0, sizeof(s_wideApplied));
+  memset(s_widePending, 0, sizeof(s_widePending));
 }
 
 void windParticlesNotifyBaseRedrawn() {
@@ -1505,10 +1812,11 @@ bool windParticlesTick(LGFX* lcd, int displayedZoom, bool busy) {
     const unsigned avgSpans =
         s_statsFrames > 0 ? (unsigned)(s_statsSpans / s_statsFrames) : 0;
     Serial.printf(
-        "wind anim fps=%.1f draw=%lums total=%lums busy=%d style=%u count=%d trails=%d new=%d spans=%u\n",
+        "wind anim fps=%.1f draw=%lums total=%lums busy=%d style=%u count=%d trails=%d new=%d spans=%u center=%.1f speed=%.1f/%.1f\n",
         fps, (unsigned long)(millis() - drawStart),
         (unsigned long)frameWorkMs, (int)busy, (unsigned)s_style,
-        s_activeParticleCount, s_trailCount, s_newCount, avgSpans);
+        s_activeParticleCount, s_trailCount, s_newCount, avgSpans,
+        s_wideCenterSpeed, s_wideQueueSpeed, s_wideQueueSpeedTarget);
     s_statsAt = now;
     s_statsFrames = 0;
     s_statsSpans = 0;
