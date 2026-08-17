@@ -36,12 +36,14 @@ struct WidePathNode {
 static_assert(sizeof(TrailPixel) == 6, "TrailPixel must stay compact");
 
 static constexpr int kTrailPixelCapacity = 3072;
-// 粗箭头队列最多 10×78=780 个原始像素；其余样式的峰值更低。
-static constexpr int kNewPixelCapacity = 896;
+// 最长约 300px 的通道按 20px 间距最多需要 15 个粗箭头；每个方向掩码
+// 最多 78 像素，1280 项仍留有 110 项余量。旧帧和新帧最坏约 2340 项，
+// 保持在 3072 项轨迹池内。
+static constexpr int kNewPixelCapacity = 1280;
 static constexpr uint32_t kTrailFadeMs = 1500UL;
-static constexpr int kWideQueueSlots = 10;
+static constexpr int kWideQueueMaxSlots = 15;
+static constexpr float kWideQueueTargetSpacing = 20.0f;
 static constexpr float kWideQueueFadeLength = 28.0f;
-static constexpr float kWideQueueMinSpacing = 12.0f;
 static constexpr float kWideQueueEndExclusion = 12.0f;
 static constexpr int kWideArrowMaskCapacity = 112;
 static constexpr int kWideDirectionCount = 16;
@@ -73,6 +75,7 @@ static uint32_t s_lastSampleFailLogAt = 0;
 static uint32_t s_statsSpans = 0;
 static WindParticleStyle s_style = WIND_PARTICLE_DOT;
 static int s_activeParticleCount = WIND_PARTICLE_COUNT;
+static int s_wideQueueSlotCount = 0;
 static float s_wideQueuePhase = 0.0f;
 static float s_wideQueueSpacing = 22.0f;
 static float s_wideQueueSpeed = 12.0f;
@@ -130,8 +133,7 @@ static uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t alpha);
 static uint16_t currentWideQueueColor(uint32_t now);
 
 static int styleParticleCount() {
-  return s_style == WIND_PARTICLE_WIDE_ARROW ? kWideQueueSlots
-                                             : WIND_PARTICLE_COUNT;
+  return s_style == WIND_PARTICLE_WIDE_ARROW ? 0 : WIND_PARTICLE_COUNT;
 }
 
 static uint32_t nextRand() {
@@ -210,6 +212,7 @@ static void resetAll(int zoom, uint32_t revision) {
   s_statsFrames = 0;
   s_statsSpans = 0;
   s_activeParticleCount = styleParticleCount();
+  s_wideQueueSlotCount = 0;
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
   s_wideQueueSpeed = 12.0f;
@@ -520,15 +523,14 @@ static bool configureWideQueueWindow(int zoomSlot) {
     return false;
   }
 
-  // 连续传送带必须让 10 个箭头均匀覆盖整条通道，而不是把它们压成一组。
-  // 通道足够长时只排除末端 12px；极短通道优先保证每格至少 12px。
-  const float maximumExclusion =
-      max(0.0f, s_widePathLength -
-                    (float)kWideQueueSlots * kWideQueueMinSpacing);
+  // 按有效通道长度选择最接近 20px 间距的整数箭头数，再用实际长度反算
+  // 精确间距。长通道自然增加箭头，短通道自然减少，不再固定为 10 个。
   const float endExclusion =
-      min(kWideQueueEndExclusion, maximumExclusion);
+      min(kWideQueueEndExclusion, max(0.0f, s_widePathLength - 1.0f));
   const float usableLength = s_widePathLength - endExclusion;
-  const float spacing = usableLength / (float)kWideQueueSlots;
+  int slotCount = (int)lroundf(usableLength / kWideQueueTargetSpacing);
+  slotCount = max(1, min(kWideQueueMaxSlots, slotCount));
+  const float spacing = usableLength / (float)slotCount;
 
   // 曲率只用于串口诊断，不再参与筛选或拒绝；急弯即使让相邻箭头略微
   // 靠近也要原样显示。
@@ -560,11 +562,13 @@ static bool configureWideQueueWindow(int zoomSlot) {
                                      oldSpacing
                                : 0.0f;
   s_wideQueueSpacing = spacing;
+  s_wideQueueSlotCount = slotCount;
   s_wideWindowStart = 0.0f;
   s_wideWindowLength = usableLength;
   s_wideQueuePhase = phaseRatio * spacing;
   s_wideWindowMinGap = minGap;
-  s_wideWindowFallback = endExclusion < kWideQueueEndExclusion - 0.01f;
+  s_wideWindowFallback = slotCount >= kWideQueueMaxSlots &&
+                         spacing > kWideQueueTargetSpacing + 0.5f;
   return true;
 }
 
@@ -661,7 +665,8 @@ static bool buildWidePath(uint32_t revision) {
       s_seenZoom, bestX, bestY, (int)switched, candidateScore,
       s_widePathCount, s_widePathLength, s_wideWindowStart,
       s_wideWindowStart + s_wideWindowLength, s_wideQueueSpacing,
-      s_wideWindowMinGap, (int)s_wideWindowFallback, kWideQueueSlots);
+      s_wideWindowMinGap, (int)s_wideWindowFallback,
+      s_wideQueueSlotCount);
   return true;
 }
 
@@ -1050,9 +1055,9 @@ static int queueWideArrowTrain(uint32_t revision, float dtSec) {
     s_wideQueuePhase -= s_wideQueueSpacing;
   }
 
-  for (int slot = 0; slot < kWideQueueSlots; ++slot) {
+  for (int slot = 0; slot < s_wideQueueSlotCount; ++slot) {
     // phase 只滚动一个间距。出口箭头逐渐消失的同时，入口箭头逐渐出现；
-    // 中间 8 个持续前进，不存在整组抵达、等待和整体重启。
+    // 中间箭头持续前进，不存在整组抵达、等待和整体重启。
     const float localDistance =
         s_wideQueuePhase + (float)slot * s_wideQueueSpacing;
     if (localDistance > s_wideWindowLength) {
@@ -1069,7 +1074,7 @@ static int queueWideArrowTrain(uint32_t revision, float dtSec) {
     const uint8_t alpha = wideWindowAlpha(localDistance);
     queueWideArrowAt(x, y, quantizeWideDirection(tangentX, tangentY), alpha);
   }
-  return kWideQueueSlots;
+  return s_wideQueueSlotCount;
 }
 
 static void finalizeWideHeadKeys() {
@@ -1391,6 +1396,7 @@ void windParticlesReset() {
   s_statsFrames = 0;
   s_statsSpans = 0;
   s_activeParticleCount = styleParticleCount();
+  s_wideQueueSlotCount = 0;
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
   s_wideQueueSpeed = 12.0f;
