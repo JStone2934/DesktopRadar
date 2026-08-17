@@ -41,6 +41,8 @@ static constexpr int kNewPixelCapacity = 896;
 static constexpr uint32_t kTrailFadeMs = 1500UL;
 static constexpr int kWideQueueSlots = 10;
 static constexpr float kWideQueueFadeLength = 28.0f;
+static constexpr float kWideQueueMinSpacing = 12.0f;
+static constexpr float kWideQueueEndExclusion = 12.0f;
 static constexpr int kWideArrowMaskCapacity = 112;
 static constexpr int kWideDirectionCount = 16;
 static constexpr int kWidePathCapacity = 32;
@@ -74,6 +76,10 @@ static int s_activeParticleCount = WIND_PARTICLE_COUNT;
 static float s_wideQueuePhase = 0.0f;
 static float s_wideQueueSpacing = 22.0f;
 static float s_wideQueueSpeed = 12.0f;
+static float s_wideWindowStart = 0.0f;
+static float s_wideWindowLength = 0.0f;
+static float s_wideWindowMinGap = 0.0f;
+static bool s_wideWindowFallback = false;
 static float s_wideDominantX = 1.0f;
 static float s_wideDominantY = 0.0f;
 static uint32_t s_wideDirectionRevision = 0;
@@ -207,6 +213,10 @@ static void resetAll(int zoom, uint32_t revision) {
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
   s_wideQueueSpeed = 12.0f;
+  s_wideWindowStart = 0.0f;
+  s_wideWindowLength = 0.0f;
+  s_wideWindowMinGap = 0.0f;
+  s_wideWindowFallback = false;
   s_wideDominantX = 1.0f;
   s_wideDominantY = 0.0f;
   s_wideDirectionRevision = 0;
@@ -470,6 +480,94 @@ static bool traceWidePath(float anchorX, float anchorY, WidePathNode* out,
   return true;
 }
 
+static bool sampleWidePath(float distance, float* x, float* y,
+                           float* tangentX, float* tangentY) {
+  if (s_widePathCount < 2 || !x || !y || !tangentX || !tangentY) {
+    return false;
+  }
+  if (distance < 0.0f) {
+    distance = 0.0f;
+  } else if (distance > s_widePathLength) {
+    distance = s_widePathLength;
+  }
+  int right = 1;
+  while (right < s_widePathCount &&
+         s_widePath[right].distance < distance) {
+    ++right;
+  }
+  if (right >= s_widePathCount) {
+    right = s_widePathCount - 1;
+  }
+  const int left = right - 1;
+  const float segmentLength =
+      s_widePath[right].distance - s_widePath[left].distance;
+  const float t = segmentLength > 0.001f
+                      ? (distance - s_widePath[left].distance) / segmentLength
+                      : 0.0f;
+  *x = s_widePath[left].x + (s_widePath[right].x - s_widePath[left].x) * t;
+  *y = s_widePath[left].y + (s_widePath[right].y - s_widePath[left].y) * t;
+
+  const int tangentLeft = max(0, left - 1);
+  const int tangentRight = min(s_widePathCount - 1, right + 1);
+  *tangentX = s_widePath[tangentRight].x - s_widePath[tangentLeft].x;
+  *tangentY = s_widePath[tangentRight].y - s_widePath[tangentLeft].y;
+  return normalizeVector(tangentX, tangentY);
+}
+
+static bool configureWideQueueWindow(int zoomSlot) {
+  (void)zoomSlot;
+  if (s_widePathLength < 1.0f) {
+    return false;
+  }
+
+  // 连续传送带必须让 10 个箭头均匀覆盖整条通道，而不是把它们压成一组。
+  // 通道足够长时只排除末端 12px；极短通道优先保证每格至少 12px。
+  const float maximumExclusion =
+      max(0.0f, s_widePathLength -
+                    (float)kWideQueueSlots * kWideQueueMinSpacing);
+  const float endExclusion =
+      min(kWideQueueEndExclusion, maximumExclusion);
+  const float usableLength = s_widePathLength - endExclusion;
+  const float spacing = usableLength / (float)kWideQueueSlots;
+
+  // 曲率只用于串口诊断，不再参与筛选或拒绝；急弯即使让相邻箭头略微
+  // 靠近也要原样显示。
+  float minGap = 10000.0f;
+  const float sampleStep = spacing * 0.25f;
+  for (float distance = 0.0f;
+       distance <= usableLength - spacing + 0.01f;
+       distance += sampleStep) {
+    float x0 = 0.0f;
+    float y0 = 0.0f;
+    float tx0 = 0.0f;
+    float ty0 = 0.0f;
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float tx1 = 0.0f;
+    float ty1 = 0.0f;
+    if (!sampleWidePath(distance, &x0, &y0, &tx0, &ty0) ||
+        !sampleWidePath(distance + spacing, &x1, &y1, &tx1, &ty1)) {
+      return false;
+    }
+    const float dx = x1 - x0;
+    const float dy = y1 - y0;
+    minGap = min(minGap, sqrtf(dx * dx + dy * dy));
+  }
+
+  const float oldSpacing = s_wideQueueSpacing;
+  const float phaseRatio = oldSpacing > 0.001f
+                               ? fmodf(s_wideQueuePhase, oldSpacing) /
+                                     oldSpacing
+                               : 0.0f;
+  s_wideQueueSpacing = spacing;
+  s_wideWindowStart = 0.0f;
+  s_wideWindowLength = usableLength;
+  s_wideQueuePhase = phaseRatio * spacing;
+  s_wideWindowMinGap = minGap;
+  s_wideWindowFallback = endExclusion < kWideQueueEndExclusion - 0.01f;
+  return true;
+}
+
 static bool buildWidePath(uint32_t revision) {
   // updateWideQueueDirection 在新 revision 时只更新主导向量；候选通道只
   // 在缩放/风场变化时评分一次，之后所有动画帧复用。
@@ -552,16 +650,18 @@ static bool buildWidePath(uint32_t revision) {
   s_wideSeedX[seedSlot] = bestX;
   s_wideSeedY[seedSlot] = bestY;
   s_wideSeedValid[seedSlot] = true;
-  s_wideQueueSpacing = s_widePathLength / (float)(kWideQueueSlots - 1);
-  if (s_wideQueueSpacing < 18.0f) {
-    s_wideQueueSpacing = 18.0f;
+  if (!configureWideQueueWindow(seedSlot)) {
+    s_widePathCount = 0;
+    s_widePathLength = 0.0f;
+    return false;
   }
-  s_wideQueuePhase = 0.0f;
   s_wideColorSamplePending = true;
   Serial.printf(
-      "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f spacing=%.1f\n",
+      "wind corridor z%d seed=(%.0f,%.0f) switched=%d score=%.1f nodes=%d length=%.1f route=%.1f..%.1f spacing=%.1f minGap=%.1f short=%d slots=%d\n",
       s_seenZoom, bestX, bestY, (int)switched, candidateScore,
-      s_widePathCount, s_widePathLength, s_wideQueueSpacing);
+      s_widePathCount, s_widePathLength, s_wideWindowStart,
+      s_wideWindowStart + s_wideWindowLength, s_wideQueueSpacing,
+      s_wideWindowMinGap, (int)s_wideWindowFallback, kWideQueueSlots);
   return true;
 }
 
@@ -844,50 +944,20 @@ static void queueWideArrowAt(float screenX, float screenY, int heading,
   }
 }
 
-static bool sampleWidePath(float distance, float* x, float* y,
-                           float* tangentX, float* tangentY) {
-  if (s_widePathCount < 2 || !x || !y || !tangentX || !tangentY) {
-    return false;
-  }
-  if (distance < 0.0f) {
-    distance = 0.0f;
-  } else if (distance > s_widePathLength) {
-    distance = s_widePathLength;
-  }
-  int right = 1;
-  while (right < s_widePathCount &&
-         s_widePath[right].distance < distance) {
-    ++right;
-  }
-  if (right >= s_widePathCount) {
-    right = s_widePathCount - 1;
-  }
-  const int left = right - 1;
-  const float segmentLength =
-      s_widePath[right].distance - s_widePath[left].distance;
-  const float t = segmentLength > 0.001f
-                      ? (distance - s_widePath[left].distance) / segmentLength
-                      : 0.0f;
-  *x = s_widePath[left].x + (s_widePath[right].x - s_widePath[left].x) * t;
-  *y = s_widePath[left].y + (s_widePath[right].y - s_widePath[left].y) * t;
-
-  const int tangentLeft = max(0, left - 1);
-  const int tangentRight = min(s_widePathCount - 1, right + 1);
-  *tangentX = s_widePath[tangentRight].x - s_widePath[tangentLeft].x;
-  *tangentY = s_widePath[tangentRight].y - s_widePath[tangentLeft].y;
-  return normalizeVector(tangentX, tangentY);
-}
-
-static uint8_t widePathAlpha(float distance) {
+static uint8_t wideWindowAlpha(float localDistance) {
   const float distanceFromEnd =
-      min(distance, s_widePathLength - distance);
+      min(localDistance, s_wideWindowLength - localDistance);
   if (distanceFromEnd <= 0.0f) {
     return 0;
   }
-  if (distanceFromEnd >= kWideQueueFadeLength) {
+  // 淡变区不超过一个箭头间距，因此入口和出口各自最多只有一个箭头
+  // 处于渐变状态，不会在终点叠出一团亮块。
+  const float fadeLength =
+      min(kWideQueueFadeLength, s_wideQueueSpacing);
+  if (distanceFromEnd >= fadeLength) {
     return 255;
   }
-  const float t = distanceFromEnd / kWideQueueFadeLength;
+  const float t = distanceFromEnd / fadeLength;
   const float smooth = t * t * (3.0f - 2.0f * t);
   return (uint8_t)lroundf(smooth * 255.0f);
 }
@@ -935,7 +1005,8 @@ static void refreshWideQueueColor() {
   // 在入口淡入段中点取样：这里是用户实际看见第一个箭头的位置，且比
   // 圆屏裁切边缘更稳定。整列只采用这一个颜色。
   const float sampleDistance =
-      min(kWideQueueFadeLength * 0.5f, s_widePathLength);
+      s_wideWindowStart +
+      min(kWideQueueFadeLength * 0.5f, s_wideWindowLength);
   float x = s_widePath[0].x;
   float y = s_widePath[0].y;
   float tangentX = 0.0f;
@@ -979,13 +1050,15 @@ static int queueWideArrowTrain(uint32_t revision, float dtSec) {
     s_wideQueuePhase -= s_wideQueueSpacing;
   }
 
-  int visible = 0;
   for (int slot = 0; slot < kWideQueueSlots; ++slot) {
-    const float distance = s_wideQueuePhase +
-                           (float)slot * s_wideQueueSpacing;
-    if (distance > s_widePathLength) {
+    // phase 只滚动一个间距。出口箭头逐渐消失的同时，入口箭头逐渐出现；
+    // 中间 8 个持续前进，不存在整组抵达、等待和整体重启。
+    const float localDistance =
+        s_wideQueuePhase + (float)slot * s_wideQueueSpacing;
+    if (localDistance > s_wideWindowLength) {
       continue;
     }
+    const float distance = s_wideWindowStart + localDistance;
     float x = 0.0f;
     float y = 0.0f;
     float tangentX = 0.0f;
@@ -993,11 +1066,10 @@ static int queueWideArrowTrain(uint32_t revision, float dtSec) {
     if (!sampleWidePath(distance, &x, &y, &tangentX, &tangentY)) {
       continue;
     }
-    const uint8_t alpha = widePathAlpha(distance);
+    const uint8_t alpha = wideWindowAlpha(localDistance);
     queueWideArrowAt(x, y, quantizeWideDirection(tangentX, tangentY), alpha);
-    ++visible;
   }
-  return visible;
+  return kWideQueueSlots;
 }
 
 static void finalizeWideHeadKeys() {
@@ -1322,6 +1394,10 @@ void windParticlesReset() {
   s_wideQueuePhase = 0.0f;
   s_wideQueueSpacing = 22.0f;
   s_wideQueueSpeed = 12.0f;
+  s_wideWindowStart = 0.0f;
+  s_wideWindowLength = 0.0f;
+  s_wideWindowMinGap = 0.0f;
+  s_wideWindowFallback = false;
   s_wideDominantX = 1.0f;
   s_wideDominantY = 0.0f;
   s_wideDirectionRevision = 0;
