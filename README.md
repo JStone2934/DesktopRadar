@@ -231,7 +231,7 @@ python3 tools/install_base.py --port /dev/cu.usbmodem101 \
 
 ## 致谢
 
-硬件选型参考了 [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar)（MIT）：同一类 **ESP32-C3 Super Mini + GC9A01 1.28″ 圆屏** 桌面设备。该项目做 ADS-B 飞机雷达；本仓库做气象雷达与摆件，**固件、配网、显示与数据源均为独立实现，不是 fork，也未使用其源码**。本项目与 Plane Radar 无隶属或背书关系。
+硬件选型参考了 [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar)（MIT）：同一类 **ESP32-C3 Super Mini + GC9A01 1.28″ 圆屏** 桌面设备。该项目做 ADS-B 飞机雷达；本仓库做气象雷达与摆件，**固件、配网、显示与数据源均为独立实现**。本项目与 Plane Radar 无隶属或背书关系。
 
 若复用对方的 3D 外壳或其它资源，请另行遵守其仓库与 [MakerWorld 模型页](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display) 的许可，不要默认沿用本仓库声明。
 
