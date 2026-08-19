@@ -43,6 +43,7 @@ ESP32-C3 Super Mini 驱动 GC9A01 240x240 圆屏的桌面气象雷达固件。�
 
 - 若屏幕无独立 BLK 引脚，背光常亮即可。
 - SPI 写入频率默认 20 MHz，飞线较长时更稳；稳定后可在 [include/config.h](include/config.h) 中调高。
+- 板型组合（ESP32-C3 Super Mini + 1.28″ GC9A01 圆屏）参考了 [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar)。接线不完全相同：本仓库 DC 为 GPIO **2**，对方为 GPIO **10**。固件为独立实现，见文末致谢。
 
 ## 快速开始
 
@@ -227,6 +228,12 @@ python3 tools/install_base.py --port /dev/cu.usbmodem101 \
 **上传失败**
 
 按住 S键，点 R键，松开 S键后重新上传；必要时指定 `--upload-port`。
+
+## 致谢
+
+硬件选型参考了 [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar)（MIT）：同一类 **ESP32-C3 Super Mini + GC9A01 1.28″ 圆屏** 桌面设备。该项目做 ADS-B 飞机雷达；本仓库做气象雷达与摆件，**固件、配网、显示与数据源均为独立实现，不是 fork，也未使用其源码**。本项目与 Plane Radar 无隶属或背书关系。
+
+若复用对方的 3D 外壳或其它资源，请另行遵守其仓库与 [MakerWorld 模型页](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display) 的许可，不要默认沿用本仓库声明。
 
 ## 开发备注
 
