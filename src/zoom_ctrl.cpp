@@ -124,9 +124,45 @@ void zoomPrefetchResetAround(int centerZoom) {
   s_prefetchLen = 0;
   enqueueUnique(centerZoom);
   const int maxDelta = s_prefetchRadius;
-  for (int delta = 1; delta <= maxDelta; ++delta) {
-    enqueueUnique(centerZoom - delta);
-    enqueueUnique(centerZoom + delta);
+
+  // 旧实现只按与当前档的距离排队，z10-z12 在队尾很容易被反复出现的
+  // 当前档刷新/用户操作打断。优先处理持久化 radar_t 最旧的 stale 档；
+  // 时间相同时仍按距离排序，保持首次补档和正常全量刷新时的体验。
+  bool queued[ZOOM_MAX - ZOOM_MIN + 1]{};
+  if (centerZoom >= ZOOM_MIN && centerZoom <= ZOOM_MAX) {
+    queued[centerZoom - ZOOM_MIN] = true;
+  }
+  for (;;) {
+    int best = -1;
+    bool bestHasTime = true;
+    uint32_t bestTime = UINT32_MAX;
+    int bestDelta = ZOOM_MAX - ZOOM_MIN + 1;
+    for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+      const int slot = z - ZOOM_MIN;
+      const int delta = abs(z - centerZoom);
+      if (queued[slot] || delta > maxDelta || !zoomCanCompose(z) ||
+          frameCacheIsFresh(z) || zoomPrefetchCooling(z)) {
+        continue;
+      }
+      uint32_t radarTime = 0;
+      const bool haveTime = frameCacheReadRadarTime(z, &radarTime);
+      const bool better =
+          best < 0 || (bestHasTime && !haveTime) ||
+          (bestHasTime == haveTime &&
+           ((haveTime && radarTime < bestTime) ||
+            ((!haveTime || radarTime == bestTime) && delta < bestDelta)));
+      if (better) {
+        best = z;
+        bestHasTime = haveTime;
+        bestTime = radarTime;
+        bestDelta = delta;
+      }
+    }
+    if (best < 0) {
+      break;
+    }
+    queued[best - ZOOM_MIN] = true;
+    enqueueUnique(best);
   }
 }
 

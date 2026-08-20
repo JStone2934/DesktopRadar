@@ -21,7 +21,7 @@ int zoomCycleNext();
 /** 是否可造片（ZOOM_MIN..ZOOM_MAX，跳过 ZOOM_SKIP；z>7 雷达上采样）。 */
 bool zoomCanCompose(int zoom);
 
-/** 清空并按距离排队入队可用档（跳过 ZOOM_SKIP）：当前档优先，再 ±1、±2… */
+/** 清空并排队可用档：当前档优先，其余 stale 档按雷达时刻从旧到新。 */
 void zoomPrefetchResetAround(int centerZoom);
 
 /** 限制 ResetAround 的邻档半径。全档秒切模式使用最大半径。 */

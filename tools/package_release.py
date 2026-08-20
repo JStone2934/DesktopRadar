@@ -64,7 +64,7 @@ def main() -> None:
     environment = os.environ.copy()
     environment["PLATFORMIO_BUILD_FLAGS"] = (
         "-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 "
-        "-DCORE_DEBUG_LEVEL=1 "
+        "-DCORE_DEBUG_LEVEL=0 "
         f'-DRADAR_VERSION=\\"{args.version}\\" '
         f"-DRADAR_VERSION_CODE={args.version_code}U "
         f'-DRADAR_BUILD_SHA=\\"{build_sha}\\"'

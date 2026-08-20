@@ -191,12 +191,75 @@ static uint32_t zoomRefreshAgeMs(int zoom) {
 }
 
 static void seedZoomRefreshTimesFromCache() {
-  const uint32_t now = nonzeroMillis();
+  // millis() 在重启后归零，不能把磁盘里的旧成品当成“刚刚刷新”。保留
+  // ready 供秒切，但让当前档立即在线校验；没有可信雷达时刻的成品直接
+  // 标旧。拿到最新时刻后 reconcileWindCacheFreshness() 会按真实时间差
+  // 决定其它档是否需要重建。
   for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
-    if (zoomCanCompose(z) && frameCacheHas(z) &&
-        s_zoomRefreshedAt[zoomRefreshSlot(z)] == 0) {
-      s_zoomRefreshedAt[zoomRefreshSlot(z)] = now;
+    if (!zoomCanCompose(z)) {
+      continue;
     }
+    s_zoomRefreshedAt[zoomRefreshSlot(z)] = 0;
+    uint32_t radarTime = 0;
+    const bool ready = frameCacheHas(z);
+    const bool haveTime = ready && frameCacheReadRadarTime(z, &radarTime);
+    if (ready && !haveTime) {
+      frameCacheMarkFresh(z, false);
+    }
+    Serial.printf("cache boot z%d ready=%d fresh=%d radar_t=%lu validate=%d\n",
+                  z, (int)ready, (int)frameCacheIsFresh(z),
+                  (unsigned long)radarTime, (int)ready);
+  }
+}
+
+/**
+ * 用当前档刚取到的 RainViewer 时刻校验风场模式的分级缓存。
+ * ready 只代表文件可显示；是否新鲜必须由每档持久化的 radar_t 决定。
+ */
+static void reconcileWindCacheFreshness(uint32_t latestRadarTime,
+                                        int centerZoom) {
+  if (!s_cfg.show_wind_particles || latestRadarTime == 0) {
+    return;
+  }
+
+  int staleCount = 0;
+  for (int z = ZOOM_MIN; z <= ZOOM_MAX; ++z) {
+    if (!zoomCanCompose(z) || z == centerZoom || !frameCacheHas(z)) {
+      continue;
+    }
+
+    uint32_t cachedTime = 0;
+    const bool haveTime = frameCacheReadRadarTime(z, &cachedTime);
+    const uint32_t intervalMs =
+        abs(z - centerZoom) <= 1 ? WIND_ADJACENT_REFRESH_MS
+                                 : WIND_FAR_REFRESH_MS;
+    const uint32_t limitSec = intervalMs / 1000UL;
+    const uint32_t lagSec =
+        haveTime && latestRadarTime > cachedTime ? latestRadarTime - cachedTime
+                                                 : 0;
+    const bool fresh = haveTime && lagSec <= limitSec;
+
+    frameCacheMarkFresh(z, fresh);
+    if (fresh) {
+      // 本次在线校验确认仍在分级时限内，从现在开始下一轮计时。
+      if (s_zoomRefreshedAt[zoomRefreshSlot(z)] == 0) {
+        noteZoomRefreshed(z);
+      }
+    } else {
+      s_zoomRefreshedAt[zoomRefreshSlot(z)] = 0;
+      ++staleCount;
+    }
+    Serial.printf(
+        "cache validate z%d radar_t=%lu latest=%lu lag=%lus limit=%lus %s\n",
+        z, (unsigned long)cachedTime, (unsigned long)latestRadarTime,
+        (unsigned long)lagSec, (unsigned long)limitSec,
+        fresh ? "fresh" : "STALE");
+  }
+
+  if (staleCount > 0) {
+    s_staticFullPassDone = false;
+    Serial.printf("cache validate: %d stale zoom(s), oldest first\n",
+                  staleCount);
   }
 }
 
@@ -1156,6 +1219,7 @@ static void serviceRadarWorkCompletion() {
         showCached(zoom);
       }
       if (s_cfg.show_wind_particles) {
+        reconcileWindCacheFreshness(radarTime, zoom);
         s_windBackgroundComposeAt =
             millis() + WIND_BACKGROUND_COMPOSE_GAP_MS;
         s_staticFullPassDone =
