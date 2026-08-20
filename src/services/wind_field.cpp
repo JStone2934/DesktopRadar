@@ -41,6 +41,9 @@ static bool s_waitingFirstAttempt = false;
 static float s_lat = 0.0f;
 static float s_lon = 0.0f;
 static int s_zoom = -1;
+// s_zoom 是当前屏幕请求的档位；s_fieldZoom 是内存中风场实际采样档位。
+// 同一地点切档时允许暂时复用旧档风场，等新档 HTTPS 成功后再替换。
+static int s_fieldZoom = -1;
 static uint32_t s_fetchDueAt = 0;
 static uint32_t s_revision = 0;
 static uint32_t s_modelTime = 0;
@@ -70,12 +73,12 @@ static bool sameLocation(float aLat, float aLon, float bLat, float bLon) {
   return fabsf(aLat - bLat) < 1e-5f && fabsf(aLon - bLon) < 1e-5f;
 }
 
-static bool loadCache() {
-  if (s_zoom < ZOOM_MIN || s_zoom > ZOOM_MAX) {
+static bool loadCacheAt(int cacheZoom) {
+  if (cacheZoom < ZOOM_MIN || cacheZoom > ZOOM_MAX) {
     return false;
   }
   char path[32];
-  cachePath(s_zoom, false, path, sizeof(path));
+  cachePath(cacheZoom, false, path, sizeof(path));
   File f = LittleFS.open(path, "r");
   if (!f || f.size() != sizeof(WindDisk)) {
     if (f) {
@@ -87,7 +90,7 @@ static bool loadCache() {
   const size_t nr = f.read(reinterpret_cast<uint8_t*>(&disk), sizeof(disk));
   f.close();
   if (nr != sizeof(disk) || disk.magic != kDiskMagic ||
-      disk.version != kDiskVersion || disk.zoom != s_zoom ||
+      disk.version != kDiskVersion || disk.zoom != cacheZoom ||
       !sameLocation(disk.centerLat, disk.centerLon, s_lat, s_lon)) {
     return false;
   }
@@ -99,15 +102,32 @@ static bool loadCache() {
   memcpy(s_east10, disk.east10, sizeof(s_east10));
   memcpy(s_south10, disk.south10, sizeof(s_south10));
   s_modelTime = disk.modelTime;
+  s_fieldZoom = cacheZoom;
   s_valid = true;
   ++s_revision;
-  Serial.printf("wind cache load z%d time=%lu rev=%lu\n", s_zoom,
+  Serial.printf("wind cache load z%d for z%d time=%lu rev=%lu\n", cacheZoom,
+                s_zoom,
                 (unsigned long)s_modelTime, (unsigned long)s_revision);
   return true;
 }
 
+static bool loadNearestCache(int targetZoom) {
+  for (int delta = 1; delta <= ZOOM_MAX - ZOOM_MIN; ++delta) {
+    const int lower = targetZoom - delta;
+    if (lower >= ZOOM_MIN && loadCacheAt(lower)) {
+      return true;
+    }
+    const int upper = targetZoom + delta;
+    if (upper <= ZOOM_MAX && loadCacheAt(upper)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool saveCache() {
-  if (!s_valid || s_zoom < ZOOM_MIN || s_zoom > ZOOM_MAX) {
+  if (!s_valid || s_zoom < ZOOM_MIN || s_zoom > ZOOM_MAX ||
+      s_fieldZoom != s_zoom) {
     return false;
   }
   if (!LittleFS.exists("/wind") && !LittleFS.mkdir("/wind")) {
@@ -298,6 +318,7 @@ static bool fetchField() {
   memcpy(s_east10, east, sizeof(s_east10));
   memcpy(s_south10, south, sizeof(s_south10));
   s_modelTime = modelTime;
+  s_fieldZoom = s_zoom;
   s_valid = true;
   ++s_revision;
   saveCache();
@@ -334,21 +355,43 @@ void windFieldSelect(float lat, float lon, int zoom) {
   if (s_zoom == zoom && sameLocation(s_lat, s_lon, lat, lon)) {
     return;
   }
+  const bool sameCenter =
+      s_valid && s_fieldZoom >= ZOOM_MIN && s_fieldZoom <= ZOOM_MAX &&
+      sameLocation(s_lat, s_lon, lat, lon);
+  const int previousFieldZoom = s_fieldZoom;
   s_lat = lat;
   s_lon = lon;
   s_zoom = zoom;
-  s_valid = false;
-  s_modelTime = 0;
   s_consecutiveFailures = 0;
-  const bool cached = loadCache();
+
+  const bool exactCached = loadCacheAt(zoom);
+  bool fallback = false;
+  if (!exactCached && sameCenter) {
+    // 保留内存中的最后有效风场。windParticlesTick 会因 displayedZoom 改变
+    // 重建箭头布局，新档网络请求成功后再以 revision 无缝替换数据。
+    fallback = true;
+    s_valid = true;
+    s_fieldZoom = previousFieldZoom;
+  } else if (!exactCached) {
+    // 冷启动或位置切换后没有内存风场时，优先复用同一地点最近档缓存。
+    fallback = loadNearestCache(zoom);
+  }
+  if (!exactCached && !fallback) {
+    s_valid = false;
+    s_fieldZoom = -1;
+    s_modelTime = 0;
+  }
+
   const uint32_t now = millis();
-  s_fetchDueAt = now + (cached ? 5000UL : WIND_FIELD_SETTLE_MS);
+  s_fetchDueAt = now + (exactCached ? 5000UL : WIND_FIELD_SETTLE_MS);
   if (s_fetchDueAt == 0) {
     s_fetchDueAt = 1;
   }
-  s_waitingFirstAttempt = !cached;
-  Serial.printf("wind select z%d cached=%d due=%lums\n", s_zoom, (int)cached,
-                (unsigned long)(cached ? 5000UL : WIND_FIELD_SETTLE_MS));
+  s_waitingFirstAttempt = !s_valid;
+  Serial.printf(
+      "wind select z%d exact=%d fallback=%d source=z%d due=%lums\n", s_zoom,
+      (int)exactCached, (int)fallback, s_fieldZoom,
+      (unsigned long)(exactCached ? 5000UL : WIND_FIELD_SETTLE_MS));
 }
 
 bool windFieldService() {
@@ -405,7 +448,8 @@ bool windFieldBlocksPrefetch() {
 }
 
 bool windFieldReadyFor(int zoom) {
-  return s_enabled && s_valid && zoom == s_zoom;
+  return s_enabled && s_valid && s_fieldZoom >= ZOOM_MIN &&
+         s_fieldZoom <= ZOOM_MAX && zoom == s_zoom;
 }
 
 bool windFieldSample(float screenX, float screenY, float* east, float* south) {

@@ -108,10 +108,12 @@
 #define WIND_BUSY_FRAME_MS 500UL
 #define WIND_FIELD_REFRESH_MS (60UL * 60UL * 1000UL)
 #define WIND_FIELD_RETRY_MS (30UL * 1000UL)
-#define WIND_FIELD_SLOW_RETRY_MS (10UL * 60UL * 1000UL)
+#define WIND_FIELD_SLOW_RETRY_MS (2UL * 60UL * 1000UL)
 #define WIND_FIELD_FAST_RETRY_LIMIT 3
 #define WIND_FIELD_SETTLE_MS 2500UL
-#define WIND_HTTP_TIMEOUT_MS 20000UL
+// 风场一次包含 49 个坐标；弱网下 TLS 建连和响应头可能超过 20 秒。
+// HTTP 在独立任务中执行，延长超时不会阻塞按键或屏幕动画。
+#define WIND_HTTP_TIMEOUT_MS 35000UL
 #define WIND_MAX_JSON_BYTES (28UL * 1024UL)
 
 // 风场模式静态图分级刷新：全档成品一直保留，过时档在后台重建。
